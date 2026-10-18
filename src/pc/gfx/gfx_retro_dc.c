@@ -22,7 +22,8 @@
 
 #include "gl_fast_vert.h"
 
-#include "sh4zam.h"
+#include "sh4zam_port.h"
+#include "pc/dc_prof.h"
 
 int in_trilerp = 0;
 int doing_peach = 0;
@@ -93,7 +94,23 @@ struct __attribute__((aligned(32))) LoadedVertex {
 // bits 0 - 5 -> clip_rej
 // bit 6 - wlt0
 // bit 7 - lit
-uint8_t __attribute__((aligned(32))) clip_rej[MAX_VERTICES];
+// The state every vertex and triangle touches, in one section (SM_HOT_DATA): left to the linker it
+// lands scattered among the big tables, and the 16 KB direct-mapped operand cache keeps evicting it.
+#define SM_HOT_DATA __attribute__((section(".data.sm64_hot")))
+SM_HOT_DATA uint8_t __attribute__((aligned(32))) clip_rej[MAX_VERTICES];
+
+// Triangle state epoch and baked-vertex cache: see tri_state_setup / tri_baked.
+static SM_HOT_DATA uint32_t sTriStateEpoch = 1;
+static SM_HOT_DATA uint32_t sVtxBakeEpoch[MAX_VERTICES + 4];
+static SM_HOT_DATA dc_fast_t __attribute__((aligned(32))) sVtxBaked[MAX_VERTICES + 4];
+
+static inline void tri_state_bump(void) {
+    DC_PROF_COUNT(DCC_EPOCHS, 1);
+    if (++sTriStateEpoch == 0) {   // wrapped: no stale slot may match the new epoch
+        memset(sVtxBakeEpoch, 0, sizeof(sVtxBakeEpoch));
+        sTriStateEpoch = 1;
+    }
+}
 
 struct TextureHashmapNode {
     // 0
@@ -124,8 +141,17 @@ struct ColorCombiner {
 
 static struct ColorCombiner color_combiner_pool[64];
 static uint8_t color_combiner_pool_size;
-#define MEM_BARRIER_PREF(ptr) asm volatile("pref @%0" : : "r"((ptr)) : "memory")
-#define MEM_BARRIER() asm volatile("" : : : "memory");
+// Plain prefetch, no "memory" clobber: a clobber makes GCC reload every global after it (in the
+// vertex and triangle loops, once per vertex). The XMTRX asm statements are volatile, so they
+// keep their order without a compiler barrier between them.
+#define MEM_BARRIER_PREF(ptr) __builtin_prefetch(ptr)
+// The code every vertex and triangle runs through. The SH4's instruction cache is 8 KB and
+// direct-mapped; left where the linker puts them these handlers overlapped in it and evicted
+// each other (measured: ~20% of display-list cycles were I-cache stalls). KOS's linker script
+// places .sub0 at an I-cache-aligned address and fails the link if it outgrows the cache, so
+// they sit side by side in it. Their cold paths are split out to keep it that small.
+#define SM_HOT __attribute__((section(".sub0.sm64_hot")))
+#define MEM_BARRIER() ((void) 0)
 
 static struct RSP {
     struct  __attribute__((aligned(32))) LoadedVertex loaded_vertices[MAX_VERTICES+4];
@@ -139,6 +165,8 @@ static struct RSP {
     Light_t __attribute__((aligned(32))) current_lookat[2];
     float __attribute__((aligned(32))) current_lights_coeffs[MAX_LIGHTS][3];
     float __attribute__((aligned(32))) current_lookat_coeffs[2][3]; // lookat_x, lookat_y
+    // Light colours as floats; directional ones prescaled by 1/127 (the normal's scale).
+    float __attribute__((aligned(32))) current_lights_colf[MAX_LIGHTS + 1][3];
 
     uint32_t __attribute__((aligned(32))) geometry_mode;
     uint16_t s_scale, t_scale;
@@ -146,9 +174,10 @@ static struct RSP {
     uint8_t modelview_matrix_stack_size;
     uint8_t current_num_lights; // includes ambient light
     uint8_t lights_changed;
+    uint8_t light_cols_changed; // light colours or count changed: refresh current_lights_colf
     uint8_t use_fog;
     
-} rsp __attribute__((aligned(32)));
+} rsp SM_HOT_DATA __attribute__((aligned(32)));
 
 static struct RDP {
     const uint8_t *palette;
@@ -178,7 +207,7 @@ static struct RDP {
     bool viewport_or_scissor_changed;
     void *z_buf_address;
     void *color_image_address;
-} rdp __attribute__((aligned(32)));
+} rdp SM_HOT_DATA __attribute__((aligned(32)));
 
 static struct RenderingState {
     // 0
@@ -201,7 +230,7 @@ static struct RenderingState {
     uint8_t fog_enabled;
     // 12 through 20, then to 31
     struct XYWidthHeight viewport, scissor;
-} rendering_state __attribute__((aligned(32)));
+} rendering_state SM_HOT_DATA __attribute__((aligned(32)));
 
 struct GfxDimensions gfx_current_dimensions;
 
@@ -241,7 +270,7 @@ static float fb_half_w = 320.0f, fb_half_h = 240.0f;
 static void gfx_recompute_screen_map(void) {
     float vw = vpf_w <= 0.0f ? 1.0f : vpf_w;
     float vh = vpf_h <= 0.0f ? 1.0f : vpf_h;
-    float fb_h = (float) gfx_current_dimensions.height;
+    float fb_h = (float) (int32_t) gfx_current_dimensions.height;
     sm_xscale = vw * 0.5f;
     sm_xbias  = vpf_x + vw * 0.5f;
     sm_yscale = -(vh * 0.5f);
@@ -262,7 +291,7 @@ extern void gfx_pvr_set_fog_color(uint8_t r, uint8_t g, uint8_t b, uint8_t a);
 static inline uint8_t gfx_calc_fog(float z, float w) {
     if (!(rsp.geometry_mode & G_FOG)) return 0;
     if (z < -w) return 0;
-    float f = (float) rsp.fog_mul * (z * shz_fast_invf(w)) + (float) rsp.fog_offset;
+    float f = (float) rsp.fog_mul * (z * shz_invf(w)) + (float) rsp.fog_offset;
     if (f > 255.0f) f = 255.0f;
     else if (f < 0.0f) f = 0.0f;
     return (uint8_t) f;
@@ -273,6 +302,17 @@ static uint8_t pvr_cur_bsrc = GFX_BLENDF_SRCALPHA, pvr_cur_bdst = GFX_BLENDF_INV
 // Derive PVR blend factors from the N64 blender (final cycle in other_mode_l). Standard
 // "incoming over framebuffer" (P=CLR_IN, M=CLR_MEM) maps A->src factor, B->dst factor; any
 // other arrangement falls back to plain alpha-over. (Ported from MK64 — game-agnostic.)
+// FORCE_BL with both blender colour inputs CLR_IN (G_RM_OPA_SURF, the background layer's mode)
+// blends the pixel with itself: the result is the source colour whatever the alpha, so the
+// surface is opaque and belongs in the OP list, not autosorted TR. The skybox draws this way.
+// The blender word interleaves the two cycles (GBL_c1/GBL_c2 in gbi.h): cycle 1 has P, A, M, B at
+// bits 30, 26, 22, 18 and cycle 2 at 28, 24, 20, 16. One-cycle mode blends with cycle 1, two-cycle
+// mode ends with cycle 2.
+static inline int pvr_blend_is_source(uint32_t oml, uint32_t omh) {
+    int base = ((omh & (3U << G_MDSFT_CYCLETYPE)) == G_CYC_2CYCLE) ? 16 : 18;
+    return ((oml >> (base + 12)) & 3) == G_BL_CLR_IN && ((oml >> (base + 4)) & 3) == G_BL_CLR_IN;
+}
+
 static void pvr_derive_blend(uint32_t oml, uint32_t omh, uint8_t *src, uint8_t *dst) {
     int base = ((omh & (3U << G_MDSFT_CYCLETYPE)) == G_CYC_2CYCLE) ? 16 : 24;
     int p = (oml >> (base + 6)) & 3, m = (oml >> (base + 4)) & 3;
@@ -696,7 +736,7 @@ static void gfx_normalize_vector(float v[3]) {
 }
 
 static void gfx_transposed_matrix_mul(float res[3], const float a[3], const float b[4][4]) {
-    *((shz_vec3_t*) res) = shz_matrix4x4_trans_vec3_transpose((const shz_matrix_4x4_t *)b, *((shz_vec3_t*) a));
+    *((shz_vec3_t*) res) = shz_mat4x4_transform_vec3_transpose((const shz_mat4x4_t *)b, *((shz_vec3_t*) a));
 }
         #define recip127 0.00787402f
 
@@ -709,8 +749,8 @@ static void calculate_normal_dir(const Light_t* light, float coeffs[3]) {
 }
 
 
-static void gfx_matrix_mul(shz_matrix_4x4_t* res, const shz_matrix_4x4_t* a, const shz_matrix_4x4_t* b) {
-    shz_xmtrx_load_4x4_apply_store(res, b, a);
+static void gfx_matrix_mul(shz_mat4x4_t* res, const shz_mat4x4_t* a, const shz_mat4x4_t* b) {
+    shz_xmtrx_load_apply_store_4x4(res, b, a);
 }
 
 static int matrix_dirty = 0;
@@ -730,15 +770,15 @@ static void  __attribute__((noinline)) gfx_sp_matrix(uint8_t parameters, const i
     }
 #else
     // For a modified GBI where fixed point values are replaced with floats
-    shz_xmtrx_load_4x4_unaligned((const float*)addr);
-    shz_xmtrx_store_4x4((shz_matrix_4x4_t *)matrix);
+    shz_xmtrx_load_unaligned_4x4((const float*)addr);
+    shz_xmtrx_store_4x4((shz_mat4x4_t *)matrix);
 #endif
     
     if (parameters & G_MTX_PROJECTION) {
         if (parameters & G_MTX_LOAD) {
-            shz_xmtrx_store_4x4((shz_matrix_4x4_t *)rsp.P_matrix);
+            shz_xmtrx_store_4x4((shz_mat4x4_t *)rsp.P_matrix);
         } else {
-            gfx_matrix_mul((shz_matrix_4x4_t *)rsp.P_matrix, (const shz_matrix_4x4_t *)matrix, (const shz_matrix_4x4_t *)rsp.P_matrix);
+            gfx_matrix_mul((shz_mat4x4_t *)rsp.P_matrix, (const shz_mat4x4_t *)matrix, (const shz_mat4x4_t *)rsp.P_matrix);
         }
 
         // Ortho vs perspective: the PERSPECTIVE term (the element that makes clip.w depend on z) is
@@ -755,19 +795,19 @@ static void  __attribute__((noinline)) gfx_sp_matrix(uint8_t parameters, const i
         if ((parameters & G_MTX_PUSH) && rsp.modelview_matrix_stack_size < 11) {
             ++rsp.modelview_matrix_stack_size;
             // why does this break goddard background
-            // shz_matrix_4x4_copy((shz_matrix_4x4_t *)rsp.modelview_matrix_stack[rsp.modelview_matrix_stack_size - 1], (const shz_matrix_4x4_t *)rsp.modelview_matrix_stack[rsp.modelview_matrix_stack_size - 2]);
+            // shz_mat4x4_copy((shz_mat4x4_t *)rsp.modelview_matrix_stack[rsp.modelview_matrix_stack_size - 1], (const shz_mat4x4_t *)rsp.modelview_matrix_stack[rsp.modelview_matrix_stack_size - 2]);
             n64_memcpy(rsp.modelview_matrix_stack[rsp.modelview_matrix_stack_size - 1], rsp.modelview_matrix_stack[rsp.modelview_matrix_stack_size - 2], sizeof(matrix));
         }
 
         if (parameters & G_MTX_LOAD) {
-            shz_xmtrx_store_4x4((shz_matrix_4x4_t *)rsp.modelview_matrix_stack[rsp.modelview_matrix_stack_size - 1]);
+            shz_xmtrx_store_4x4((shz_mat4x4_t *)rsp.modelview_matrix_stack[rsp.modelview_matrix_stack_size - 1]);
         } else {
-            gfx_matrix_mul((shz_matrix_4x4_t *)rsp.modelview_matrix_stack[rsp.modelview_matrix_stack_size - 1], (const shz_matrix_4x4_t *)matrix, (const shz_matrix_4x4_t *)rsp.modelview_matrix_stack[rsp.modelview_matrix_stack_size - 1]);
+            gfx_matrix_mul((shz_mat4x4_t *)rsp.modelview_matrix_stack[rsp.modelview_matrix_stack_size - 1], (const shz_mat4x4_t *)matrix, (const shz_mat4x4_t *)rsp.modelview_matrix_stack[rsp.modelview_matrix_stack_size - 1]);
         }
         rsp.lights_changed = 1;
     }
     matrix_dirty = 1;
-    gfx_matrix_mul((shz_matrix_4x4_t *)rsp.MP_matrix, (const shz_matrix_4x4_t *)rsp.modelview_matrix_stack[rsp.modelview_matrix_stack_size - 1], (const shz_matrix_4x4_t *)rsp.P_matrix);
+    gfx_matrix_mul((shz_mat4x4_t *)rsp.MP_matrix, (const shz_mat4x4_t *)rsp.modelview_matrix_stack[rsp.modelview_matrix_stack_size - 1], (const shz_mat4x4_t *)rsp.P_matrix);
 }
 
 static void  __attribute__((noinline)) gfx_sp_pop_matrix(uint32_t count) {
@@ -778,7 +818,7 @@ static void  __attribute__((noinline)) gfx_sp_pop_matrix(uint32_t count) {
     }
     if (rsp.modelview_matrix_stack_size > 0) {
         matrix_dirty = 1;
-        gfx_matrix_mul((shz_matrix_4x4_t *)rsp.MP_matrix, (const shz_matrix_4x4_t *)rsp.modelview_matrix_stack[rsp.modelview_matrix_stack_size - 1], (const shz_matrix_4x4_t *)rsp.P_matrix);
+        gfx_matrix_mul((shz_mat4x4_t *)rsp.MP_matrix, (const shz_mat4x4_t *)rsp.modelview_matrix_stack[rsp.modelview_matrix_stack_size - 1], (const shz_mat4x4_t *)rsp.P_matrix);
     }
 }
 
@@ -811,8 +851,8 @@ static void  __attribute__((noinline)) gfx_sp_vertex_no(size_t n_vertices, size_
 static void  __attribute__((noinline)) gfx_sp_vertex_light(size_t n_vertices, size_t dest_index, const Vtx *vertices);
 
 
-static void  __attribute__((noinline)) gfx_sp_vertex(size_t n_vertices, size_t dest_index, const Vtx *vertices) {
-    shz_xmtrx_load_4x4((const shz_matrix_4x4_t *)&rsp.MP_matrix);
+static void SM_HOT __attribute__((noinline)) gfx_sp_vertex(size_t n_vertices, size_t dest_index, const Vtx *vertices) {
+    shz_xmtrx_load_4x4((const shz_mat4x4_t *)&rsp.MP_matrix);
     if (rsp.geometry_mode & G_LIGHTING) {
         if (rsp.lights_changed) {
             int i;
@@ -823,21 +863,50 @@ static void  __attribute__((noinline)) gfx_sp_vertex(size_t n_vertices, size_t d
             calculate_normal_dir(&rsp.current_lookat[1], rsp.current_lookat_coeffs[1]);
             rsp.lights_changed = false;
         }
+        if (rsp.light_cols_changed) {
+            int i;
+            for (i = 0; i < rsp.current_num_lights; i++) {
+                // The ambient light (last) adds as is; directional ones scale by the N.L dot of the
+                // normal, whose components are in 1/127 units.
+                float scale = (i == rsp.current_num_lights - 1) ? 1.0f : recip127;
+                rsp.current_lights_colf[i][0] = rsp.current_lights[i].col[0] * scale;
+                rsp.current_lights_colf[i][1] = rsp.current_lights[i].col[1] * scale;
+                rsp.current_lights_colf[i][2] = rsp.current_lights[i].col[2] * scale;
+            }
+            rsp.light_cols_changed = false;
+        }
         gfx_sp_vertex_light(n_vertices, dest_index, vertices);
     } else {
         gfx_sp_vertex_no(n_vertices, dest_index, vertices);
     }
+    DC_PROF_COUNT(DCC_VERTS, n_vertices);
+    for (size_t i = 0; i < n_vertices; i++) {
+        sVtxBakeEpoch[dest_index + i] = 0;
+    }
 }
 
-static void __attribute__((noinline)) gfx_sp_vertex_light(size_t n_vertices, size_t dest_index, const Vtx *vertices) {
+static void SM_HOT __attribute__((noinline)) gfx_sp_vertex_light(size_t n_vertices, size_t dest_index, const Vtx *vertices) {
     size_t i;
+    // The batch's lights in locals: the loop stores into rsp.loaded_vertices, which GCC must assume
+    // may alias rsp.current_lights_*, so reading them from rsp would reload them per vertex.
+    const int nl = rsp.current_num_lights - 1;
+    float lcoef[MAX_LIGHTS][3], lcol[MAX_LIGHTS][3];
+    const float amb_r = rsp.current_lights_colf[nl][0];
+    const float amb_g = rsp.current_lights_colf[nl][1];
+    const float amb_b = rsp.current_lights_colf[nl][2];
+    for (int l = 0; l < nl; l++) {
+        for (int c = 0; c < 3; c++) {
+            lcoef[l][c] = rsp.current_lights_coeffs[l][c];
+            lcol[l][c] = rsp.current_lights_colf[l][c];
+        }
+    }
 
     for (i = 0; i < n_vertices; i++, dest_index++) {
         const Vtx_tn *vn = &vertices[i].n;
         struct LoadedVertex *d = &rsp.loaded_vertices[dest_index];
 
-        shz_vec4_t out = shz_xmtrx_trans_vec4(shz_vec4_init((float)vn->ob[0], (float)vn->ob[1], (float)vn->ob[2], 1.0f));
-        MEM_BARRIER_PREF(vn + 1);
+        shz_vec4_t out = shz_xmtrx_transform_vec4(shz_vec4_init((float)vn->ob[0], (float)vn->ob[1], (float)vn->ob[2], 1.0f));
+        MEM_BARRIER_PREF(vn + 4);   // Vtx is 16 bytes: two cache lines ahead
         d->x = (float)vn->ob[0];
         d->y = (float)vn->ob[1];
         d->z = (float)vn->ob[2];
@@ -854,24 +923,27 @@ static void __attribute__((noinline)) gfx_sp_vertex_light(size_t n_vertices, siz
         w = out.w;
         MEM_BARRIER();
 
-        int r = rsp.current_lights[rsp.current_num_lights - 1].col[0];
-        int g = rsp.current_lights[rsp.current_num_lights - 1].col[1];
-        int b = rsp.current_lights[rsp.current_num_lights - 1].col[2];
+        // Accumulate in float and convert once: int += float per light costs an int<->float
+        // round trip per channel per light on the SH4.
+        float r = amb_r;
+        float g = amb_g;
+        float b = amb_b;
+        const float nx = (float) vn->n[0], ny = (float) vn->n[1], nz = (float) vn->n[2];
         int i;
 
-        for (i = 0; i < rsp.current_num_lights - 1; i++) {
-            float intensity = MAX((float) 0.0f, (float) (recip127 * shz_dot6f((float) vn->n[0], (float) vn->n[1], (float) vn->n[2], rsp.current_lights_coeffs[i][0], rsp.current_lights_coeffs[i][1], rsp.current_lights_coeffs[i][2])));
+        for (i = 0; i < nl; i++) {
+            float intensity = shz_dot6f(nx, ny, nz, lcoef[i][0], lcoef[i][1], lcoef[i][2]);
 
             if (intensity > 0.0f) {
-                r += intensity * rsp.current_lights[i].col[0];
-                g += intensity * rsp.current_lights[i].col[1];
-                b += intensity * rsp.current_lights[i].col[2];
+                r += intensity * lcol[i][0];
+                g += intensity * lcol[i][1];
+                b += intensity * lcol[i][2];
             }
         }
 
-        d->color.r = MIN(255, r);
-        d->color.g = MIN(255, g);
-        d->color.b = MIN(255, b);
+        d->color.r = r >= 255.0f ? 255 : (uint8_t) r;
+        d->color.g = g >= 255.0f ? 255 : (uint8_t) g;
+        d->color.b = b >= 255.0f ? 255 : (uint8_t) b;
 
 #define recip2pi 0.159155f
 
@@ -926,15 +998,15 @@ static void __attribute__((noinline)) gfx_sp_vertex_light(size_t n_vertices, siz
     }
 }
 
-static void  __attribute__((noinline)) gfx_sp_vertex_no(size_t n_vertices, size_t dest_index, const Vtx *vertices) {
+static void SM_HOT __attribute__((noinline)) gfx_sp_vertex_no(size_t n_vertices, size_t dest_index, const Vtx *vertices) {
     size_t i;
 
 	for (i = 0; i < n_vertices; i++, dest_index++) {
 		const Vtx_t* v = &vertices[i].v;
 		struct LoadedVertex* d = &rsp.loaded_vertices[dest_index];
 
-        shz_vec4_t out = shz_xmtrx_trans_vec4(shz_vec4_init((float)v->ob[0], (float)v->ob[1], (float)v->ob[2], 1.0f));
-        MEM_BARRIER_PREF(v + 1);
+        shz_vec4_t out = shz_xmtrx_transform_vec4(shz_vec4_init((float)v->ob[0], (float)v->ob[1], (float)v->ob[2], 1.0f));
+        MEM_BARRIER_PREF(v + 4);    // Vtx is 16 bytes: two cache lines ahead
         d->x = (float)v->ob[0];
         d->y = (float)v->ob[1];
         d->z = (float)v->ob[2];
@@ -1002,40 +1074,6 @@ extern u8 gWarpTransBlue;
 // colour; a constant additive 'd' / a texture-independent colour is routed to oargb (added
 // post-modulate via the always-on specular bit). Carries MK64's cloud-oargb + has_texel
 // d-slot fixes. (a/b/d 4-bit, c 5-bit; mux 6 == G_CCMUX_1 == 1.0.)
-static inline float pvr_cc4(int mux, int ch, float tex, const float prim[4], const float env[4], const float shade[4]) {
-    switch (mux) {
-        case 1: case 2: return tex;   // TEXEL0 / TEXEL1 placeholder (substituted per texenv mode)
-        case 3: return prim[ch];
-        case 4: return shade[ch];
-        case 5: return env[ch];
-        case 6: return 1.0f;
-        default: return 0.0f;
-    }
-}
-static inline float pvr_cc5(int mux, int ch, float tex, const float prim[4], const float env[4], const float shade[4]) {
-    switch (mux) {
-        case 1: case 2: case 8: case 9: return tex;   // TEXEL0/1 colour or alpha placeholder
-        case 3: return prim[ch];
-        case 4: return shade[ch];
-        case 5: return env[ch];
-        case 6: return 1.0f;
-        case 10: return prim[3];
-        case 11: return shade[3];
-        case 12: return env[3];
-        default: return 0.0f;
-    }
-}
-static inline float pvr_ca(int mux, const float prim[4], const float env[4], const float shade[4]) {
-    switch (mux) {
-        case 1: case 2: return 1.0f;
-        case 3: return prim[3];
-        case 4: return shade[3];
-        case 5: return env[3];
-        case 6: return 1.0f;
-        default: return 0.0f;
-    }
-}
-
 // Derive the PVR texenv mode from the N64 1-cycle combiner (compact cc_id = rdp.combine_mode, the
 // CC_ enum). Maps the combiner's texel<->colour relationship onto REPLACE/MODULATE/DECAL/
 // MODULATEALPHA — replaces old per-shader-id texenv hacks.
@@ -1089,19 +1127,141 @@ static uint32_t derive_pvr_texenv(uint32_t cc_id) {
     return mode;
 }
 
-static inline void pvr_eval_combiner(uint32_t w0, uint32_t w1, const struct RGBA* sh,
-                                     int textured, uint32_t mode, uint32_t* out_argb, uint32_t* out_oargb) {
+// The combiner only changes with RDP state, so it is compiled once per triangle-state epoch
+// (cc_compile) into linear forms, and each vertex only evaluates those (cc_eval). Every slot of
+// (a-b)*c+d is k + kc*shade[ch] + ka*shade.a: a constant (prim, env, 1, 0, or the texel
+// placeholder) or one of the vertex's shade channels. Mux decode, as on the RSP:
+//   colour a/b/d (4-bit): 1,2 TEXEL0/1 placeholder, 3 PRIM, 4 SHADE, 5 ENV, 6 1.0 (G_CCMUX_1)
+//   colour c (5-bit):     1,2,8,9 texel placeholder, 3 PRIM, 4 SHADE, 5 ENV, 6 1.0,
+//                         10 PRIM_ALPHA, 11 SHADE_ALPHA, 12 ENV_ALPHA
+//   alpha (3-bit):        1,2 texel (1.0), 3 PRIM, 4 SHADE, 5 ENV, 6 1.0
+// The texel placeholder substitutes per texenv mode (see cc_compile).
+typedef struct {
+    float k, kc, ka;
+} CCForm;
+
+typedef struct {
+    uint8_t replace;       // REPLACE texenv: px = texel, argb white, no offset
+    uint8_t all_const;     // no slot reads shade: const_argb/const_oargb hold the result
+    uint8_t bytes;         // every channel is the shade byte or a constant: keep/konst masks
+    uint8_t linear;        // every channel's c slot is constant: lin[] holds (a-b)*c+d folded
+    uint8_t cct;           // colour_const_textured: whole colour goes to oargb, argb rgb = 0
+    uint8_t offset_shade;  // the additive d slot is SHADE, routed to oargb per vertex
+    CCForm col[3][4];      // [channel][a, b, c, d]
+    CCForm alpha[4];
+    uint32_t const_argb, const_oargb;
+    // bytes: channel = (shade & keep) | konst, in ARGB order. For cct the rgb part goes to oargb.
+    uint32_t keep, konst;
+    // linear: channel = clamp(k + kc*shade[ch] + ka*shade.a), [r, g, b, a].
+    CCForm lin[4];
+} CompiledCC;
+
+static CCForm cc_slot4(int mux, int ch, float tex, const float prim[4], const float env[4]) {
+    CCForm f = { 0.0f, 0.0f, 0.0f };
+    switch (mux) {
+        case 1: case 2: f.k = tex; break;   // TEXEL0 / TEXEL1 placeholder (substituted per texenv mode)
+        case 3: f.k = prim[ch]; break;
+        case 4: f.kc = 1.0f; break;
+        case 5: f.k = env[ch]; break;
+        case 6: f.k = 1.0f; break;
+        default: break;
+    }
+    return f;
+}
+
+static CCForm cc_slot5(int mux, int ch, float tex, const float prim[4], const float env[4]) {
+    CCForm f = { 0.0f, 0.0f, 0.0f };
+    switch (mux) {
+        case 1: case 2: case 8: case 9: f.k = tex; break;   // TEXEL0/1 colour or alpha placeholder
+        case 3: f.k = prim[ch]; break;
+        case 4: f.kc = 1.0f; break;
+        case 5: f.k = env[ch]; break;
+        case 6: f.k = 1.0f; break;
+        case 10: f.k = prim[3]; break;
+        case 11: f.ka = 1.0f; break;
+        case 12: f.k = env[3]; break;
+        default: break;
+    }
+    return f;
+}
+
+static CCForm cc_slot_alpha(int mux, const float prim[4], const float env[4]) {
+    CCForm f = { 0.0f, 0.0f, 0.0f };
+    switch (mux) {
+        case 1: case 2: f.k = 1.0f; break;
+        case 3: f.k = prim[3]; break;
+        case 4: f.ka = 1.0f; break;
+        case 5: f.k = env[3]; break;
+        case 6: f.k = 1.0f; break;
+        default: break;
+    }
+    return f;
+}
+
+static inline __attribute__((always_inline)) float cc_form(const CCForm *f, float s_ch, float s_a) {
+    return f->k + f->kc * s_ch + f->ka * s_a;
+}
+
+static inline __attribute__((always_inline)) float cc_clamp01(float v) {
+    return v < 0.0f ? 0.0f : (v > 1.0f ? 1.0f : v);
+}
+
+static inline __attribute__((always_inline)) float cc_apply(const CCForm f[4], float s_ch, float s_a) {
+    return cc_clamp01((cc_form(&f[0], s_ch, s_a) - cc_form(&f[1], s_ch, s_a)) * cc_form(&f[2], s_ch, s_a) +
+                      cc_form(&f[3], s_ch, s_a));
+}
+
+static void cc_eval(const CompiledCC *cc, const struct RGBA *sh, uint32_t *out_argb, uint32_t *out_oargb);
+
+static inline int cc_form_const(const CCForm *f) {
+    return f->kc == 0.0f && f->ka == 0.0f;
+}
+
+// The form is exactly the channel's shade value: shade[ch] (kc) for colour, shade.a (ka) for alpha.
+static inline int cc_form_shade(const CCForm *f, int alpha) {
+    return f->k == 0.0f && (alpha ? (f->kc == 0.0f && f->ka == 1.0f) : (f->kc == 1.0f && f->ka == 0.0f));
+}
+
+// clamp((a-b)*c+d) is exactly the shade value for every shade in [0,1]: the shapes the SM64
+// combiners take (SHADE, TEXEL0*SHADE with the texel factored out, ...). Byte -> float -> byte
+// round-trips exactly through *1/255 and *255, so such a channel is just the shade byte.
+static int cc_channel_passes_shade(const CCForm f[4], int alpha) {
+    const CCForm *a = &f[0], *b = &f[1], *c = &f[2], *d = &f[3];
+    int d_zero = cc_form_const(d) && d->k == 0.0f;
+    if (cc_form_shade(d, alpha)) {
+        int c_zero = cc_form_const(c) && c->k == 0.0f;
+        int a_eq_b = a->k == b->k && a->kc == b->kc && a->ka == b->ka;
+        return c_zero || a_eq_b;
+    }
+    if (d_zero && cc_form_shade(c, alpha)) {
+        return cc_form_const(a) && cc_form_const(b) && a->k == 1.0f && b->k == 0.0f;
+    }
+    if (d_zero && cc_form_const(c) && c->k == 1.0f) {
+        return cc_form_shade(a, alpha) && cc_form_const(b) && b->k == 0.0f;
+    }
+    return 0;
+}
+
+static inline int cc_channel_const(const CCForm f[4]) {
+    return cc_form_const(&f[0]) && cc_form_const(&f[1]) && cc_form_const(&f[2]) && cc_form_const(&f[3]);
+}
+
+// Evaluate cycle-0 (a-b)*c+d for colour AND alpha from the RAW G_SETCOMBINE words (ported from
+// MK64). TEXEL substitutes to 1.0 (the PVR does the real texture modulate), so argb is the
+// modulate colour; a constant additive 'd' / a texture-independent colour is routed to oargb
+// (added post-modulate via the always-on specular bit). Carries MK64's cloud-oargb + has_texel
+// d-slot fixes.
+static void cc_compile(CompiledCC *cc, uint32_t w0, uint32_t w1, int textured, uint32_t mode) {
+    memset(cc, 0, sizeof(*cc));
     // REPLACE ignores the vertex colour (px = texel); oargb (added afterward) must be 0.
     if (mode == GFX_TEXENV_REPLACE) {
-        *out_argb = 0xFFFFFFFFu;
-        *out_oargb = 0;
+        cc->replace = 1;
         return;
     }
 
     const float r255 = 1.0f / 255.0f;
     const float prim[4]  = { rdp.prim_color.r*r255, rdp.prim_color.g*r255, rdp.prim_color.b*r255, rdp.prim_color.a*r255 };
     const float env[4]   = { rdp.env_color.r*r255,  rdp.env_color.g*r255,  rdp.env_color.b*r255,  rdp.env_color.a*r255 };
-    const float shade[4] = { sh->r*r255, sh->g*r255, sh->b*r255, sh->a*r255 };
     // DECAL: PVR lerps vtx<->texel by texel.a, so the FACE colour is the combiner with the texel
     // terms ABSENT (texel->0; e.g. Boo's (TEXEL0-SHADE)*TEXEL0A+SHADE collapses to SHADE).
     // MODULATE/MODULATEALPHA factor the texel OUT (texel->1) to get the multiplier colour.
@@ -1117,47 +1277,191 @@ static inline void pvr_eval_combiner(uint32_t w0, uint32_t w1, const struct RGBA
     // colour-from-constant on a textured (alpha-only) poly -> route whole colour to oargb so
     // MODULATE doesn't darken it. Only trustworthy in 1-cycle (cycle-1 texel is invisible here).
     int two_cycle = ((rdp.other_mode_h & (3U << G_MDSFT_CYCLETYPE)) == G_CYC_2CYCLE);
-    int color_const_textured = textured && !has_texel && !two_cycle;
+    cc->cct = textured && !has_texel && !two_cycle;
     // The combiner's additive d term ((a-b)*c + d) can't be done in PVR's MODULATE (which only
     // multiplies texel*col), so route a constant/per-vertex d into oargb (added post-modulate):
     // d == PRIM(3) / SHADE(4) / ENV(5). This is what makes "(X)*texel + d" combiners correct —
     // REFLECTRGB (env*tex+shade), HILITERGB ((prim-shade)*tex+shade, the goddard head), BLENDI,
     // ADDRGB — instead of collapsing to (X+d)*tex (dark everywhere, only bright texels survive).
     // DECAL keeps its additive base colour in argb (via texv=0), so don't also route it to oargb.
-    int offset = (mode != GFX_TEXENV_DECAL) && !color_const_textured &&
-                 (d == 3 || d == 4 || d == 5) && has_texel;
+    int offset = (mode != GFX_TEXENV_DECAL) && !cc->cct && (d == 3 || d == 4 || d == 5) && has_texel;
 
-    uint32_t col[4];
-    uint32_t oarr[3] = { 0, 0, 0 };
     for (int ch = 0; ch < 3; ch++) {
-        float va = pvr_cc4(a, ch, texv, prim, env, shade);
-        float vb = pvr_cc4(b, ch, texv, prim, env, shade);
-        float vc = pvr_cc5(c, ch, texv, prim, env, shade);
-        if (color_const_textured) {
-            float v = (va - vb) * vc + pvr_cc4(d, ch, texv, prim, env, shade);
-            v = v < 0.0f ? 0.0f : (v > 1.0f ? 1.0f : v);
-            oarr[ch] = (uint32_t)(v * 255.0f);
-            col[ch]  = 0;
-        } else {
-            float vd = offset ? 0.0f : pvr_cc4(d, ch, texv, prim, env, shade);
-            float v = (va - vb) * vc + vd;
-            v = v < 0.0f ? 0.0f : (v > 1.0f ? 1.0f : v);
-            col[ch] = (uint32_t)(v * 255.0f);
+        cc->col[ch][0] = cc_slot4(a, ch, texv, prim, env);
+        cc->col[ch][1] = cc_slot4(b, ch, texv, prim, env);
+        cc->col[ch][2] = cc_slot5(c, ch, texv, prim, env);
+        // An offset d is added after the PVR modulate (oargb), so it drops out of argb.
+        if (!offset) {
+            cc->col[ch][3] = cc_slot4(d, ch, texv, prim, env);
         }
     }
-    if (color_const_textured) {
-        *out_oargb = PACK_ARGB8888(oarr[0], oarr[1], oarr[2], 0);
-    } else if (offset) {
-        const float* o = (d == 3) ? prim : (d == 4) ? shade : env;
-        *out_oargb = PACK_ARGB8888((uint32_t)(o[0]*255.0f), (uint32_t)(o[1]*255.0f), (uint32_t)(o[2]*255.0f), 0);
-    } else {
-        *out_oargb = 0;
+    cc->alpha[0] = cc_slot_alpha(aa, prim, env);
+    cc->alpha[1] = cc_slot_alpha(ab, prim, env);
+    cc->alpha[2] = cc_slot_alpha(ac, prim, env);
+    cc->alpha[3] = cc_slot_alpha(ad, prim, env);
+
+    uint32_t off_rgb = 0;
+    if (offset) {
+        if (d == 4) {
+            cc->offset_shade = 1;
+        } else {
+            const float *o = (d == 3) ? prim : env;
+            off_rgb = PACK_ARGB8888((uint32_t)(o[0]*255.0f), (uint32_t)(o[1]*255.0f), (uint32_t)(o[2]*255.0f), 0);
+        }
     }
-    float av = (pvr_ca(aa, prim, env, shade) - pvr_ca(ab, prim, env, shade)) * pvr_ca(ac, prim, env, shade)
-               + pvr_ca(ad, prim, env, shade);
-    av = av < 0.0f ? 0.0f : (av > 1.0f ? 1.0f : av);
-    col[3] = (uint32_t)(av * 255.0f);
-    *out_argb = PACK_ARGB8888(col[0], col[1], col[2], col[3]);
+
+    // Constant c slots: fold (a-b)*c+d into one linear form per channel. (Rounding can differ from
+    // the slot-by-slot evaluation in the last bit, at most one level of one channel.)
+    {
+        int ok = 1;
+        for (int ch = 0; ch < 4 && ok; ch++) {
+            const CCForm *f = ch < 3 ? cc->col[ch] : cc->alpha;
+            if (!cc_form_const(&f[2])) {
+                ok = 0;
+                break;
+            }
+            float c = f[2].k;
+            cc->lin[ch].k = (f[0].k - f[1].k) * c + f[3].k;
+            cc->lin[ch].kc = (f[0].kc - f[1].kc) * c + f[3].kc;
+            cc->lin[ch].ka = (f[0].ka - f[1].ka) * c + f[3].ka;
+        }
+        cc->linear = ok;
+    }
+
+    int reads_shade = cc->offset_shade;
+    for (int ch = 0; ch < 3; ch++) {
+        for (int i = 0; i < 4; i++) {
+            reads_shade |= cc->col[ch][i].kc != 0.0f || cc->col[ch][i].ka != 0.0f;
+        }
+    }
+    for (int i = 0; i < 4; i++) {
+        reads_shade |= cc->alpha[i].ka != 0.0f;
+    }
+    cc->const_oargb = off_rgb;
+
+    // Byte path: every channel either passes its shade byte through or is constant.
+    {
+        static const uint32_t shift[4] = { 16, 8, 0, 24 };   // r, g, b, a in ARGB
+        uint32_t keep = 0;
+        int ok = 1;
+        for (int ch = 0; ch < 4 && ok; ch++) {
+            const CCForm *f = ch < 3 ? cc->col[ch] : cc->alpha;
+            if (cc_channel_passes_shade(f, ch == 3)) {
+                keep |= 0xFFu << shift[ch];
+            } else if (!cc_channel_const(f)) {
+                ok = 0;
+            }
+        }
+        if (ok) {
+            // The constant channels: evaluate with a zero shade, then drop the kept ones.
+            static const struct RGBA zero_shade = { 0, 0, 0, 0 };
+            uint32_t argb0, oargb0;
+            cc_eval(cc, &zero_shade, &argb0, &oargb0);
+            cc->keep = keep;
+            if (cc->cct) {
+                // rgb lives in oargb, alpha in argb: keep the masks in ARGB order and split at eval.
+                cc->konst = ((oargb0 & 0x00FFFFFFu) | (argb0 & 0xFF000000u)) & ~keep;
+            } else {
+                cc->konst = argb0 & ~keep;
+            }
+            cc->bytes = 1;
+        }
+    }
+
+    if (!reads_shade) {
+        static const struct RGBA no_shade = { 0, 0, 0, 0 };
+        cc_eval(cc, &no_shade, &cc->const_argb, &cc->const_oargb);
+        cc->all_const = 1;
+    }
+}
+
+static void __attribute__((noinline, cold)) cc_eval_float(const CompiledCC *cc, const struct RGBA *sh,
+                                                          uint32_t *out_argb, uint32_t *out_oargb);
+static void cc_compile(CompiledCC *cc, uint32_t w0, uint32_t w1, int textured, uint32_t mode);
+
+// cc_compile runs at every triangle-state setup (~80 a frame), but a scene uses a handful of
+// combiner/colour combinations over and over. Remember the last results, keyed by everything
+// cc_compile reads, so a setup usually copies a CompiledCC instead of recompiling it.
+#define CC_MEMO_SIZE 32
+static struct {
+    uint32_t w0, w1, prim, env, flags;   // flags: textured | mode << 1 | two_cycle << 8 | valid << 9
+    CompiledCC cc;
+} sCcMemo[CC_MEMO_SIZE];
+
+static void cc_compile_cached(CompiledCC *cc, uint32_t w0, uint32_t w1, int textured, uint32_t mode) {
+    uint32_t two_cycle = ((rdp.other_mode_h & (3U << G_MDSFT_CYCLETYPE)) == G_CYC_2CYCLE);
+    uint32_t prim = PACK_ARGB8888(rdp.prim_color.r, rdp.prim_color.g, rdp.prim_color.b, rdp.prim_color.a);
+    uint32_t env = PACK_ARGB8888(rdp.env_color.r, rdp.env_color.g, rdp.env_color.b, rdp.env_color.a);
+    uint32_t flags = (textured ? 1u : 0u) | (mode << 1) | (two_cycle << 8) | (1u << 9);
+    uint32_t h = (w0 ^ (w1 * 0x9E3779B1u) ^ (prim * 0x85EBCA6Bu) ^ (env * 0xC2B2AE35u) ^ flags);
+    h = (h ^ (h >> 15) ^ (h >> 23)) & (CC_MEMO_SIZE - 1);
+    if (sCcMemo[h].flags == flags && sCcMemo[h].w0 == w0 && sCcMemo[h].w1 == w1 && sCcMemo[h].prim == prim &&
+        sCcMemo[h].env == env) {
+        *cc = sCcMemo[h].cc;
+        return;
+    }
+    cc_compile(cc, w0, w1, textured, mode);
+    sCcMemo[h].w0 = w0;
+    sCcMemo[h].w1 = w1;
+    sCcMemo[h].prim = prim;
+    sCcMemo[h].env = env;
+    sCcMemo[h].flags = flags;
+    sCcMemo[h].cc = *cc;
+}
+
+static inline void cc_eval(const CompiledCC *cc, const struct RGBA *sh, uint32_t *out_argb, uint32_t *out_oargb) {
+    if (cc->replace) {
+        *out_argb = 0xFFFFFFFFu;
+        *out_oargb = 0;
+        return;
+    }
+    if (cc->all_const) {
+        *out_argb = cc->const_argb;
+        *out_oargb = cc->const_oargb;
+        return;
+    }
+    if (cc->bytes) {
+        uint32_t packed = PACK_ARGB8888(sh->r, sh->g, sh->b, sh->a);
+        uint32_t v = (packed & cc->keep) | cc->konst;
+        if (cc->cct) {
+            *out_oargb = v & 0x00FFFFFFu;
+            *out_argb = v & 0xFF000000u;
+        } else {
+            *out_argb = v;
+            *out_oargb = cc->offset_shade ? (packed & 0x00FFFFFFu) : cc->const_oargb;
+        }
+        return;
+    }
+    cc_eval_float(cc, sh, out_argb, out_oargb);
+}
+
+// Combiners that mix shade with a constant factor: the general linear-form evaluation.
+static void __attribute__((noinline, cold)) cc_eval_float(const CompiledCC *cc, const struct RGBA *sh,
+                                                          uint32_t *out_argb, uint32_t *out_oargb) {
+    const float r255 = 1.0f / 255.0f;
+    const float s[4] = { sh->r*r255, sh->g*r255, sh->b*r255, sh->a*r255 };
+    uint32_t col[3];
+    uint32_t alpha;
+    if (cc->linear) {
+        for (int ch = 0; ch < 3; ch++) {
+            col[ch] = (uint32_t)(cc_clamp01(cc_form(&cc->lin[ch], s[ch], s[3])) * 255.0f);
+        }
+        alpha = (uint32_t)(cc_clamp01(cc_form(&cc->lin[3], s[3], s[3])) * 255.0f);
+    } else {
+        for (int ch = 0; ch < 3; ch++) {
+            col[ch] = (uint32_t)(cc_apply(cc->col[ch], s[ch], s[3]) * 255.0f);
+        }
+        alpha = (uint32_t)(cc_apply(cc->alpha, s[3], s[3]) * 255.0f);
+    }
+    if (cc->cct) {
+        *out_oargb = PACK_ARGB8888(col[0], col[1], col[2], 0);
+        *out_argb = PACK_ARGB8888(0, 0, 0, alpha);
+    } else {
+        *out_oargb = cc->offset_shade ? PACK_ARGB8888((uint32_t)(s[0]*255.0f), (uint32_t)(s[1]*255.0f),
+                                                      (uint32_t)(s[2]*255.0f), 0)
+                                      : cc->const_oargb;
+        *out_argb = PACK_ARGB8888(col[0], col[1], col[2], alpha);
+    }
 }
 
 // ---- Near-plane (eye) clip ---------------------------------------------------------------
@@ -1216,71 +1520,33 @@ static int sm_near_clip_fan(struct LoadedVertex *v1, struct LoadedVertex *v2,
     return 1;
 }
 
-static void  __attribute__((noinline)) gfx_sp_tri1(uint8_t vtx1_idx, uint8_t vtx2_idx, uint8_t vtx3_idx) {
-    struct LoadedVertex* v1 = &rsp.loaded_vertices[vtx3_idx];
-    MEM_BARRIER_PREF(v1);
-    struct LoadedVertex* v2 = &rsp.loaded_vertices[vtx2_idx];
-    struct LoadedVertex* v3 = &rsp.loaded_vertices[vtx1_idx];
-    uint8_t l_clip_rej[3] = { clip_rej[vtx3_idx], clip_rej[vtx2_idx], clip_rej[vtx1_idx] };
-    MEM_BARRIER_PREF(v2);
-    struct LoadedVertex* v_arr[3] = { v1, v2, v3 };
-    uint8_t c0 = l_clip_rej[0];
-    uint8_t c1 = l_clip_rej[1];
-    uint8_t c2 = l_clip_rej[2];
-    MEM_BARRIER_PREF(v3);
+// ---- Triangle state + baked-vertex cache ("blast" path, after the DKR port) -------------------
+// Everything gfx_sp_tri1 derives from RSP/RDP state (render mode, combiner, texture, list kind,
+// screen map...) only changes when the display list runs a state command, so it is computed once
+// per "state epoch" (tri_state_setup) instead of once per triangle. Every command except
+// G_TRI1/G_TRI2/G_VTX/G_DL/G_ENDDL starts a new epoch (gfx_run_dl).
+//
+// Likewise a loaded vertex is baked into its final PVR form (screen x/y, 1/w, UV, combined
+// colours, fog) once per epoch and reused by every triangle that shares it, instead of being
+// re-projected and re-combined for each triangle corner. gfx_sp_vertex invalidates the slots it
+// loads. Triangles crossing the near plane, 2D-as-triangles overlays and the peach/bowser
+// trilerp still take the per-corner path, which handles their per-triangle z and alpha.
 
-    if ((c0 & c1 & c2) & 0x3f) {
-        // The whole triangle lies outside the visible area
-        return;
-    }
-    if ((rsp.geometry_mode & G_CULL_BOTH) != 0) {
-        // PVR stores RAW CLIP _x,_y; the back-face test needs NDC, so divide per vertex.
-        float rw1 = shz_fast_invf(v1->_w), rw2 = shz_fast_invf(v2->_w), rw3 = shz_fast_invf(v3->_w);
-        float dx1 = (v1->_x * rw1) - (v2->_x * rw2);
-        float dy1 = (v1->_y * rw1) - (v2->_y * rw2);
-        float dx2 = (v3->_x * rw3) - (v2->_x * rw2);
-        float dy2 = (v3->_y * rw3) - (v2->_y * rw2);
-        float cross = dx1 * dy2 - dy1 * dx2;
-        if ((c0 ^ c1 ^ c2) & 0x40) {
-            // If one vertex lies behind the eye, negating cross will give the correct result.
-            // If all vertices lie behind the eye, the triangle will be rejected anyway.
-            cross = -cross;
-        }
-        switch (rsp.geometry_mode & G_CULL_BOTH) {
-            case G_CULL_FRONT:
-                if (cross >= 0) {
-                    return;
-                }
-                break;
-            case G_CULL_BACK:
-                if (cross <= 0) {
-                    return;
-                }
-                break;
-            default:
-                break;
-        }
-    }
+static struct {
+    uint32_t epoch;          // sTriStateEpoch these values were computed for (0 = never)
+    uint8_t fast;            // the baked-vertex path may draw this state
+    uint8_t usetex, linear_filter, depth_test, zmode_decal, ortho_3d, cull_flip;
+    uint32_t texenv;
+    float recip_tw, recip_th, pvr_us, pvr_vs, uls, ult;
+    CompiledCC cc;
+} sTri SM_HOT_DATA;
 
+extern void pvr_submit_op_tri(const dc_fast_t *a, const dc_fast_t *b, const dc_fast_t *c);
+
+// Apply the current RSP/RDP state to the backend and cache what the per-vertex emit needs.
+static void __attribute__((noinline, cold)) tri_state_setup(void) {
     if (matrix_dirty) {
         matrix_dirty = 0;
-    }
-
-    if (in_trilerp) {
-        if (doing_bowser) {
-            float mx,my,mz;
-            get_mario_pos(&mx,&my,&mz);
-            float distance_frac = -(mz * 0.00025f);
-
-            if (distance_frac < 0.0f)
-			 	distance_frac = 0.0f;
-            else if (distance_frac > 1.0f)
-    			distance_frac = 1.0f;
-
-            distance_frac = 1.0f - step_ramp_pow(distance_frac, 0.8f, 2.0f);
-
-            trilerp_a = (uint8_t)(distance_frac * 255.0f);
-        }
     }
 
     bool depth_test = (rsp.geometry_mode & G_ZBUFFER) == G_ZBUFFER;
@@ -1302,13 +1568,13 @@ static void  __attribute__((noinline)) gfx_sp_tri1(uint8_t vtx1_idx, uint8_t vtx
         gfx_rapi->set_depth_mask(z_upd);
         rendering_state.depth_mask = z_upd;
     }
-    
+
     bool zmode_decal = (rdp.other_mode_l & ZMODE_DEC) == ZMODE_DEC;
     if (zmode_decal != rendering_state.decal_mode) {
         gfx_rapi->set_zmode_decal(zmode_decal);
         rendering_state.decal_mode = zmode_decal;
     }
-    
+
     if (rdp.viewport_or_scissor_changed) {
         if (memcmp(&rdp.viewport, &rendering_state.viewport, sizeof(rdp.viewport)) != 0) {
 //            gfx_rapi->set_viewport(rdp.viewport.x, rdp.viewport.y, rdp.viewport.width, rdp.viewport.height);
@@ -1324,9 +1590,9 @@ static void  __attribute__((noinline)) gfx_sp_tri1(uint8_t vtx1_idx, uint8_t vtx
         }
         rdp.viewport_or_scissor_changed = false;
     }
-    
+
     uint32_t cc_id = rdp.combine_mode;
-    
+
     bool use_alpha = (rdp.other_mode_l & (G_BL_A_MEM << 18)) == 0;
     bool use_fog = (rdp.other_mode_l >> 30) == G_BL_CLR_FOG;
     if ((rsp.use_fog != use_fog)) {
@@ -1334,20 +1600,20 @@ static void  __attribute__((noinline)) gfx_sp_tri1(uint8_t vtx1_idx, uint8_t vtx
     }
     bool texture_edge = (rdp.other_mode_l & CVG_X_ALPHA) == CVG_X_ALPHA;
     bool use_noise = (rdp.other_mode_l & G_AC_DITHER) == G_AC_DITHER;
-    
+
     if (texture_edge) {
         use_alpha = true;
     }
-    
+
     if (use_alpha) cc_id |= SHADER_OPT_ALPHA;
     if (use_fog) cc_id |= SHADER_OPT_FOG;
     if (texture_edge) cc_id |= SHADER_OPT_TEXTURE_EDGE;
     if (use_noise) cc_id |= SHADER_OPT_NOISE;
-    
+
     if (!use_alpha) {
         cc_id &= ~0xfff000;
     }
-    
+
     struct ColorCombiner *comb = gfx_lookup_or_create_color_combiner(cc_id);
     struct ShaderProgram *prg = comb->prg;
     if (prg != rendering_state.shader_program) {
@@ -1363,7 +1629,6 @@ static void  __attribute__((noinline)) gfx_sp_tri1(uint8_t vtx1_idx, uint8_t vtx
 
     uint8_t num_inputs;
     uint8_t usetex = gfx_rapi->shader_get_info(prg, &num_inputs);
-    int i;
 
     uint8_t linear_filter = (rdp.other_mode_h & (3U << G_MDSFT_TEXTFILT)) != G_TF_POINT;
 
@@ -1382,7 +1647,9 @@ static void  __attribute__((noinline)) gfx_sp_tri1(uint8_t vtx1_idx, uint8_t vtx
             line_size = 1;
             tex_height_i = tex_size_bytes;
         } else {
-            tex_height_i = (uint32_t) shz_divf((float) tex_size_bytes , (float) line_size);
+            // Via int32_t: SH4 has no unsigned->float instruction, so a uint32_t converts through
+            // double precision, and sh4zam's fsrra must not land inside that FPSCR window.
+            tex_height_i = (uint32_t) shz_divf((float) (int32_t) tex_size_bytes, (float) (int32_t) line_size);
         }
 
         switch (rdp.texture_tile.siz) {
@@ -1428,8 +1695,8 @@ static void  __attribute__((noinline)) gfx_sp_tri1(uint8_t vtx1_idx, uint8_t vtx
         uint32_t tex_width = (rdp.texture_tile.lrs - rdp.texture_tile.uls + 4) >> 2;
         uint32_t tex_height = (rdp.texture_tile.lrt - rdp.texture_tile.ult + 4) >> 2;
 
-        recip_tw = shz_fast_invf(tex_width);
-        recip_th = shz_fast_invf(tex_height);
+        recip_tw = shz_invf((float) (int32_t) tex_width);   // int32_t: see tex_height_i above
+        recip_th = shz_invf((float) (int32_t) tex_height);
     }
 
     // ---- 3-way OP/PT/TR classification (raw alpha mux + render-mode flags) --------------
@@ -1442,7 +1709,7 @@ static void  __attribute__((noinline)) gfx_sp_tri1(uint8_t vtx1_idx, uint8_t vtx
         uint8_t alpha_uses_texel = (aa == 1 || aa == 2 || ab == 1 || ab == 2 ||
                                     ac == 1 || ac == 2 || ad == 1 || ad == 2);
         uint8_t alpha_compare_on = (rdp.other_mode_l & 3) != 0;   // G_AC_THRESHOLD/DITHER
-        uint8_t real_blend = (rdp.other_mode_l & FORCE_BL) != 0;
+        uint8_t real_blend = (rdp.other_mode_l & FORCE_BL) && !pvr_blend_is_source(rdp.other_mode_l, rdp.other_mode_h);
         uint8_t cutout     = texture_edge || (alpha_uses_texel && alpha_compare_on);
         uint8_t kind = real_blend ? 2 : (cutout ? 1 : 0);   // TR : PT : OP
         if (kind != pvr_cur_kind) {
@@ -1459,13 +1726,9 @@ static void  __attribute__((noinline)) gfx_sp_tri1(uint8_t vtx1_idx, uint8_t vtx
         }
     }
 
-    // Near-plane clip the triangle into a fan of 1-2 tris (instead of dropping eye-crossers).
-    struct LoadedVertex *fan_tris[2][3];
-    int n_tris = sm_near_clip_fan(v1, v2, v3, fan_tris);
-    if (n_tris == 0) return;   // fully behind the eye plane
     // Texenv derived from the N64 combiner (REPLACE/MODULATE/DECAL/MODULATEALPHA). A change ends
     // the current batch — the PVR poly header (cxt.txr.env) is per-batch — so flush first, then
-    // the per-vertex argb below is evaluated in the matching mode.
+    // the per-vertex argb is evaluated in the matching mode.
     uint32_t texenv = usetex ? derive_pvr_texenv(rdp.combine_mode) : GFX_TEXENV_MODULATE;
     if (texenv != rendering_state.tex_env) {
         gfx_rapi->set_tex_env(texenv);
@@ -1480,14 +1743,136 @@ static void  __attribute__((noinline)) gfx_sp_tri1(uint8_t vtx1_idx, uint8_t vtx
         gfx_pvr_set_fog(fog_on);
         rendering_state.fog_enabled = fog_on;
     }
-    // PVR has no buf_vbo — the deferred bucket guards its own overflow (pvr_reserve returns NULL).
-    // POT-padding UV correction for the bound texture (real/padded). Same for all 3 verts.
-    float pvr_us = usetex ? gfx_pvr_get_u_scale() : 1.0f;
-    float pvr_vs = usetex ? gfx_pvr_get_v_scale() : 1.0f;
+
+    DC_PROF_COUNT(DCC_SETUPS, 1);
+    sTri.epoch = sTriStateEpoch;
+    cc_compile_cached(&sTri.cc, rdp.combine_w0, rdp.combine_w1, usetex, texenv);
+    sTri.usetex = usetex;
+    sTri.linear_filter = linear_filter;
+    sTri.depth_test = depth_test;
+    sTri.zmode_decal = zmode_decal;
+    sTri.texenv = texenv;
+    sTri.recip_tw = recip_tw;
+    sTri.recip_th = recip_th;
+    // POT-padding UV correction for the bound texture (real/padded). Same for all verts.
+    sTri.pvr_us = usetex ? gfx_pvr_get_u_scale() : 1.0f;
+    sTri.pvr_vs = usetex ? gfx_pvr_get_v_scale() : 1.0f;
+    sTri.uls = (float) (rdp.texture_tile.uls << 3);
+    sTri.ult = (float) (rdp.texture_tile.ult << 3);
     // Ortho 3D GEOMETRY (depth-tested, e.g. goddard's head): under ortho w is ~constant, so 1/w
-    // carries NO depth — derive depth from the clip-space z instead (below). This is NOT a 2D
+    // carries NO depth — derive depth from the clip-space z instead (see bake). This is NOT a 2D
     // overlay; without this it z-fights/renders inside-out (faces resolve in submit order).
-    int ortho_3d = proj_is_ortho && depth_test;
+    sTri.ortho_3d = proj_is_ortho && depth_test;
+    // Screen-space winding = NDC winding * sign(xscale * yscale).
+    sTri.cull_flip = (sm_xscale * sm_yscale) < 0.0f;
+    // Ortho Z-off triangles may be 2D overlays with a per-triangle paint-order z, and the trilerp
+    // passes override alpha per pass: both keep the per-corner path.
+    sTri.fast = !(proj_is_ortho && !depth_test) && !in_trilerp;
+}
+
+// Bake one loaded vertex into its final PVR form for the current state (z per sTri: 1/w, decal-
+// biased 1/w, ortho clip z, or far-pinned for Z-off geometry). The caller sets flags at emit.
+static inline void tri_bake_vertex(dc_fast_t *bv, const struct LoadedVertex *v) {
+    float invw = shz_invf(v->_w);
+    bv->vert.x = sm_xscale * (v->_x * invw) + sm_xbias;
+    bv->vert.y = sm_yscale * (v->_y * invw) + sm_ybias;
+    if (sTri.ortho_3d)        bv->vert.z = 1.0f - (v->_z * invw);
+    else if (sTri.depth_test) bv->vert.z = sTri.zmode_decal ? invw * PVR_DECAL_ZBIAS : invw;
+    else                      bv->vert.z = 0.00001f;
+    if (sTri.usetex) {
+        float u = (v->u - sTri.uls) * 0.03125f;
+        float vv = (v->v - sTri.ult) * 0.03125f;
+        if (sTri.linear_filter) {
+            // Linear filter adds 0.5f to the coordinates
+            u += 0.5f;
+            vv += 0.5f;
+        }
+        bv->texture.u = u * sTri.recip_tw * sTri.pvr_us;
+        bv->texture.v = vv * sTri.recip_th * sTri.pvr_vs;
+    }
+    uint32_t argb, oargb;
+    cc_eval(&sTri.cc, &v->color, &argb, &oargb);
+    // PVR hardware vertex fog reads the density from the offset-colour (oargb) ALPHA.
+    bv->color.packed = argb;
+    bv->pad0.vertindex = oargb | ((uint32_t) v->fog << 24);
+}
+
+static inline const dc_fast_t *tri_baked(uint8_t idx) {
+    if (sVtxBakeEpoch[idx] != sTriStateEpoch) {
+        DC_PROF_COUNT(DCC_BAKES, 1);
+        tri_bake_vertex(&sVtxBaked[idx], &rsp.loaded_vertices[idx]);
+        sVtxBakeEpoch[idx] = sTriStateEpoch;
+    }
+    return &sVtxBaked[idx];
+}
+
+// Everything the cached-vertex path can't draw: corners behind the near plane (clipped into a fan),
+// 2D-as-triangles overlays with per-triangle paint-order z, and the peach/bowser trilerp passes.
+// Cold and out of line so the hot triangle path stays small in the instruction cache.
+static void __attribute__((noinline, cold)) gfx_sp_tri1_slow(struct LoadedVertex *v1, struct LoadedVertex *v2,
+                                                           struct LoadedVertex *v3, uint8_t c0, uint8_t c1,
+                                                           uint8_t c2) {
+    struct LoadedVertex* v_arr[3] = { v1, v2, v3 };
+
+    if ((rsp.geometry_mode & G_CULL_BOTH) != 0) {
+        // PVR stores RAW CLIP _x,_y; the back-face test needs NDC, so divide per vertex.
+        float rw1 = shz_invf(v1->_w), rw2 = shz_invf(v2->_w), rw3 = shz_invf(v3->_w);
+        float dx1 = (v1->_x * rw1) - (v2->_x * rw2);
+        float dy1 = (v1->_y * rw1) - (v2->_y * rw2);
+        float dx2 = (v3->_x * rw3) - (v2->_x * rw2);
+        float dy2 = (v3->_y * rw3) - (v2->_y * rw2);
+        float cross = dx1 * dy2 - dy1 * dx2;
+        if ((c0 ^ c1 ^ c2) & 0x40) {
+            // If one vertex lies behind the eye, negating cross will give the correct result.
+            // If all vertices lie behind the eye, the triangle will be rejected anyway.
+            cross = -cross;
+        }
+        switch (rsp.geometry_mode & G_CULL_BOTH) {
+            case G_CULL_FRONT:
+                if (cross >= 0) {
+                    return;
+                }
+                break;
+            case G_CULL_BACK:
+                if (cross <= 0) {
+                    return;
+                }
+                break;
+            default:
+                break;
+        }
+    }
+
+    if (in_trilerp) {
+        if (doing_bowser) {
+            float mx,my,mz;
+            get_mario_pos(&mx,&my,&mz);
+            float distance_frac = -(mz * 0.00025f);
+
+            if (distance_frac < 0.0f)
+			 	distance_frac = 0.0f;
+            else if (distance_frac > 1.0f)
+    			distance_frac = 1.0f;
+
+            distance_frac = 1.0f - step_ramp_pow(distance_frac, 0.8f, 2.0f);
+
+            trilerp_a = (uint8_t)(distance_frac * 255.0f);
+        }
+    }
+
+    const bool depth_test = sTri.depth_test;
+    const bool zmode_decal = sTri.zmode_decal;
+    const uint8_t usetex = sTri.usetex;
+    const uint8_t linear_filter = sTri.linear_filter;
+    const float recip_tw = sTri.recip_tw, recip_th = sTri.recip_th;
+    const float pvr_us = sTri.pvr_us, pvr_vs = sTri.pvr_vs;
+    int i;
+
+    // Near-plane clip the triangle into a fan of 1-2 tris (instead of dropping eye-crossers).
+    struct LoadedVertex *fan_tris[2][3];
+    int n_tris = sm_near_clip_fan(v1, v2, v3, fan_tris);
+    if (n_tris == 0) return;   // fully behind the eye plane
+    const int ortho_3d = sTri.ortho_3d;
     // 2D-as-triangles (ortho, Z-OFF menu/HUD/text) is a foreground OVERLAY when there's no 3D
     // scene this frame, OR 3D has ALREADY drawn (painted on top, e.g. file-select text over the
     // save faces) -> near screen_2d_z paint order. A Z-off ortho draw BEFORE any 3D in a 3D-scene
@@ -1531,7 +1916,7 @@ static void  __attribute__((noinline)) gfx_sp_tri1(uint8_t vtx1_idx, uint8_t vtx
         dc_fast_t * const bv = &emit[op_n];
         // Raw-PVR: perspective divide + viewport map -> screen pixels; z = 1/w (inverse depth).
         // Z-disabled geometry (skybox) far-pinned so the depth-tested scene wins.
-        float invw = shz_fast_invf(v_arr[i]->_w);
+        float invw = shz_invf(v_arr[i]->_w);
         bv->vert.x = sm_xscale * (v_arr[i]->_x * invw) + sm_xbias;
         bv->vert.y = sm_yscale * (v_arr[i]->_y * invw) + sm_ybias;
         // Decal coplanar surfaces (N64 ZMODE_DEC) z-fight the surface they sit on. PVR z is 1/w
@@ -1567,7 +1952,7 @@ static void  __attribute__((noinline)) gfx_sp_tri1(uint8_t vtx1_idx, uint8_t vtx
             // the final alpha. Use a local copy so the shared (re-used) vertex isn't mutated.
             struct RGBA sh_local = v_arr[i]->color;
             if (trilerp_pass) sh_local.a = trilerp_alpha;
-            pvr_eval_combiner(rdp.combine_w0, rdp.combine_w1, &sh_local, usetex, texenv, &_argb, &_oargb);
+            cc_eval(&sTri.cc, &sh_local, &_argb, &_oargb);
             // PVR hardware vertex fog reads the density from the offset-colour (oargb) ALPHA. The
             // combiner only ever sets oargb RGB (offset is alpha-0), so OR in this vertex's fog
             // coefficient — the two share oargb without conflict.
@@ -1585,6 +1970,78 @@ static void  __attribute__((noinline)) gfx_sp_tri1(uint8_t vtx1_idx, uint8_t vtx
     // A perspective 3D primitive has drawn this frame -> a later Z-off ortho 2D draw is a
     // foreground overlay, not a backdrop (gfx_draw_rectangle's far-pin reads this).
     if (!proj_is_ortho) has_done_3d = 1;
+}
+
+static void SM_HOT __attribute__((noinline)) gfx_sp_tri1(uint8_t vtx1_idx, uint8_t vtx2_idx, uint8_t vtx3_idx) {
+    struct LoadedVertex* v1 = &rsp.loaded_vertices[vtx3_idx];
+    MEM_BARRIER_PREF(v1);
+    struct LoadedVertex* v2 = &rsp.loaded_vertices[vtx2_idx];
+    struct LoadedVertex* v3 = &rsp.loaded_vertices[vtx1_idx];
+    uint8_t l_clip_rej[3] = { clip_rej[vtx3_idx], clip_rej[vtx2_idx], clip_rej[vtx1_idx] };
+    MEM_BARRIER_PREF(v2);
+    uint8_t c0 = l_clip_rej[0];
+    uint8_t c1 = l_clip_rej[1];
+    uint8_t c2 = l_clip_rej[2];
+    MEM_BARRIER_PREF(v3);
+
+    DC_PROF_COUNT(DCC_TRIS, 1);
+    if ((c0 & c1 & c2) & 0x3f) {
+        // The whole triangle lies outside the visible area
+        return;
+    }
+
+    if (sTri.epoch != sTriStateEpoch) {
+        tri_state_setup();
+    }
+
+    // Fast path: every corner in front of the near plane (no w<0, no z<-w) -> no clipping, so the
+    // three corners are cached baked vertices and back-face culling works in screen space.
+    if (sTri.fast && !((c0 | c1 | c2) & (64 | 16))) {
+        DC_PROF_COUNT(DCC_FAST, 1);
+        const dc_fast_t *b1 = tri_baked(vtx3_idx);
+        const dc_fast_t *b2 = tri_baked(vtx2_idx);
+        const dc_fast_t *b3 = tri_baked(vtx1_idx);
+        if ((rsp.geometry_mode & G_CULL_BOTH) != 0) {
+            float dx1 = b1->vert.x - b2->vert.x;
+            float dy1 = b1->vert.y - b2->vert.y;
+            float dx2 = b3->vert.x - b2->vert.x;
+            float dy2 = b3->vert.y - b2->vert.y;
+            float cross = dx1 * dy2 - dy1 * dx2;
+            if (sTri.cull_flip) {
+                cross = -cross;
+            }
+            switch (rsp.geometry_mode & G_CULL_BOTH) {
+                case G_CULL_FRONT:
+                    if (cross >= 0) {
+                        return;
+                    }
+                    break;
+                case G_CULL_BACK:
+                    if (cross <= 0) {
+                        return;
+                    }
+                    break;
+                default:
+                    break;
+            }
+        }
+        if (pvr_cur_kind == 0) {
+            pvr_submit_op_tri(b1, b2, b3);
+        } else {
+            dc_fast_t *out = pvr_reserve(pvr_cur_kind, 3);
+            if (out != NULL) {
+                // pvr_reserve stamped the strip flags; keep them over the baked copies.
+                uint32_t f0 = out[0].flags, f1 = out[1].flags, f2 = out[2].flags;
+                out[0] = *b1; out[0].flags = f0;
+                out[1] = *b2; out[1].flags = f1;
+                out[2] = *b3; out[2].flags = f2;
+            }
+        }
+        if (!proj_is_ortho) has_done_3d = 1;
+        return;
+    }
+
+    gfx_sp_tri1_slow(v1, v2, v3, c0, c1, c2);
 }
 
 static inline uint32_t color_comb(uint32_t a, uint32_t b, uint32_t c, uint32_t d);  // defined below
@@ -1721,8 +2178,8 @@ static void __attribute__((noinline)) gfx_sp_quad_2d(void) {
         rendering_state.texture->cmt = rdp.texture_tile.cmt;
         uint32_t tex_width = ((rdp.texture_tile.lrs - rdp.texture_tile.uls + 4) * 0.25f);
         uint32_t tex_height = ((rdp.texture_tile.lrt - rdp.texture_tile.ult + 4) * 0.25f);
-        float recip_tex_width = shz_fast_invf((float) tex_width);
-        float recip_tex_height = shz_fast_invf((float) tex_height);
+        float recip_tex_width = shz_invf((float) (int32_t) tex_width);   // int32_t: no double-precision conversion
+        float recip_tex_height = shz_invf((float) (int32_t) tex_height);
         float offs = linear_filter ? 0.5f : 0.0f;
         float uls = (float) (rdp.texture_tile.ult * 0.25f) - offs;
         float ult = (float) (rdp.texture_tile.ult * 0.25f) - offs;
@@ -1783,7 +2240,7 @@ static void __attribute__((noinline)) gfx_sp_quad_2d(void) {
         uint8_t alpha_uses_texel = (aa == 1 || aa == 2 || ab == 1 || ab == 2 ||
                                     ac == 1 || ac == 2 || ad == 1 || ad == 2);
         uint8_t alpha_compare_on = (rdp.other_mode_l & 3) != 0;
-        uint8_t real_blend = (rdp.other_mode_l & FORCE_BL) != 0;
+        uint8_t real_blend = (rdp.other_mode_l & FORCE_BL) && !pvr_blend_is_source(rdp.other_mode_l, rdp.other_mode_h);
         uint8_t cutout     = texture_edge || (alpha_uses_texel && alpha_compare_on);
         uint8_t kind = real_blend ? 2 : (cutout ? 1 : 0);
         if (kind != pvr_cur_kind) { gfx_pvr_set_blend(kind); pvr_cur_kind = kind; }
@@ -1844,6 +2301,7 @@ static void  __attribute__((noinline)) gfx_sp_movemem(uint8_t index, uint8_t off
             if (lightidx >= 0 && lightidx <= MAX_LIGHTS) { // skip lookat
                 // NOTE: reads out of bounds if it is an ambient light
                 memcpy(rsp.current_lights + lightidx, data, sizeof(Light_t));
+                rsp.light_cols_changed = 1;
             } else {
                 if (lightidx == -2)
                     memcpy(rsp.current_lookat, data, sizeof(Light_t));
@@ -1858,6 +2316,7 @@ static void  __attribute__((noinline)) gfx_sp_movemem(uint8_t index, uint8_t off
         case G_MV_L2:
             // NOTE: reads out of bounds if it is an ambient light
             memcpy(rsp.current_lights + (index - G_MV_L0) / 2, data, sizeof(Light_t));
+            rsp.light_cols_changed = 1;
             break;
 #endif
     }
@@ -1868,10 +2327,12 @@ static void gfx_sp_moveword(uint8_t index, uint32_t data) {
         case G_MW_NUMLIGHT:
 #ifdef F3DEX_GBI_2
             rsp.current_num_lights = data / 24 + 1; // add ambient light
+            rsp.light_cols_changed = 1;
 #else
             // Ambient light is included
             // The 31th bit is a flag that lights should be recalculated
             rsp.current_num_lights = (data - 0x80000000U) >> 5;// / 32;
+            rsp.light_cols_changed = 1;
 #endif
             rsp.lights_changed = 1;
             break;
@@ -2286,7 +2747,7 @@ static Gfx __attribute__((aligned(32))) * dl_stack[GFX_DL_STACK_MAX];
 
 //int max_sp = 0;
 
-static void __attribute__((noinline)) gfx_run_dl(Gfx* cmd) {
+static void SM_HOT __attribute__((noinline)) gfx_run_dl(Gfx* cmd) {
     int dl_sp = 0;
 
     for (;;) {
@@ -2295,6 +2756,7 @@ static void __attribute__((noinline)) gfx_run_dl(Gfx* cmd) {
         __builtin_prefetch(clip_rej);
 
         if (cmd->words.w0 == 0x424C4E44) {
+            tri_state_bump();   // trilerp markers switch the per-corner path on/off
             __builtin_prefetch((void *) (cmd) + 32);
             if (cmd->words.w1 == 0xAAAAAAAA) {
                 in_trilerp = 1;
@@ -2313,6 +2775,11 @@ static void __attribute__((noinline)) gfx_run_dl(Gfx* cmd) {
             }
             ++cmd;
             continue;
+        }
+
+        if (opcode != (uint8_t) G_TRI1 && opcode != (uint8_t) G_TRI2 && opcode != (uint8_t) G_VTX &&
+            opcode != (uint8_t) G_DL && opcode != (uint8_t) G_ENDDL) {
+            tri_state_bump();
         }
 
         switch (opcode) {
@@ -2620,14 +3087,17 @@ void gfx_start_frame(void) {
 void gfx_run(Gfx *commands) {
     __builtin_prefetch(commands);
     gfx_sp_reset();
+    tri_state_bump();   // backend state is reset per frame
     
     gfx_rapi->start_frame();
     gfx_run_dl(commands);
     gfx_rapi->end_frame();
+    DC_PROF_MARK(DCP_DL);
     gfx_wapi->swap_buffers_begin();
 }
 
 void gfx_end_frame(void) {
     gfx_rapi->finish_render();
+    DC_PROF_MARK(DCP_FINISH);
     gfx_wapi->swap_buffers_end();
 }

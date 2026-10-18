@@ -24,6 +24,7 @@
 #include "gfx_rendering_api.h"
 #include "macros.h"
 #include "gl_fast_vert.h"   // dc_fast_t (the front-end's per-vertex emit struct)
+#include "pc/dc_prof.h"
 
 extern int cur_frame_persp;
 extern int prev_frame_had_persp;
@@ -99,6 +100,9 @@ struct PvrTex {
     uint8_t   clampu, clampv;   // G_TX_CLAMP -> PVR_UVCLAMP
     uint8_t   flipu, flipv;     // G_TX_MIRROR -> PVR_UVFLIP (mirror-repeat)
     float     u_scale, v_scale; // real/padded, consumed by gfx_pvr_get_*_scale
+#ifdef DC_PROF_LISTS
+    uint8_t   opaque;      // every texel's alpha is 1
+#endif
 };
 static struct PvrTex sTextures[PVR_TEX_MAX];
 // SIX base poly headers — {colour, textured} x {OP, PT, TR} — each compiled ONCE by the official
@@ -130,7 +134,16 @@ static uint32_t sCurBound = 0;   // last select_texture id == upload target
 // on real sampler-state change); the same scene now measures ~73 batches, so 512 keeps ~7x margin.
 #define TR_MAX_BATCH     512
 
-typedef struct { pvr_poly_hdr_t __attribute__((aligned(32))) hdr; uint32_t start, count; } PvrBatch;
+typedef struct {
+    pvr_poly_hdr_t __attribute__((aligned(32))) hdr;
+    uint32_t start, count;
+#ifdef DC_PROF_LISTS
+    // Where the batch's alpha comes from, for prof_count_bucket.
+    uint8_t alpha_vtx;   // the vertex alpha reaches the pixel
+    uint8_t alpha_tex;   // the texel alpha reaches the pixel, and the texture has alpha < 1
+    uint8_t blend_src;   // alpha 1 gives the source colour (SRCALPHA/INVSRCALPHA or ONE/ZERO)
+#endif
+} PvrBatch;
 typedef struct {
     pvr_vertex_t *verts; PvrBatch *batch;
     uint32_t nverts, max_verts;
@@ -232,6 +245,23 @@ static void pvr_compile_header(pvr_poly_hdr_t *out, int kind) {
     }
 }
 
+#ifdef DC_PROF_LISTS
+// Records where a new PT/TR batch's alpha comes from (PVR texenv: REPLACE and MODULATE take the
+// texel's alpha, DECAL the vertex's, MODULATEALPHA both; untextured, the vertex's).
+static void prof_batch_alpha(PvrBatch *bt, int kind) {
+    int textured = cur_shader && cur_shader->texture_used && sBoundTex && sTextures[sBoundTex].addr;
+
+    bt->alpha_vtx = !textured || sTexEnv == PVR_TXRENV_DECAL || sTexEnv == PVR_TXRENV_MODULATEALPHA;
+    bt->alpha_tex = textured && sTexEnv != PVR_TXRENV_DECAL && !sTextures[sBoundTex].opaque;
+    bt->blend_src = kind != PVR_KIND_TR ||
+                    (sBlendSrc == PVR_BLEND_SRCALPHA && sBlendDst == PVR_BLEND_INVSRCALPHA) ||
+                    (sBlendSrc == PVR_BLEND_ONE && sBlendDst == PVR_BLEND_ZERO);
+}
+#define PROF_BATCH_ALPHA(bt, kind) prof_batch_alpha(bt, kind)
+#else
+#define PROF_BATCH_ALPHA(bt, kind) ((void) 0)
+#endif
+
 // Append n vertices (n/3 tris) of already-screen-baked dc_fast_t to a bucket,
 // starting a new batch when the bucket's header state has changed.
 static void pvr_append(PvrBucket *b, int kind, const dc_fast_t *tris, size_t n) {
@@ -239,6 +269,7 @@ static void pvr_append(PvrBucket *b, int kind, const dc_fast_t *tris, size_t n) 
         if (b->nbatch >= b->max_batch) { if (sDropB++ < 8) printf("PVR_DROP batch %d\n", kind); return; }
         b->cur = b->nbatch++;
         pvr_compile_header(&b->batch[b->cur].hdr, kind);
+        PROF_BATCH_ALPHA(&b->batch[b->cur], kind);
         b->batch[b->cur].start = b->nverts;
         b->batch[b->cur].count = 0;
         b->dirty = 0;
@@ -263,6 +294,7 @@ dc_fast_t *pvr_reserve(int kind, size_t n) {
         if (b->nbatch >= b->max_batch) { if (sDropB++ < 8) printf("PVR_DROP batch %d\n", kind); return NULL; }
         b->cur = b->nbatch++;
         pvr_compile_header(&b->batch[b->cur].hdr, kind);
+        PROF_BATCH_ALPHA(&b->batch[b->cur], kind);
         b->batch[b->cur].start = b->nverts;
         b->batch[b->cur].count = 0;
         b->dirty = 0;
@@ -278,22 +310,38 @@ dc_fast_t *pvr_reserve(int kind, size_t n) {
     return out;
 }
 
+// Send one store queue's 32 bytes to the TA. Unlike pvr_dr_commit (sq_flush) this has no "memory"
+// clobber: the asm only reads this vertex, so GCC keeps everything else in registers around it.
+static inline void sq_send(pvr_vertex_t *v) {
+    __asm__ __volatile__("pref @%0" : : "r"(v), "m"(*v));
+}
+
+// One store-queue vertex: pvr_dr_target's double-buffered address, kept in a register by the
+// caller instead of the global pvr_dr_addr being loaded and stored per vertex.
+static inline pvr_vertex_t *sq_next(uint32_t *addr) {
+    *addr ^= 32;
+    return (pvr_vertex_t *) __builtin_assume_aligned((void *) *addr, 32);
+}
+
 // Replay a bucket's batches (header + its verts) to the open list via the DR path.
 static void pvr_flush_bucket(PvrBucket *b) {
+    uint32_t addr = pvr_dr_addr;
     for (int i = 0; i < b->nbatch; i++) {
         PvrBatch *bt = &b->batch[i];
         if (!bt->count) continue;
-        pvr_poly_hdr_t *hp = (pvr_poly_hdr_t *) pvr_dr_target(sDrState);
+        pvr_poly_hdr_t *hp = (pvr_poly_hdr_t *) sq_next(&addr);
         *hp = bt->hdr;
-        pvr_dr_commit(hp);
+        sq_send((pvr_vertex_t *) hp);
+        const pvr_vertex_t *src = &b->verts[bt->start];
         for (uint32_t v = 0; v < bt->count; v++) {
-            pvr_vertex_t *vp = (pvr_vertex_t *) pvr_dr_target(sDrState);
-            *vp = b->verts[bt->start + v];
+            pvr_vertex_t *vp = sq_next(&addr);
+            *vp = src[v];
             // Flags are already set in the bucket: 3-vert tris by pvr_reserve, 4-vert quads by
             // gfx_pvr_draw_quad_2d. Do NOT re-stamp here — a blanket (v%3) would corrupt the 2D quads.
-            pvr_dr_commit(vp);
+            sq_send(vp);
         }
     }
+    pvr_dr_addr = addr;
 }
 
 // Scratch for POT padding (max 256x256 @ 16bpp = 128KB). MK64 textures are small.
@@ -462,6 +510,17 @@ static void gfx_pvr_upload_texture(const uint8_t *buf16, int width, int height, 
     if (t->addr && size > t->alloc_size) { pvr_mem_free(t->addr); t->addr = NULL; }
     if (!t->addr) { t->addr = pvr_mem_malloc(size); t->alloc_size = t->addr ? size : 0; }
     if (t->addr) pvr_txr_load_ex((void *) src, t->addr, fw, fh, PVR_TXRLOAD_16BPP);
+#ifdef DC_PROF_LISTS
+    {
+        const uint16_t *px = (const uint16_t *) buf16;
+        uint16_t alpha = (fmt == PVR_TXRFMT_ARGB4444) ? 0xf000 : (fmt == PVR_TXRFMT_ARGB1555) ? 0x8000 : 0;
+
+        t->opaque = 1;
+        for (int i = 0; i < width * height; i++) {
+            if ((px[i] & alpha) != alpha) { t->opaque = 0; break; }
+        }
+    }
+#endif
 
     t->w = fw; t->h = fh; t->fmt = fmt;
     t->u_scale = us; t->v_scale = vs;
@@ -595,6 +654,86 @@ void gfx_pvr_set_blend_factors(uint8_t src_code, uint8_t dst_code) {
     }
 }
 
+#ifdef DC_PROF_LISTS
+// On-screen pixels of a triangle: clipped to the framebuffer (Sutherland-Hodgman), then the
+// shoelace area. Off-screen parts of big floor and sky triangles cost the PVR nothing.
+static float prof_tri_px(const pvr_vertex_t *a, const pvr_vertex_t *b, const pvr_vertex_t *c) {
+    float px[2][9][2] = { { { a->x, a->y }, { b->x, b->y }, { c->x, c->y } } };
+    int n = 3, cur = 0;
+
+    for (int edge = 0; edge < 4 && n > 0; edge++) {
+        int axis = edge & 1;
+        float bound = (edge < 2) ? 0.0f : (axis ? (float) DC_FB_H : (float) DC_FB_W);
+        float dir = (edge < 2) ? 1.0f : -1.0f;   // inside: dir * (p - bound) >= 0
+        int m = 0;
+
+        for (int i = 0; i < n; i++) {
+            const float *p = px[cur][i], *q = px[cur][(i + 1) % n];
+            float dp = dir * (p[axis] - bound), dq = dir * (q[axis] - bound);
+
+            if (dp >= 0.0f) {
+                px[cur ^ 1][m][0] = p[0]; px[cur ^ 1][m][1] = p[1]; m++;
+            }
+            if ((dp >= 0.0f) != (dq >= 0.0f)) {
+                float t = dp / (dp - dq);
+                px[cur ^ 1][m][0] = p[0] + (q[0] - p[0]) * t;
+                px[cur ^ 1][m][1] = p[1] + (q[1] - p[1]) * t;
+                m++;
+            }
+        }
+        n = m;
+        cur ^= 1;
+    }
+    float area = 0.0f;
+    for (int i = 0; i < n; i++) {
+        const float *p = px[cur][i], *q = px[cur][(i + 1) % n];
+        area += p[0] * q[1] - q[0] * p[1];
+    }
+    return 0.5f * __builtin_fabsf(area);
+}
+
+static void __attribute__((noinline, cold)) prof_count_op(const pvr_vertex_t *a, const pvr_vertex_t *b,
+                                                          const pvr_vertex_t *c) {
+    DC_PROF_COUNT(DCC_OP_TRIS, 1);
+    DC_PROF_COUNT(DCC_OP_PX, (unsigned int) prof_tri_px(a, b, c));
+}
+
+// Triangles and pixels of a PT or TR bucket, and the part whose alpha is provably 1 everywhere:
+// those could be drawn in the OP list (PT: the alpha test never fails; TR: the blend gives the
+// source colour). Batches hold strips ended by EOL flags: 3-vertex triangles and 4-vertex quads.
+static void prof_count_bucket(const PvrBucket *b, int kind) {
+    for (int i = 0; i < b->nbatch; i++) {
+        const PvrBatch *bt = &b->batch[i];
+        const pvr_vertex_t *v = &b->verts[bt->start];
+        uint32_t strip = 0;
+
+        for (uint32_t k = 0; k < bt->count; k++) {
+            if (++strip >= 3) {
+                const pvr_vertex_t *t0 = &v[k - 2], *t1 = &v[k - 1], *t2 = &v[k];
+                unsigned int px = (unsigned int) prof_tri_px(t0, t1, t2);
+                int opaque = bt->blend_src && !bt->alpha_tex &&
+                             (!bt->alpha_vtx || (t0->argb & t1->argb & t2->argb) >> 24 == 0xff);
+
+                DC_PROF_COUNT(kind == PVR_KIND_TR ? DCC_TR_TRIS : DCC_PT_TRIS, 1);
+                DC_PROF_COUNT(kind == PVR_KIND_TR ? DCC_TR_PX : DCC_PT_PX, px);
+                if (opaque && kind == PVR_KIND_TR) {
+                    DC_PROF_COUNT(DCC_TR_OPQ_TRIS, 1);
+                    DC_PROF_COUNT(DCC_TR_OPQ_PX, px);
+                } else if (opaque) {
+                    DC_PROF_COUNT(DCC_PT_OPQ_PX, px);
+                }
+            }
+            if (v[k].flags == PVR_CMD_VERTEX_EOL) {
+                strip = 0;
+            }
+        }
+    }
+}
+#define PROF_COUNT_OP(a, b, c) prof_count_op(a, b, c)
+#else
+#define PROF_COUNT_OP(a, b, c) ((void) 0)
+#endif
+
 // (Re)emit the live OP header to the open OP list when depth/texture state changed.
 static inline void pvr_emit_op_header(void) {
     if (!sOpDirty) return;
@@ -618,6 +757,33 @@ void pvr_submit_op(const dc_fast_t *tris, size_t n) {
         v->flags = ((i % 3) == 2) ? PVR_CMD_VERTEX_EOL : PVR_CMD_VERTEX;
         pvr_dr_commit(v);
     }
+#ifdef DC_PROF_LISTS
+    for (size_t i = 0; i + 2 < n; i += 3)
+        PROF_COUNT_OP((const pvr_vertex_t *) &tris[i], (const pvr_vertex_t *) &tris[i + 1],
+                      (const pvr_vertex_t *) &tris[i + 2]);
+#endif
+}
+
+// One triangle from three separately stored vertices (the front-end's baked-vertex cache).
+__attribute__((section(".sub0.sm64_hot"))) void pvr_submit_op_tri(const dc_fast_t *a, const dc_fast_t *b,
+                                                                   const dc_fast_t *c) {
+    pvr_emit_op_header();
+    uint32_t addr = pvr_dr_addr;
+    pvr_vertex_t *v;
+    v = sq_next(&addr);
+    *v = *(const pvr_vertex_t *) a;
+    v->flags = PVR_CMD_VERTEX;
+    sq_send(v);
+    v = sq_next(&addr);
+    *v = *(const pvr_vertex_t *) b;
+    v->flags = PVR_CMD_VERTEX;
+    sq_send(v);
+    v = sq_next(&addr);
+    *v = *(const pvr_vertex_t *) c;
+    v->flags = PVR_CMD_VERTEX_EOL;
+    sq_send(v);
+    pvr_dr_addr = addr;
+    PROF_COUNT_OP((const pvr_vertex_t *) a, (const pvr_vertex_t *) b, (const pvr_vertex_t *) c);
 }
 
 // 2D quad depth counter owned by the front-end (gfx_draw_rectangle increments it).
@@ -654,6 +820,8 @@ static void gfx_pvr_draw_quad_2d(void *quad, UNUSED size_t buf_vbo_len, UNUSED s
             o->flags = (i == 3) ? PVR_CMD_VERTEX_EOL : PVR_CMD_VERTEX;
             pvr_dr_commit(o);
         }
+        PROF_COUNT_OP((const pvr_vertex_t *) &q[0], (const pvr_vertex_t *) &q[1], (const pvr_vertex_t *) &q[2]);
+        PROF_COUNT_OP((const pvr_vertex_t *) &q[1], (const pvr_vertex_t *) &q[2], (const pvr_vertex_t *) &q[3]);
         return;
     }
 
@@ -663,6 +831,7 @@ static void gfx_pvr_draw_quad_2d(void *quad, UNUSED size_t buf_vbo_len, UNUSED s
         if (b->nbatch >= b->max_batch) { if (sDropB++ < 8) printf("PVR_DROP batch %d\n", kind); return; }
         b->cur = b->nbatch++;
         pvr_compile_header(&b->batch[b->cur].hdr, kind);
+        PROF_BATCH_ALPHA(&b->batch[b->cur], kind);
         b->batch[b->cur].start = b->nverts;
         b->batch[b->cur].count = 0;
         b->dirty = 0;
@@ -726,7 +895,9 @@ static inline void sm_rgba5551_to_rgbf(uint16_t c, float *r, float *g, float *b)
 
 static void gfx_pvr_start_frame(void) {
     float cr, cg, cb;
+    DC_PROF_MARK(DCP_WAIT_BEGIN);
     pvr_wait_ready();
+    DC_PROF_MARK(DCP_WAIT_END);
     pvr_scene_begin();
     // drive the PVR background plane from the game's clear_color (set last game-loop iteration).
     sm_rgba5551_to_rgbf((uint16_t) clear_color, &cr, &cg, &cb);
@@ -771,6 +942,10 @@ static void gfx_pvr_start_frame(void) {
 
 static void gfx_pvr_end_frame(void) {
     pvr_list_finish();   // close the OP list (opened once this frame)
+#ifdef DC_PROF_LISTS
+    prof_count_bucket(&sPunch, PVR_KIND_PT);
+    prof_count_bucket(&sTR, PVR_KIND_TR);
+#endif
 
     // Flush the deferred buckets, each into its own list opened once. PT FIRST: alpha-test
     // cutouts are opaque pixels that write depth, so they must be down before TR composites.
