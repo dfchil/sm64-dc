@@ -14,7 +14,13 @@
 #include "seq_ids.h"
 #include "sm64.h"
 
+#if defined(DC_PROF) && !defined(DC_PROF_TITLE)
+// Profile runs cycle the attract demos as the workload: start each one after ~3 s, not ~27 s.
+// (DC_PROF_TITLE keeps the normal wait, to profile the title screen's Mario head.)
+#define PRESS_START_DEMO_TIMER 90
+#else
 #define PRESS_START_DEMO_TIMER 800
+#endif
 
 #define STUB_LEVEL(textname, _1, _2, _3, _4, _5, _6, _7, _8) textname,
 #define DEFINE_LEVEL(textname, _1, _2, _3, _4, _5, _6, _7, _8, _9, _10) textname,
@@ -60,6 +66,21 @@ int run_press_start_demo_timer(s32 timer) {
                 // add 1 (+4) to the pointer to skip the demoID.
                 gCurrDemoInput = ((struct DemoInput *) gDemo.targetAnim) + 1;
                 timer = (s8)((struct DemoInput *) gDemo.targetAnim)->timer;
+#ifdef DC_PROF_TOUR
+                {
+                    // Profile tour: send each attract demo to the next level of this list instead of
+                    // its own. Mario follows the wrong level's inputs, but every level's geometry,
+                    // objects and camera get rendered and measured.
+                    static const s8 sTour[] = {
+                        LEVEL_BOB, LEVEL_WF, LEVEL_JRB, LEVEL_CCM, LEVEL_BBH, LEVEL_HMC, LEVEL_LLL,
+                        LEVEL_SSL, LEVEL_DDD, LEVEL_SL, LEVEL_WDW, LEVEL_TTM, LEVEL_THI, LEVEL_TTC,
+                        LEVEL_RR, LEVEL_CASTLE_GROUNDS, LEVEL_CASTLE, LEVEL_BITDW, LEVEL_BITFS,
+                        LEVEL_BITS, LEVEL_BOWSER_1,
+                    };
+                    static u32 sTourPos = 0;
+                    timer = sTour[sTourPos++ % ARRAY_COUNT(sTour)];
+                }
+#endif
                 gCurrSaveFileNum = 1;
                 gCurrActNum = 1;
             }

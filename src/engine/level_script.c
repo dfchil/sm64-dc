@@ -24,6 +24,7 @@
 #include "math_util.h"
 #include "surface_collision.h"
 #include "surface_load.h"
+#include "pc/dc_prof.h"
 
 #define CMD_GET(type, offset) (*(type *) (CMD_PROCESS_OFFSET(offset) + (u8 *) sCurrentCmd))
 
@@ -840,9 +841,11 @@ struct LevelCommand *level_script_execute(struct LevelCommand *cmd) {
     }
 
     //profiler_log_thread5_time(LEVEL_SCRIPT_EXECUTE);
+    DC_PROF_MARK(DCP_LOGIC);
     init_render_image();
     render_game();
     end_master_display_list();
+    DC_PROF_MARK(DCP_GEO);
     alloc_display_list(0);
 
     return sCurrentCmd;
