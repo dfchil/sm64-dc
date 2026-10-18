@@ -73,7 +73,7 @@
 #define MOVTEX_ATTR_COLORED_S 7
 #define MOVTEX_ATTR_COLORED_T 8
 
-#include "sh4zam.h"
+#include "sh4zam_port.h"
 
 /**
  * An object containing all info for a mesh with moving textures.

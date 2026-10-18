@@ -9,7 +9,7 @@
 #include "surface_collision.h"
 #include "surface_load.h"
 
-#include "sh4zam.h"
+#include "sh4zam_port.h"
 
 /**************************************************
  *                      WALLS                     *

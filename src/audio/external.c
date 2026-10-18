@@ -13,7 +13,7 @@
 #include "seq_ids.h"
 #include "dialog_ids.h"
 
-#include "sh4zam.h"
+#include "sh4zam_port.h"
 
 #ifdef VERSION_EU
 #define EU_FLOAT(x) x ## f
@@ -895,7 +895,7 @@ void play_sound(s32 soundBits, f32 *pos) {
     sSoundRequests[sSoundRequestCount].position = pos;
     sSoundRequestCount++;
 }
-#include "sh4zam.h"
+#include "sh4zam_port.h"
 void process_sound_request(u32 bits, f32 *pos) {
     u8 bankIndex;
     u8 index;
@@ -940,7 +940,7 @@ void process_sound_request(u32 bits, f32 *pos) {
     if (gSoundBanks[bankIndex][D_803320B0[bankIndex]].next != 0xff && index != 0) {
         index = D_803320B0[bankIndex];
 //        dist = sqrtf(pos[0] * pos[0] + pos[1] * pos[1] + pos[2] * pos[2]) * one;
-        dist = shz_sqrtf_fsrra(shz_vec3_magnitude_sqr(shz_vec3_deref(pos)));
+        dist = shz_sqrtf(shz_vec3_magnitude_sqr(shz_vec3_deref(pos)));
         gSoundBanks[bankIndex][index].x = &pos[0];
         gSoundBanks[bankIndex][index].y = &pos[1];
         gSoundBanks[bankIndex][index].z = &pos[2];
@@ -1036,7 +1036,7 @@ void func_8031E16C(u8 bankIndex) {
         if (gSoundBanks[bankIndex][soundIndex].soundStatus != SOUND_STATUS_STOPPED
             && soundIndex == spDB) {
             gSoundBanks[bankIndex][soundIndex].distance =
-                shz_sqrtf_fsrra((*gSoundBanks[bankIndex][soundIndex].x * *gSoundBanks[bankIndex][soundIndex].x)
+                shz_sqrtf((*gSoundBanks[bankIndex][soundIndex].x * *gSoundBanks[bankIndex][soundIndex].x)
                       + (*gSoundBanks[bankIndex][soundIndex].y * *gSoundBanks[bankIndex][soundIndex].y)
                       + (*gSoundBanks[bankIndex][soundIndex].z * *gSoundBanks[bankIndex][soundIndex].z))
                 * 1;

@@ -15,7 +15,7 @@
 #include "save_file.h"
 #include "thread6.h"
 
-#include "sh4zam.h"
+#include "sh4zam_port.h"
 
 void play_flip_sounds(struct MarioState *m, s16 frame1, s16 frame2, s16 frame3) {
     s32 animFrame = m->marioObj->header.gfx.unk38.animFrame;
@@ -160,7 +160,7 @@ s32 check_horizontal_wind(struct MarioState *m) {
         m->slideVelX += as; // 1.2f * sins(pushAngle);
         m->slideVelZ += ac; // 1.2f * coss(pushAngle);
 
-        speed = shz_sqrtf_fsrra(m->slideVelX * m->slideVelX + m->slideVelZ * m->slideVelZ);
+        speed = shz_sqrtf(m->slideVelX * m->slideVelX + m->slideVelZ * m->slideVelZ);
 
         if (speed > 48.0f) {
             f32 speeddiv = shz_divf(48.0f, speed);

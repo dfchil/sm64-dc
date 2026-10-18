@@ -204,7 +204,7 @@ void note_disable2(struct Note *note) {
     note_disable(note);
 }
 #endif // VERSION_EU
-#include "sh4zam.h"
+#include "sh4zam_port.h"
 void process_notes(void) {
     f32 scale;
     f32 frequency;

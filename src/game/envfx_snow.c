@@ -142,7 +142,7 @@ void envfx_cleanup_snow(void *snowParticleArray) {
     }
 }
 
-#include "sh4zam.h"
+#include "sh4zam_port.h"
 
 /**
  * Given two points, return the vector from one to the other represented
@@ -153,8 +153,8 @@ void orbit_from_positions(Vec3s from, Vec3s to, s16 *radius, s16 *pitch, s16 *ya
     f32 dy = to[1] - from[1];
     f32 dz = to[2] - from[2];
 
-    *radius = (s16) shz_sqrtf_fsrra(shz_mag_sqr3f(dx, dy, dz)); //sqrtf(dx * dx + dy * dy + dz * dz);
-    *pitch = atan2s(shz_sqrtf_fsrra(dx * dx + dz * dz), dy);
+    *radius = (s16) shz_sqrtf(shz_mag_sqr3f(dx, dy, dz)); //sqrtf(dx * dx + dy * dy + dz * dz);
+    *pitch = atan2s(shz_sqrtf(dx * dx + dz * dz), dy);
     *yaw = atan2s(dz, dx);
 }
 

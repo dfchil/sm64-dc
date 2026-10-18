@@ -29,6 +29,20 @@ TARGET_PSP ?= 0
 TARGET_DC ?= 0
 # Render at 240p (320x240) instead of 480i/VGA (640x480) on Dreamcast
 LOWRES ?= 0
+# Optimisation level for the Dreamcast game code (the renderer files are always -O3)
+DC_OPT ?= -Os
+# Dreamcast hardware profile build: per-frame timings, attract demos as the workload,
+# report + /pc/sm64_prof.csv and exit back to dcload after DC_AUTO_EXIT_SECONDS
+DC_PROF ?= 0
+DC_AUTO_EXIT_SECONDS ?= 150
+# 60 fps on Dreamcast: every 30 Hz logic step is drawn twice, interpolated then exact
+DC_60FPS ?= 0
+# Vblanks per presented frame on Dreamcast (2 = stock 30 fps cap, 1 = uncapped / 60 fps)
+ifeq ($(DC_60FPS),1)
+  DC_VBL_WAIT ?= 1
+else
+  DC_VBL_WAIT ?= 2
+endif
 # Compiler to use (ido or gcc)
 #COMPILER ?= ido
 
@@ -549,7 +563,7 @@ endif
 ifeq ($(TARGET_DC),1)
   #Notes from neo
   #-gdwarf-2 -gstrict-dwarf -g3 --ffunction-sections -fdata-sections -Wl,-gc-sections
-  PLATFORM_CFLAGS  := $(KOS_CFLAGS) -Os -flto=auto -DTARGET_DC -Wall -Wextra -DNDEBUG -Werror -Wno-missing-braces -Wno-old-style-declaration
+  PLATFORM_CFLAGS  := $(KOS_CFLAGS) $(DC_OPT) -flto=auto -DTARGET_DC -Wall -Wextra -DNDEBUG -Werror -Wno-missing-braces -Wno-old-style-declaration
 # -Wno-unused-variable -Wno-unused-parameter -fno-strict-aliasing
 
 ifeq ($(LOWRES),1)
@@ -560,6 +574,40 @@ ifeq ($(FOR_DCLOAD),1)
   PLATFORM_CFLAGS += -DFOR_DCLOAD=1
 endif
 
+PLATFORM_CFLAGS += -DDC_VBL_WAIT=$(DC_VBL_WAIT)
+ifeq ($(DC_60FPS),1)
+  PLATFORM_CFLAGS += -DDC_60FPS
+endif
+# Above -Os GCC flags stock SM64 code (mario_actions_moving.c) as maybe-uninitialized.
+PLATFORM_CFLAGS += -Wno-error=maybe-uninitialized
+ifeq ($(DC_PROF),1)
+  PLATFORM_CFLAGS += -DDC_PROF -DDC_AUTO_EXIT_SECONDS=$(DC_AUTO_EXIT_SECONDS)
+  # DC_PROF_SAMPLE=1: also sample the PC at 500 Hz into /pc/sm64_samples.bin (tools/dc_prof_samples.py)
+  ifeq ($(DC_PROF_SAMPLE),1)
+    PLATFORM_CFLAGS += -DDC_PROF_SAMPLE
+  endif
+  # DC_PROF_TITLE=1: keep the normal title wait before the demos (profile the Mario head screen)
+  ifeq ($(DC_PROF_TITLE),1)
+    PLATFORM_CFLAGS += -DDC_PROF_TITLE
+  endif
+  # DC_PROF_TOUR=1: the attract demos visit every main level in turn (level_select_menu.c)
+  ifeq ($(DC_PROF_TOUR),1)
+    PLATFORM_CFLAGS += -DDC_PROF_TOUR
+  endif
+  # DC_PROF_LISTS=1: count triangles and on-screen pixels per PVR list, and the PT/TR that could
+  # be OP (gfx_pvr.c). Costs CPU time per triangle, so leave it out of timing runs.
+  ifeq ($(DC_PROF_LISTS),1)
+    PLATFORM_CFLAGS += -DDC_PROF_LISTS
+  endif
+endif
+
+# KOS dropped genwait_wait()'s callback argument in Nov 2025 without a version bump,
+# so detect the signature from the installed header. The same KOS deprecates
+# pvr_dr_init (now a no-op), which -Werror would otherwise reject.
+ifeq ($(shell grep -c callback $(KOS_BASE)/include/kos/genwait.h 2>/dev/null),0)
+  PLATFORM_CFLAGS += -DKOS_GENWAIT_3ARG -Wno-error=deprecated-declarations
+endif
+
 # GFX_BACKEND - selects the renderer backend (DC):
 #   pvr  - raw KOS PVR direct-render (gfx_pvr.c)
   PLATFORM_CFLAGS += -DGFX_BACKEND_PVR=1
@@ -567,7 +615,7 @@ endif
 # need to finish working through these
 #  PLATFORM_CFLAGS += -Wdouble-promotion
 
-  PLATFORM_LDFLAGS := -Wl,--gc-sections  -Wl,-Map=output.map
+  PLATFORM_LDFLAGS := -Wl,--gc-sections  -Wl,-Map=output.map -lsh4zam
 endif
 ifeq ($(TARGET_WEB),1)
   PLATFORM_CFLAGS  := -DTARGET_WEB
@@ -989,6 +1037,14 @@ $(BUILD_DIR)/src/engine/math_util.o: CFLAGS += -O3
 $(BUILD_DIR)/src/pc/mixer.o: CFLAGS += -O3
 $(BUILD_DIR)/src/pc/gfx/gfx_retro_dc.o: CFLAGS += -O3
 $(BUILD_DIR)/src/pc/gfx/gfx_pvr.o: CFLAGS += -O3
+# sh-elf GCC 15.2 hits an internal compiler error (reload, gen_reg_rtx) in
+# bhv_haunted_chair_loop above -Os, so keep this file at -Os whatever DC_OPT is (and out of
+# LTO, which would otherwise recompile it at the link-time level).
+$(BUILD_DIR)/src/game/obj_behaviors_2.o: CFLAGS += -Os -fno-lto
+# Bisection aid: these sources (e.g. DC_OS_FILES="src/goddard/objects.c") are built at -Os
+# whatever DC_OPT is. Delete their .o files when the list changes; make does not track flags.
+DC_OS_FILES ?=
+$(foreach f,$(DC_OS_FILES),$(eval $(BUILD_DIR)/$(f:.c=.o): CFLAGS += -Os))
 
 ifeq ($(TARGET_DC),1)
 # Unused for now, might be later

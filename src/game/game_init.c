@@ -350,7 +350,7 @@ void display_and_vsync(void) {
     }
     gGlobalTimer++;
 }
-#include "sh4zam.h"
+#include "sh4zam_port.h"
 // take the updated controller struct and calculate
 // the new x, y, and distance floats.
 void adjust_analog_stick(struct Controller *controller) {
@@ -377,12 +377,12 @@ void adjust_analog_stick(struct Controller *controller) {
 
     // calculate f32 magnitude from the center by vector length.
     controller->stickMag =
-        shz_sqrtf_fsrra(controller->stickX * controller->stickX + controller->stickY * controller->stickY);
+        shz_sqrtf(controller->stickX * controller->stickX + controller->stickY * controller->stickY);
 
     // magnitude cannot exceed 64.0f: if it does, modify the values appropriately to
     // flatten the values down to the allowed maximum value.
     if (controller->stickMag > 64) {
-        f32 invmag64 = 64.0f * shz_fast_invf(controller->stickMag);
+        f32 invmag64 = 64.0f * shz_invf(controller->stickMag);
         controller->stickX *= invmag64; // 64.0f / controller->stickMag;
         controller->stickY *= invmag64; // 64.0f / controller->stickMag;
         controller->stickMag = 64;

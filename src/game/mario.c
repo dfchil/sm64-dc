@@ -35,7 +35,7 @@
 #include "sound_init.h"
 #include "thread6.h"
 
-#include "sh4zam.h"
+#include "sh4zam_port.h"
 
 u32 unused80339F10;
 s8 filler80339F1C[20];
@@ -766,7 +766,7 @@ void set_steep_jump_action(struct MarioState *m) {
         scaled_sincoss(faceAngleTemp, &y, &x, m->forwardVel);
         x *= 0.75f;
 
-        m->forwardVel = shz_sqrtf_fsrra(y * y + x * x);
+        m->forwardVel = shz_sqrtf(y * y + x * x);
         m->faceAngle[1] = atan2s(x, y) + angleTemp;
     }
 

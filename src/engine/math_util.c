@@ -1,4 +1,5 @@
 #include <ultra64.h>
+#include <string.h>
 
 #include "sm64.h"
 #include "engine/graph_node.h"
@@ -7,7 +8,7 @@
 
 #include "trig_tables.inc.c"
 
-#include "sh4zam.h"
+#include "sh4zam_port.h"
 
 // Variables for a spline curve animation (used for the flight path in the grand star cutscene)
 Vec4s *gSplineKeyframe;
@@ -141,7 +142,10 @@ void mtxf_copy(Mat4 dest, Mat4 src) {
         *d++ = *s++;
     }
 #endif
-    shz_matrix_4x4_copy((shz_matrix_4x4_t *)dest, (shz_matrix_4x4_t *)src);
+    // Not shz_mat4x4_copy: its paired fmov.d moves need 8-byte alignment, and matrices such as
+    // an object's transform (a throwMatrix target) are only 4-byte aligned. Same reason mtxf_mul
+    // uses the unaligned XMTRX loads.
+    memcpy(dest, src, sizeof(Mat4));
 }
 
 /**
@@ -159,7 +163,7 @@ void mtxf_identity(Mat4 mtx) {
     for (dest = (f32 *) mtx, i = 0; i < 4; dest += 5, i++) *dest = 1;
 #endif
     shz_xmtrx_init_identity();
-    shz_xmtrx_store_4x4_unaligned((float *)mtx);
+    shz_xmtrx_store_unaligned_4x4((float *)mtx);
 
 }
 
@@ -522,13 +526,13 @@ void mtxf_align_terrain_triangle(Mat4 mtx, Vec3f pos, s16 yaw, f32 radius) {
 
 void mtxf_mul(Mat4 dest, Mat4 a, Mat4 b) {
 #if 1
-    shz_xmtrx_load_4x4_unaligned((const float*)b);
-    shz_xmtrx_apply_4x4_unaligned((const float *)a);
-    shz_xmtrx_store_4x4_unaligned((float *)dest);
+    shz_xmtrx_load_unaligned_4x4((const float*)b);
+    shz_xmtrx_apply_unaligned_4x4((const float *)a);
+    shz_xmtrx_store_unaligned_4x4((float *)dest);
 #else
     // in theory these are all 32-byte aligned
     // in practice, the following call crashes
-    shz_xmtrx_load_4x4_apply_store((shz_matrix_4x4_t *)dest, (const shz_matrix_4x4_t *)b, (const shz_matrix_4x4_t *)a);
+    shz_xmtrx_load_apply_store_4x4((shz_mat4x4_t *)dest, (const shz_mat4x4_t *)b, (const shz_mat4x4_t *)a);
 #endif
 
     dest[0][3] = 0.0f;
@@ -557,13 +561,13 @@ void mtxf_scale_vec3f(Mat4 dest, Mat4 mtx, Vec3f s) {
  * true for transformation matrices if the translation has a w component of 1.
  */
 void mtxf_mul_vec3s(Mat4 mtx, Vec3s b) {
-    shz_xmtrx_load_4x4_unaligned((const float *)mtx);
+    shz_xmtrx_load_unaligned_4x4((const float *)mtx);
 
     register f32 x = b[0];
     register f32 y = b[1];
     register f32 z = b[2];
 
-    shz_vec3_t out = shz_xmtrx_trans_vec3((shz_vec3_t){.x = x, .y = y, .z = z});
+    shz_vec3_t out = shz_xmtrx_transform_vec3((shz_vec3_t){.x = x, .y = y, .z = z});
     b[0] = out.x;
     b[1] = out.y;
     b[2] = out.z;
@@ -656,8 +660,8 @@ void vec3f_get_dist_and_angle(Vec3f from, Vec3f to, f32 *dist, s16 *pitch, s16 *
     /* register */ f32 y = to[1] - from[1];
     /* register */ f32 z = to[2] - from[2];
 
-    *dist = shz_sqrtf_fsrra(shz_mag_sqr3f(x, y, z)); // (x * x + y * y + z * z);
-    *pitch = atan2s(shz_sqrtf_fsrra(x * x + z * z), y);
+    *dist = shz_sqrtf(shz_mag_sqr3f(x, y, z)); // (x * x + y * y + z * z);
+    *pitch = atan2s(shz_sqrtf(x * x + z * z), y);
     *yaw = atan2s(z, x);
 }
 

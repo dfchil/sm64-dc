@@ -101,6 +101,12 @@ static bool gfx_dc_start_frame(void) {
 static void gfx_dc_swap_buffers_begin(void) {
 }
 
+// Vblanks per presented frame: 2 = the stock 30 fps cap; 1 shows the natural frame time
+// (game logic then also runs per frame, so the game plays faster).
+#ifndef DC_VBL_WAIT
+#define DC_VBL_WAIT 2
+#endif
+
 unsigned int last_elapsed = 0;
 extern volatile uint64_t vblticker;
 uint64_t last_ticker = 0;
@@ -123,8 +129,12 @@ static void gfx_dc_swap_buffers_end(void) {
         last_time += (FRAME_TIME_MS - elapsed);
     }
 #endif
-    while (vblticker < (last_ticker + 2))
+    while (vblticker < (last_ticker + DC_VBL_WAIT))
+#ifdef KOS_GENWAIT_3ARG
+        genwait_wait((void*)&vblticker, NULL, 0);
+#else
         genwait_wait((void*)&vblticker, NULL, 0, NULL);
+#endif
     last_ticker = vblticker;
 
 //    while ((vblticker - last_ticker) < 2) {
