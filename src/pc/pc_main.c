@@ -18,6 +18,7 @@
 #include "audio/audio_null.h"
 
 #include "configfile.h"
+#include "dc_prof.h"
 
 #include "compat.h"
 uint64_t gSysFrameCount = 0;
@@ -72,6 +73,12 @@ static uint8_t inited = 0;
 #include "game/game_init.h" // for gGlobalTimer
 
 void send_display_list(struct SPTask *spTask) {
+#ifndef DC_60FPS
+    // The scene walk always writes the interpolated matrices (rendering_graph_node.c). Without the
+    // 60 fps double draw, patch the exact ones in before the only draw of this logic step.
+    extern void mtx_patch_interpolated(void);
+    mtx_patch_interpolated();
+#endif
     gfx_run((Gfx *)spTask->task.t.data_ptr);
 }
 
@@ -98,18 +105,42 @@ void vblfunc(uint32_t c, void *d) {
 //432
 s16 audio_buffer[2][SAMPLES_HIGH * 2 * 2 * 3] __attribute__((aligned(64)));
 
+#ifdef DC_PROF
+// Set before the profile build exits: KOS shuts the sound driver down in arch_exit, and an
+// audio thread still queueing AICA commands then crashes in snd_sh4_to_aica.
+static volatile int sAudioThreadStop = 0;
+void dc_prof_stop_audio(void) {
+    sAudioThreadStop = 1;
+}
+#endif
+
 void *AudioSynthesisThread(UNUSED void *arg) {
     uint64_t last_vbltick = vblticker;
 
     while (1) {
         while (vblticker <= last_vbltick)
+#ifdef KOS_GENWAIT_3ARG
+            genwait_wait((void*)&vblticker, NULL, 0);
+#else
             genwait_wait((void*)&vblticker, NULL, 0/* 3 */, NULL);
+#endif
         last_vbltick = vblticker;
+#ifdef DC_PROF
+        if (sAudioThreadStop) {
+            return NULL;
+        }
+#endif
 // if you notice the sound starts skipping, re-enable the irq_disable/enable around synthesis
 //        irq_disable();
         // num samples is 448
+#ifdef DC_PROF
+        uint64_t audio_start = dc_prof_now_us();
+#endif
         create_next_audio_buffer(audio_buffer[0], audio_buffer[1], 448);
         audio_api->play((u8 *)audio_buffer[0], (u8 *)audio_buffer[1], 1792);
+#ifdef DC_PROF
+        dc_prof_audio_add((unsigned int) (dc_prof_now_us() - audio_start));
+#endif
 //        irq_enable();
     }
     return NULL;
@@ -136,6 +167,9 @@ void *main_pc_pool_gd = NULL;
 static u8 pool[0x165000+0x70800] __attribute__((aligned(16384)));
 
 void main_func(void) {
+#ifdef DC_PROF
+    dc_prof_init();
+#endif
     main_pc_pool = &pool;
     main_pc_pool_gd = &pool[0x165000];
 
@@ -181,7 +215,27 @@ void main_func(void) {
         gfx_start_frame();
         game_loop_one_iteration();
         gfx_end_frame();
+#ifdef DC_PROF
+        dc_prof_frame_end();
+#endif
         gSysFrameCount++;
+#ifdef DC_60FPS
+        // 60 fps over SM64's 30 Hz logic (the PC 60fps patch's scheme): the display list the game
+        // just built carries matrices interpolated halfway between the previous and the current
+        // logic step, and was drawn above. Patch the real matrices back in and draw it again, so
+        // each logic step shows as two frames, one vblank apart.
+        if (!gResetTimer) {
+            extern void mtx_patch_interpolated(void);
+            gfx_start_frame();
+            mtx_patch_interpolated();
+            send_display_list(gGfxSPTask);
+            gfx_end_frame();
+#ifdef DC_PROF
+            dc_prof_frame_end();
+#endif
+            gSysFrameCount++;
+        }
+#endif
         thd_pass();
     }
 }
