@@ -608,6 +608,19 @@ endif
 ifneq ($(DC_FRAME_MODE),)
   PLATFORM_CFLAGS += -DDC_FRAME_MODE=$(DC_FRAME_MODE)
 endif
+# SH4ZAM 0.10 under __FAST_MATH__ (our -ffast-math) computes sincos as two __builtin_sinf/cosf
+# calls on float radians instead of one FSCA on the 16-bit angle, which differs by one unit on
+# ~17% of angles and moves the game's sins/coss. DC_SHZ_FSCA=1 (default) keeps FSCA, as SH4ZAM 0.9
+# had it, by reading SH4ZAM's inline routines without __FAST_MATH__ (include/sh4zam_port.h);
+# -fno-finite-math-only would do it for the whole build, but its code no longer fits the pinned
+# hot sections. DC_SHZ_FIPR=1 brings back FIPR dot products (SHZ_SH4_DOT_FIPR; 0.10 uses
+# fmul/fadd), but that code does not fit them either (.sub2 over the I-cache size).
+DC_SHZ_FSCA ?= 1
+PLATFORM_CFLAGS += -DDC_SHZ_FSCA=$(DC_SHZ_FSCA)
+DC_SHZ_FIPR ?= 0
+ifeq ($(DC_SHZ_FIPR),1)
+  PLATFORM_CFLAGS += -DSHZ_SH4_DOT_FIPR
+endif
 # DC_RAIL_TR=1 (default): BBH's chain-link fence is blended in the PVR's TR list instead of PT,
 # its biggest fill there (gfx_dc_tags.h DC_GFX_RAIL_TR_*). Unlike DC_CUTOUT_TR, only that fence.
 DC_RAIL_TR ?= 1
