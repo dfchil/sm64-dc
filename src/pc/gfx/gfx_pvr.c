@@ -1018,7 +1018,10 @@ static void pvr_post_init(void) {
     // Punch-through chunk of the tile renderer: ISP_FEED_CFG (PVR register 0x098) bits 13..4, in
     // vertices. Per tile the ISP takes PT polygons this many vertices at a time and repeats its
     // passes per chunk. pvr_init writes 0x00800408 (chunk 64); only the chunk field changes.
-    PVR_SET(PVR_UNK_0098, 0x00800008u | ((unsigned) DC_PT_CHUNK << 4));
+#ifndef PVR_ISP_FEED_CFG
+#define PVR_ISP_FEED_CFG PVR_UNK_0098   /* KOS before 315741eb named it by its address */
+#endif
+    PVR_SET(PVR_ISP_FEED_CFG, 0x00800008u | ((unsigned) DC_PT_CHUNK << 4));
 #endif
 #if defined(__DREAMCAST__) && LOWRES
     PVR_SET(PVR_SCALER_CFG, 0x400);   // 240p: disable the vertical flicker/scanline filter
