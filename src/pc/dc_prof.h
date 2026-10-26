@@ -35,6 +35,8 @@ enum DcProfCount {
     DCC_TR_PX,
     DCC_TR_OPQ_TRIS, // TR whose blend gives the source colour: drawn opaque
     DCC_TR_OPQ_PX,
+    DCC_HELD,        // 60 fps second draws skipped as identical to the first (pc_main.c)
+    DCC_DROPPED,     // DC_FRAME_MODE_60_DROP: exact frames dropped after a late interpolated one
     DCC_COUNT
 };
 
@@ -44,12 +46,21 @@ extern unsigned int gDcProfCount[DCC_COUNT];
 void dc_prof_mark(int mark);
 void dc_prof_frame_end(void);
 void dc_prof_audio_add(unsigned int us);
+// An asset read on the main thread (an AICAflow song or sound from /pc, ok = 0 if it is missing):
+// logged per frame as DCPROF ASSET, and a late frame that read one is a "load" frame.
+void dc_prof_asset_load(const char *name, unsigned int us, unsigned int bytes, int ok);
 unsigned long long dc_prof_now_us(void);
 void dc_prof_stop_audio(void);
 void dc_prof_init(void);
+#ifdef DC_PROF_LISTS
+// One PT (kind 1) or TR (kind 2) batch of this frame: its texture's N64 address (0 untextured),
+// on-screen pixels and triangles. Summed per scene and printed as DCPROF LISTSRC (largest first).
+void dc_prof_list_src(int kind, unsigned int src, unsigned int px, unsigned int tris);
+#endif
 #define DC_PROF_MARK(m) dc_prof_mark(m)
 #else
 #define DC_PROF_MARK(m) ((void) 0)
+#define dc_prof_asset_load(name, us, bytes, ok) ((void) 0)
 #define DC_PROF_COUNT(c, n) ((void) 0)
 #endif
 

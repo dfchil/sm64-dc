@@ -32,6 +32,46 @@ static char gLevelSelect_StageNamesText[64][16] = {
 #undef DEFINE_LEVEL
 
 static u16 gDemoCountdown = 0;
+
+#ifdef DC_PROF_BENCH
+// Benchmark tour (make DC_PROF_BENCH=1): every level, each entered at its start as an attract
+// demo whose inputs game_init.c generates (run_demo_inputs): the camera turns round twice, close
+// and zoomed out, while Mario stands still, so the PVR sees each level in every direction and
+// nothing depends on a route. The demo index only loads a valid input list.
+static const struct { s8 level; u8 demo; } sTour[] = {
+    { LEVEL_BOB, 1 },   { LEVEL_WF, 1 },     { LEVEL_JRB, 1 },    { LEVEL_CCM, 1 },   { LEVEL_BBH, 1 },
+    { LEVEL_HMC, 1 },   { LEVEL_LLL, 1 },    { LEVEL_SSL, 1 },    { LEVEL_DDD, 1 },   { LEVEL_SL, 1 },
+    { LEVEL_WDW, 1 },   { LEVEL_TTM, 1 },    { LEVEL_THI, 1 },    { LEVEL_TTC, 1 },   { LEVEL_RR, 1 },
+    { LEVEL_PSS, 1 },   { LEVEL_SA, 1 },     { LEVEL_WMOTR, 1 },  { LEVEL_TOTWC, 1 }, { LEVEL_COTMC, 1 },
+    { LEVEL_VCUTM, 1 }, { LEVEL_BITDW, 1 },  { LEVEL_BITFS, 1 },  { LEVEL_BITS, 1 },
+    { LEVEL_BOWSER_1, 1 }, { LEVEL_BOWSER_2, 1 }, { LEVEL_BOWSER_3, 1 },
+    { LEVEL_CASTLE_GROUNDS, 1 }, { LEVEL_CASTLE, 1 }, { LEVEL_CASTLE_COURTYARD, 1 },
+};
+#define DC_PROF_TOUR_TABLE
+#endif
+#if defined(DC_PROF_TOUR) && !defined(DC_PROF_TOUR_TABLE)
+// Profile tour (make DC_PROF_TOUR=1): the attract demos visit every main level in turn. A level
+// with an attract demo of its own plays it, so Mario and the camera move as in a real attract
+// run; the others play Whomp's Fortress's inputs (the shortest demo) in a level they were not
+// recorded for, so the tour fits one profile run. Demo indices are the US table's order
+// (assets/demo_data.json): BITDW, WF, CCM, BBH, JRB, HMC, PSS.
+static const struct { s8 level; u8 demo; } sTour[] = {
+    { LEVEL_BOB, 1 },   { LEVEL_WF, 1 },     { LEVEL_JRB, 4 },    { LEVEL_CCM, 2 },  { LEVEL_BBH, 3 },
+    { LEVEL_HMC, 5 },   { LEVEL_LLL, 1 },    { LEVEL_SSL, 1 },    { LEVEL_DDD, 1 },  { LEVEL_SL, 1 },
+    { LEVEL_WDW, 1 },   { LEVEL_TTM, 1 },    { LEVEL_THI, 1 },    { LEVEL_TTC, 1 },
+    { LEVEL_CASTLE_GROUNDS, 1 }, { LEVEL_CASTLE, 1 }, { LEVEL_BITDW, 0 }, { LEVEL_BITFS, 1 },
+    { LEVEL_BITS, 1 },  { LEVEL_BOWSER_1, 1 }, { LEVEL_PSS, 6 },
+    { LEVEL_RR, 1 },
+};
+#endif
+#ifdef DC_PROF_TOUR
+#ifndef DC_PROF_TOUR_START
+#define DC_PROF_TOUR_START 0
+#endif
+#ifndef DC_PROF_TOUR_ONLY
+static u32 sTourPos = DC_PROF_TOUR_START;   // make DC_PROF_TOUR_START=n starts the tour at entry n
+#endif
+#endif
 #ifndef VERSION_JP
 static s16 D_U_801A7C34 = 1;
 static s16 gameOverNotPlayed = 1;
@@ -49,11 +89,30 @@ int run_press_start_demo_timer(s32 timer) {
 
     if (timer == 0) {
         if (!gPlayer1Controller->buttonDown && !gPlayer1Controller->stickMag) {
+#ifdef DC_PROF_TOUR
+            // A demo that ends by Mario's death (Wing Mario Over the Rainbow, Rainbow Ride with
+            // inputs recorded elsewhere) does not reset the countdown, which then never equals
+            // the limit again and the tour stops on the title screen.
+            if ((++gDemoCountdown) >= PRESS_START_DEMO_TIMER) {
+#else
             if ((++gDemoCountdown) == PRESS_START_DEMO_TIMER) {
+#endif
                 // start the demo. 800 frames has passed while
                 // player is idle on PRESS START screen.
                 D_U_801A7C34 = 1;
 
+#ifdef DC_PROF_TOUR
+#ifdef DC_PROF_TOUR_ONLY
+                const u32 tourPos = DC_PROF_TOUR_ONLY;   // make DC_PROF_TOUR_ONLY=n: entry n every time
+#else
+                const u32 tourPos = sTourPos++ % ARRAY_COUNT(sTour);
+#endif
+                gDemoInputListID = sTour[tourPos].demo;
+                // The same demo twice in a row: load_patchable_table would skip the DMA (same source
+                // address as last time) although the level load reused the buffer, leaving Mario
+                // without inputs. Force the reload.
+                gDemo.currentAnimAddr = NULL;
+#endif
                 // start the Mario demo animation for the demo list.
                 load_patchable_table(&gDemo, gDemoInputListID);
 
@@ -67,19 +126,7 @@ int run_press_start_demo_timer(s32 timer) {
                 gCurrDemoInput = ((struct DemoInput *) gDemo.targetAnim) + 1;
                 timer = (s8)((struct DemoInput *) gDemo.targetAnim)->timer;
 #ifdef DC_PROF_TOUR
-                {
-                    // Profile tour: send each attract demo to the next level of this list instead of
-                    // its own. Mario follows the wrong level's inputs, but every level's geometry,
-                    // objects and camera get rendered and measured.
-                    static const s8 sTour[] = {
-                        LEVEL_BOB, LEVEL_WF, LEVEL_JRB, LEVEL_CCM, LEVEL_BBH, LEVEL_HMC, LEVEL_LLL,
-                        LEVEL_SSL, LEVEL_DDD, LEVEL_SL, LEVEL_WDW, LEVEL_TTM, LEVEL_THI, LEVEL_TTC,
-                        LEVEL_RR, LEVEL_CASTLE_GROUNDS, LEVEL_CASTLE, LEVEL_BITDW, LEVEL_BITFS,
-                        LEVEL_BITS, LEVEL_BOWSER_1,
-                    };
-                    static u32 sTourPos = 0;
-                    timer = sTour[sTourPos++ % ARRAY_COUNT(sTour)];
-                }
+                timer = sTour[tourPos].level;
 #endif
                 gCurrSaveFileNum = 1;
                 gCurrActNum = 1;

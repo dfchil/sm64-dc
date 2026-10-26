@@ -578,6 +578,49 @@ PLATFORM_CFLAGS += -DDC_VBL_WAIT=$(DC_VBL_WAIT)
 ifeq ($(DC_60FPS),1)
   PLATFORM_CFLAGS += -DDC_60FPS
 endif
+# DC_FSAA=1: KOS's horizontal 2x full-screen anti-aliasing. The PVR renders 1280 wide and the
+# scaler filters down to 640 on output (gfx_pvr.c, gfx_retro_dc.c scale x by 2).
+DC_FSAA ?= 0
+ifeq ($(DC_FSAA),1)
+  PLATFORM_CFLAGS += -DDC_FSAA=1
+endif
+# DC_OPAQUE_LAVA=1 (default with FSAA): lava is drawn opaque, out of the PVR's TR list (moving_texture.c).
+DC_OPAQUE_LAVA ?= $(DC_FSAA)
+PLATFORM_CFLAGS += -DDC_OPAQUE_LAVA=$(DC_OPAQUE_LAVA)
+# DC_HOLD_IDENTICAL=1: at 60 fps, a second draw identical to the first (no interpolated matrix
+# differs, e.g. the title's goddard head) is not drawn; the frame is shown again (pc_main.c).
+DC_HOLD_IDENTICAL ?= 1
+# DC_OVERLAY=1: frame rate and missed frames of the scene on screen, in enDjinn's quick font
+# (src/pc/dc_overlay.c; enDjinn is the third_party/endjinn submodule).
+DC_OVERLAY ?= 0
+ENDJINN_DIR ?= third_party/endjinn
+PLATFORM_CFLAGS += -DDC_OVERLAY=$(DC_OVERLAY)
+ifeq ($(DC_OVERLAY),1)
+  PLATFORM_CFLAGS += -I$(ENDJINN_DIR)/include -DENJ_CBASEPATH=\"/cd/\" -DENJ_FSAA=$(DC_FSAA)
+endif
+PLATFORM_CFLAGS += -DDC_HOLD_IDENTICAL=$(DC_HOLD_IDENTICAL)
+# The default video options (src/pc/dc_video_options.h): DC_FSAA_MODE (DC_FSAA=1 builds) 0 off,
+# 1 on, 2 on except the water and lava courses (default); DC_FRAME_MODE (DC_60FPS=1 builds) 0 30 fps,
+# 1 60 fps that slows down when late, 2 60 fps that drops a late step's second frame (default).
+ifneq ($(DC_FSAA_MODE),)
+  PLATFORM_CFLAGS += -DDC_FSAA_MODE=$(DC_FSAA_MODE)
+endif
+ifneq ($(DC_FRAME_MODE),)
+  PLATFORM_CFLAGS += -DDC_FRAME_MODE=$(DC_FRAME_MODE)
+endif
+# DC_RAIL_TR=1 (default): BBH's chain-link fence is blended in the PVR's TR list instead of PT,
+# its biggest fill there (gfx_dc_tags.h DC_GFX_RAIL_TR_*). Unlike DC_CUTOUT_TR, only that fence.
+DC_RAIL_TR ?= 1
+PLATFORM_CFLAGS += -DDC_RAIL_TR=$(DC_RAIL_TR)
+# DC_CUTOUT_TR=1: alpha-test cutouts (fences, railings, foliage) are blended in the TR list instead
+# of punch-through; same picture, softer edges. An experiment: PT costs extra passes per tile.
+DC_CUTOUT_TR ?= 0
+ifeq ($(DC_CUTOUT_TR),1)
+  PLATFORM_CFLAGS += -DDC_CUTOUT_KIND=2
+endif
+# DC_PT_CHUNK: vertices per punch-through chunk in the tile renderer (ISP_FEED_CFG, 32..512; KOS 64).
+DC_PT_CHUNK ?= 64
+PLATFORM_CFLAGS += -DDC_PT_CHUNK=$(DC_PT_CHUNK)
 # Above -Os GCC flags stock SM64 code (mario_actions_moving.c) as maybe-uninitialized.
 PLATFORM_CFLAGS += -Wno-error=maybe-uninitialized
 ifeq ($(DC_PROF),1)
@@ -599,6 +642,41 @@ ifeq ($(DC_PROF),1)
   ifeq ($(DC_PROF_LISTS),1)
     PLATFORM_CFLAGS += -DDC_PROF_LISTS
   endif
+  # DC_PROF_TOUR_MUSIC=1: the tour's demos play their level's music (attract demos normally don't).
+  ifeq ($(DC_PROF_TOUR_MUSIC),1)
+    PLATFORM_CFLAGS += -DDC_PROF_TOUR_MUSIC
+  endif
+  # DC_PROF_BENCH=1: the tour visits every level and turns the camera round instead of playing
+  # demo inputs (level_select_menu.c, game_init.c bench_demo_inputs); implies DC_PROF_TOUR.
+  ifeq ($(DC_PROF_BENCH),1)
+    PLATFORM_CFLAGS += -DDC_PROF_BENCH -DDC_PROF_TOUR
+  endif
+  ifneq ($(DC_PROF_TOUR_ONLY),)
+    PLATFORM_CFLAGS += -DDC_PROF_TOUR_ONLY=$(DC_PROF_TOUR_ONLY)
+  endif
+  ifneq ($(DC_PROF_TOUR_START),)
+    PLATFORM_CFLAGS += -DDC_PROF_TOUR_START=$(DC_PROF_TOUR_START)
+  endif
+  # DC_PROF_SAMPLE_LATE=1: sample the PC at 2 kHz but keep only the samples of late frames.
+  ifeq ($(DC_PROF_SAMPLE_LATE),1)
+    PLATFORM_CFLAGS += -DDC_PROF_SAMPLE -DDC_PROF_SAMPLE_LATE
+  endif
+  # DC_PROF_SKIP=<code>: leave one part of the frame out of the PVR lists, to price it by
+  # subtraction (codes in gfx_pvr.c); 999 cycles through every code in one run (DCPROF SKIP lines).
+  DC_PROF_SKIP ?= 0
+  ifneq ($(DC_PROF_SKIP),0)
+    PLATFORM_CFLAGS += -DDC_PROF_SKIP=$(DC_PROF_SKIP)
+  endif
+endif
+# DC_AUDIO_RECORD=1: no game; play each sequence of DC_AUDIO_RECORD_SEQS (hex, comma-separated) and
+# each sound of DC_AUDIO_RECORD_SOUNDS (SOUND_* values in hex, low status nibble 1 = starting) in turn,
+# logging every AICA voice command to /pc/rec_*.bin (src/audio/aica_record.h; tools/aica/sm64_afx_batch.py).
+# Each item stops by itself (two passes of a song, the end of a sound) or after DC_AUDIO_RECORD_SECONDS.
+DC_AUDIO_RECORD ?= 0
+ifeq ($(DC_AUDIO_RECORD),1)
+  DC_AUDIO_RECORD_SECONDS ?= 300
+  PLATFORM_CFLAGS += -DDC_AUDIO_RECORD -DDC_AUDIO_RECORD_SEQS=\"$(DC_AUDIO_RECORD_SEQS)\" \
+    -DDC_AUDIO_RECORD_SOUNDS=\"$(DC_AUDIO_RECORD_SOUNDS)\" -DDC_AUDIO_RECORD_SECONDS=$(DC_AUDIO_RECORD_SECONDS)
 endif
 
 # KOS dropped genwait_wait()'s callback argument in Nov 2025 without a version bump,
@@ -616,6 +694,40 @@ endif
 #  PLATFORM_CFLAGS += -Wdouble-promotion
 
   PLATFORM_LDFLAGS := -Wl,--gc-sections  -Wl,-Map=output.map -lsh4zam
+  # SM_WARM (gfx_retro_dc.c): hot code that does not fit in .sub0, placed on I-cache sets
+  # DC_SM_WARM_SET.. by an ld ordering file. .sub1 starts one I-cache size after .sub0, so the offset
+  # into .sub1 is the I-cache index. Pick the set from samples: lines .sub0 leaves cold.
+  DC_SM_WARM_SET ?= 174
+  # tri_state_setup in .sub2 at I-cache set DC_SM_WARM2_SET (gfx_retro_dc.c SM_WARM2).
+  DC_SM_WARM2_SET ?= 126
+  # The renderer's hot data (.data.sm64_hot: rsp, rdp, sTri, the vertex bake buffers) at a fixed
+  # offset from .sub0 mod the 16 KB operand cache, so it keeps its O-cache sets relative to the hot
+  # code and its literal pools when code or .rodata grows (.sub0 moves in 8 KB steps). It goes into
+  # .sub3, which starts 24 KB after .sub0 (8 KB steps, .sub1/.sub2 in use), i.e. at .sub0 + 8 KB
+  # mod 16 KB; the Dreamcast has no MMU, so data there is fine. The offset must stay within
+  # 0x2000..0x3fff minus the block's ~5.3 KB. 0x22c0 is the offset in the build whose title-screen
+  # D-cache stalls were lowest (5.9% of display-list cycles). .bss starts on a 16 KB boundary.
+  DC_HOT_DATA_RESIDUE ?= 0x22c0
+  # DC_COVERS=0: screen transitions draw their solid parts blended (TR) instead of as OP covers
+  # (src/pc/gfx/gfx_dc_tags.h), for A/B runs.
+  DC_COVERS ?= 1
+  PLATFORM_CFLAGS += -DDC_COVERS=$(DC_COVERS)
+  PLATFORM_LDFLAGS += -Wl,--section-ordering-file=$(BUILD_DIR)/sm_warm.ld
+  # DC_AICAFLOW=1: music and sounds as AICAflow assets (src/pc/audio/sm64_aicaflow.c) from
+  # DC_AICAFLOW_ROOT (default /pc/afx), made by tools/aica/sm64_afx.py. No sequencer thread, no
+  # KOS sound driver, no AICA voice driver or its 2.4 MB sample pool.
+  DC_AICAFLOW ?= 0
+  AICAFLOW_DIR ?= third_party/aicaflow
+  ifeq ($(DC_AICAFLOW),1)
+    PLATFORM_CFLAGS += -DDC_AICAFLOW -I$(AICAFLOW_DIR)/driver/include \
+      -I$(AICAFLOW_DIR)/driver/format/include -I$(AICAFLOW_DIR)/driver/sh4/include
+    ifeq ($(DC_AICAFLOW_DEBUG),1)
+      PLATFORM_CFLAGS += -DDC_AICAFLOW_DEBUG
+    endif
+    ifneq ($(DC_AICAFLOW_ROOT),)
+      PLATFORM_CFLAGS += -DDC_AICAFLOW_ROOT=\"$(DC_AICAFLOW_ROOT)\"
+    endif
+  endif
 endif
 ifeq ($(TARGET_WEB),1)
   PLATFORM_CFLAGS  := -DTARGET_WEB
@@ -883,7 +995,31 @@ $(SOUND_BIN_DIR)/sound_data.tbl.inc.c: $(SOUND_BIN_DIR)/sound_data.tbl
 # built sound_data banks (timestamp-gated; only re-runs when the banks change).
 # scipy-optional -- a clean checkout builds with stock python3.
 AICA_TOOLS := $(filter-out tools/aica/compare_encoders.py tools/aica/adpcm_quality.py,$(wildcard tools/aica/*.py)) tools/aica/ya2beam.c
+ifeq ($(DC_AICAFLOW),1)
+# The AICAflow host library, rebuilt when its sources change, and its ARM7 firmware as a C array.
+AICAFLOW_LIB := $(AICAFLOW_DIR)/driver/sh4/libaicaflow_host.a
+SOUND_OBJ_FILES += $(BUILD_DIR)/aicaflow_firmware.o $(AICAFLOW_LIB)
+$(AICAFLOW_LIB): $(wildcard $(AICAFLOW_DIR)/driver/sh4/src/*.c $(AICAFLOW_DIR)/driver/sh4/include/aicaflow/*.h \
+                   $(AICAFLOW_DIR)/driver/include/aicaflow/*.h $(AICAFLOW_DIR)/driver/format/src/*.c \
+                   $(AICAFLOW_DIR)/driver/format/include/aicaflow/*.h)
+	$(MAKE) -C $(AICAFLOW_DIR)/driver/sh4
+$(BUILD_DIR)/aicaflow_firmware.c: $(AICAFLOW_DIR)/firmware/aicaflow.drv
+	$(PYTHON) -c 'import sys; d = open(sys.argv[1], "rb").read(); print("const unsigned char gAicaflowFirmware[] __attribute__((aligned(32))) = {" + ",".join(str(b) for b in d) + "};\nconst unsigned int gAicaflowFirmwareSize = sizeof(gAicaflowFirmware);")' $< > $@
+$(BUILD_DIR)/aicaflow_firmware.o: $(BUILD_DIR)/aicaflow_firmware.c
+	$(CC) -c -o $@ $<
+else
 SOUND_OBJ_FILES += $(SOUND_BIN_DIR)/aica_pool.o $(SOUND_BIN_DIR)/aica_sample_table.o
+endif
+
+ifeq ($(DC_OVERLAY),1)
+# The few enDjinn sources the overlay's quick font needs, built with its own C dialect.
+ENDJINN_SRCS := enj_qfont.c enj_font.c enj_draw.c enj_bitmap.c
+ENDJINN_O_FILES := $(addprefix $(BUILD_DIR)/endjinn/,$(ENDJINN_SRCS:.c=.o))
+SOUND_OBJ_FILES += $(ENDJINN_O_FILES)
+$(BUILD_DIR)/endjinn/%.o: $(ENDJINN_DIR)/code/%.c
+	@mkdir -p $(dir $@)
+	$(CC) -std=gnu23 -O2 -c -I$(ENDJINN_DIR)/include -DENJ_CBASEPATH=\"/cd/\" -DENJ_FSAA=$(DC_FSAA) -DENJ_INJECT_QFONT=1 -o $@ $<
+endif
 
 $(SOUND_BIN_DIR)/aica_pool.c: $(SOUND_BIN_DIR)/sound_data.tbl $(SOUND_BIN_DIR)/sound_data.ctl $(AICA_TOOLS)
 	PYTHONPATH=tools/aica $(PYTHON) tools/aica/sm64_emit.py \
@@ -1049,12 +1185,24 @@ $(foreach f,$(DC_OS_FILES),$(eval $(BUILD_DIR)/$(f:.c=.o): CFLAGS += -Os))
 ifeq ($(TARGET_DC),1)
 # Unused for now, might be later
 include $(KOS_BASE)/Makefile.rules
-  $(EXE): $(O_FILES) $(MIO0_FILES:.mio0=.o) $(SOUND_OBJ_FILES) $(ULTRA_O_FILES) $(GODDARD_O_FILES) romdisk.o
+  $(EXE): $(O_FILES) $(MIO0_FILES:.mio0=.o) $(SOUND_OBJ_FILES) $(ULTRA_O_FILES) $(GODDARD_O_FILES) romdisk.o $(BUILD_DIR)/sm_warm.ld
 else
   $(EXE): $(O_FILES) $(MIO0_FILES:.mio0=.o) $(SOUND_OBJ_FILES) $(ULTRA_O_FILES) $(GODDARD_O_FILES)
 endif
 	@echo "Linking $@"
 	@$(LD) -L $(BUILD_DIR) -o $@ $(O_FILES) $(SOUND_OBJ_FILES) $(ULTRA_O_FILES) $(GODDARD_O_FILES) $(LDFLAGS) -flto
+# (A DC_AUDIO_RECORD build has no renderer, so nothing to place: the check is skipped there.)
+ifeq ($(TARGET_DC)$(DC_AUDIO_RECORD),10)
+# gfx_retro_dc.c's SM_WARM code must sit on I-cache sets DC_SM_WARM_SET.. inside .sub1, or it is
+# back on whatever lines the link gives it. LTO may rename a static symbol to name.lto_priv.N.
+	@sh-elf-nm $@ | awk -v r=$$(( $(DC_HOT_DATA_RESIDUE) )) 'function hex(s,  i, n) { n = 0; for (i = 1; i <= length(s); i++) n = n * 16 + index("0123456789abcdef", substr(s, i, 1)) - 1; return n } \
+	  $$3 == "__sub0_start" { s0 = hex($$1) } $$3 == "__sub2_start" { s2 = hex($$1) } $$3 ~ /^_tri_state_setup(\.lto_priv\.[0-9]+)?$$/ { ts = hex($$1) } \
+	  $$3 == "__sub1_start" { s = hex($$1) } $$3 ~ /^_cc_eval_float/ { f = hex($$1) } $$3 ~ /^_(sTriStateEpoch|clip_rej|rsp)(\.lto_priv\.[0-9]+)?$$/ { h = (!h || hex($$1) < h) ? hex($$1) : h } \
+	  END { if (!s || s % 8192 || f != s + $(DC_SM_WARM_SET) * 32) { print "SM_WARM placement broken: cc_eval_float is not at .sub1 + $(DC_SM_WARM_SET) * 32"; exit 1 } \
+	        if (!s2 || ts != s2 + $(DC_SM_WARM2_SET) * 32) { print "SM_WARM2 placement broken: tri_state_setup is not at .sub2 + $(DC_SM_WARM2_SET) * 32"; exit 1 } \
+	        d = (h - s0) % 16384; if (d < r || d >= r + 8192) { printf "hot data at .sub0 + %d mod 16384, not near $(DC_HOT_DATA_RESIDUE)\n", d; exit 1 } \
+	        printf "SM_WARM: cc_eval_float on I-cache sets $(DC_SM_WARM_SET).., tri_state_setup on $(DC_SM_WARM2_SET)..; hot data at .sub0 + 0x%x mod 16 KB\n", d }' || { rm -f $@; exit 1; }
+endif
 ifeq ($(TARGET_PSP),1)
 	psp-fixup-imports $@
 	psp-prxgen $@ $@.prx
@@ -1070,6 +1218,11 @@ pbp: $(EXE)
 .PHONY: pbp
 endif
 ifeq ($(TARGET_DC),1)
+$(BUILD_DIR)/sm_warm.ld: Makefile
+	@printf '/* SM_WARM code (gfx_retro_dc.c) on I-cache sets $(DC_SM_WARM_SET).. */\n.sub1 : {\n  . = MAX(., %d); *(.sub1.sm64_warm)\n}\n' $$(( $(DC_SM_WARM_SET) * 32 )) > $@
+	@printf '/* SM_WARM2 code on I-cache sets $(DC_SM_WARM2_SET).. */\n.sub2 : {\n  . = MAX(., %d); *(.sub2.sm64_warm)\n}\n' $$(( $(DC_SM_WARM2_SET) * 32 )) >> $@
+	@printf '/* The hot data at .sub0 + $(DC_HOT_DATA_RESIDUE) mod 16 KB, .bss from a 16 KB boundary (O-cache sets). */\n.sub3 : {\n  . = MAX(., %d); *(.data.sm64_hot)\n}\n.bss : {\n  . = ALIGN(0x4000);\n}\n' $$(( ($(DC_HOT_DATA_RESIDUE) + 0x2000) & 0x3fff )) >> $@
+
 elf: $(EXE)
 	sh-elf-objcopy -R .stack -O binary $< $<.bin
 

@@ -391,9 +391,41 @@ void adjust_analog_stick(struct Controller *controller) {
 
 // if a demo sequence exists, this will run the demo
 // input list until it is complete. called every frame.
+#ifdef DC_PROF_BENCH
+// The benchmark tour (level_select_menu.c): 3 s for the level to come in, then the camera goes
+// round Mario once in 6 s, once more 1.6 times as far out, and the demo ends 1 s later. Mario
+// gets no input. The game's own camera cannot orbit (C-left turns it a step or two), so
+// camera.c turns its result by gDcBenchYaw and stretches it by gDcBenchZoom.
+s16 gDcBenchYaw;
+f32 gDcBenchZoom = 1.0f;
+
+static int bench_demo_inputs(void) {
+    static u32 tick;
+    OSContPad *pad = gControllers[0].controllerData;
+    if (gCurrDemoInput == NULL) {
+        tick = 0;
+        gDcBenchYaw = 0;
+        gDcBenchZoom = 1.0f;
+        return FALSE;
+    }
+    u32 t = tick++;
+    pad->stick_x = 0;
+    pad->stick_y = 0;
+    pad->button = t >= 480 ? END_DEMO : 0;
+    gDcBenchYaw = t < 90 ? 0 : (s16) ((t - 90) * 65536 / 180);
+    gDcBenchZoom = t < 270 ? 1.0f : 1.6f;
+    return TRUE;
+}
+#endif
+
 void run_demo_inputs(void) {
     // eliminate the unused bits.
     gControllers[0].controllerData->button &= VALID_BUTTONS;
+#ifdef DC_PROF_BENCH
+    if (bench_demo_inputs()) {
+        return;
+    }
+#endif
 
     /*
         Check if a demo inputs list

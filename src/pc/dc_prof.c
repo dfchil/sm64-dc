@@ -18,6 +18,9 @@
 #ifndef DC_VBL_WAIT
 #define DC_VBL_WAIT 2
 #endif
+#ifndef DC_FSAA
+#define DC_FSAA 0
+#endif
 
 struct DemoInput;
 extern int16_t gCurrLevelNum;
@@ -38,14 +41,59 @@ typedef struct {
     uint16_t us[C_COUNT];
 } FrameRec;
 
+// A sampling build gives the per-frame CSV's RAM to the samples: the image must stay under the
+// 1 MB free-RAM guard (tools/dc_prof_run.zsh).
+#ifdef DC_PROF_SAMPLE
+#define MAX_FRAMES 8192
+#else
 #define MAX_FRAMES 16384
+#endif
 static FrameRec sFrames[MAX_FRAMES];
 static uint32_t sFrameCount;
 static uint32_t sFramesDropped;   // frames past MAX_FRAMES: in the scene stats, not the CSV
 
+// Why a frame was late (DCPROF LATE lines, and the SCENE late_* counts). One field is 16.7 ms;
+// the frame's own CPU work (logic + geo walk + translation) or the PVR (the wait for the previous
+// render, or the render time itself) reaching a field's budget is what makes it late. A frame
+// in a level load (a long level script, a translation that uploads every texture, or one of the
+// first frames of a scene) is "load", whatever else it was.
+enum { LATE_CPU, LATE_PVR, LATE_BOTH, LATE_LOAD, LATE_OTHER, LATE_CAUSES };
+static const char *const sCauseNames[LATE_CAUSES] = { "cpu", "pvr", "both", "load", "other" };
+#define FIELD_US 16667
+#define LATE_BUDGET_US (DC_VBL_WAIT * FIELD_US - 1200)
+#define LOAD_LOGIC_US 8000
+#define LOAD_DL_US 30000
+#define LOAD_SCENE_FRAMES 3
+
+typedef struct {
+    uint32_t frame, vbl;
+    uint16_t scene, since_scene;
+    uint8_t fields, cause;
+    uint16_t logic, geo, dl, wait, render, audio, asset;
+} LateRec;
+#define MAX_LATE 2048
+static LateRec sLate[MAX_LATE];
+static uint32_t sLateCount, sLateDropped;
+static uint16_t sPrevScene = 0xFFFF;
+
+// Asset reads on the main thread (dc_prof_asset_load): each one, and their time in this frame.
+typedef struct {
+    uint32_t frame, us, bytes;
+    uint16_t scene;
+    uint8_t ok;
+    char name[21];
+} AssetRec;
+#define MAX_ASSETS 512
+static AssetRec sAssets[MAX_ASSETS];
+static uint32_t sAssetCount, sAssetsDropped;
+static uint32_t sFrameAssetUs;
+static uint32_t sSinceScene;   // frames since the scene (level/area/demo) last changed
+
 typedef struct {
     uint16_t scene;
     uint32_t frames, late;
+    uint32_t late_by[LATE_CAUSES];
+    uint32_t vram_min;   // least free texture VRAM seen in the scene, bytes
     uint64_t sum[C_COUNT];
     uint16_t max[C_COUNT];
 } SceneStats;
@@ -59,8 +107,66 @@ static uint64_t sSceneCounts[MAX_SCENES][DCC_COUNT];
 static uint64_t sScenePmu[MAX_SCENES][PMU_COUNT];
 static uint32_t sScenePmuFrames[MAX_SCENES][PMU_COUNT];
 static const char *const sCountNames[DCC_COUNT] = { "tris", "fast", "bakes", "epochs", "setups", "verts",
-    "op_tris", "op_px", "pt_tris", "pt_px", "pt_opq_px", "tr_tris", "tr_px", "tr_opq_tris", "tr_opq_px" };
+    "op_tris", "op_px", "pt_tris", "pt_px", "pt_opq_px", "tr_tris", "tr_px", "tr_opq_tris", "tr_opq_px", "held", "dropped" };
 static int sSceneCount;
+
+#ifdef DC_PROF_LISTS
+// What fills the PT and TR lists, by texture: each frame's batches are summed by (list, N64 texture
+// address) and merged into a per-scene top table. A full table replaces its smallest entry, so the
+// tail is approximate; the large entries are what matter.
+typedef struct { uint32_t src; uint8_t kind; uint64_t px; uint32_t tris; } ListSrc;
+#define LIST_SRC_FRAME 96
+#define LIST_SRC_SCENE 24
+static ListSrc sFrameSrc[LIST_SRC_FRAME];
+static int sFrameSrcCount;
+static ListSrc sSceneSrc[MAX_SCENES][LIST_SRC_SCENE];
+
+void dc_prof_list_src(int kind, unsigned int src, unsigned int px, unsigned int tris) {
+    for (int i = 0; i < sFrameSrcCount; i++) {
+        if (sFrameSrc[i].src == src && sFrameSrc[i].kind == kind) {
+            sFrameSrc[i].px += px;
+            sFrameSrc[i].tris += tris;
+            return;
+        }
+    }
+    if (sFrameSrcCount < LIST_SRC_FRAME) {
+        ListSrc *f = &sFrameSrc[sFrameSrcCount++];
+        f->src = src;
+        f->kind = (uint8_t) kind;
+        f->px = px;
+        f->tris = tris;
+    }
+}
+
+static void list_src_merge(int scene) {
+    ListSrc *t = sSceneSrc[scene];
+    for (int i = 0; i < sFrameSrcCount; i++) {
+        const ListSrc *f = &sFrameSrc[i];
+        int slot = -1, min = 0;
+        for (int j = 0; j < LIST_SRC_SCENE; j++) {
+            if (t[j].tris && t[j].src == f->src && t[j].kind == f->kind) {
+                slot = j;
+                break;
+            }
+            if (t[j].px < t[min].px) {
+                min = j;
+            }
+        }
+        if (slot < 0) {
+            if (t[min].tris && t[min].px > f->px) {
+                continue;
+            }
+            slot = min;
+            t[slot].src = f->src;
+            t[slot].kind = f->kind;
+            t[slot].px = 0;
+            t[slot].tris = 0;
+        }
+        t[slot].px += f->px;
+        t[slot].tris += f->tris;
+    }
+}
+#endif
 
 static uint64_t sMark[DCP_COUNT];
 static uint64_t sFrameStart, sRunStart;
@@ -103,24 +209,83 @@ void dc_prof_mark(int mark) {
     }
 }
 
+// DC_PROF_SKIP: the part of the frame gfx_pvr.c leaves out, to price it by subtraction (the codes
+// are listed there). DC_PROF_SKIP=999 cycles through every code, a block of frames each, with
+// blocks that leave nothing out between them, so one run prices every part on the same content.
+// The render time read at a frame's end is that of a frame or two before, so the first frames of
+// a block are not attributed.
+#ifdef DC_PROF_SKIP
+int gDcProfSkip = DC_PROF_SKIP == 999 ? 0 : DC_PROF_SKIP;
+#if DC_PROF_SKIP == 999
+static const uint8_t sSkipCodes[] = { 0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10 };
+#define SKIP_CODES ((int) sizeof(sSkipCodes))
+#define SKIP_BLOCK 10
+#define SKIP_SETTLE 3
+static uint32_t sSkipFrame;
+typedef struct {
+    uint64_t sum;
+    uint32_t frames, over;
+    uint16_t max;
+} SkipStats;
+static SkipStats sSceneSkip[MAX_SCENES][SKIP_CODES];
+#endif
+#endif
+
 #ifdef DC_PROF_SAMPLE
 // PC sampler (make DC_PROF_SAMPLE=1): TMU1 interrupts at DC_SAMPLE_HZ and stores the interrupted
 // PC (offset from 0x8c000000, low 24 bits) with the frame stage in the top byte. Written to
 // /pc/sm64_samples.bin at exit; tools/dc_prof_samples.py resolves it against the ELF.
+// DC_PROF_SAMPLE_LATE=1 keeps only the samples of frames that turn out late: a frame's samples
+// wait in a staging buffer until its end shows how many fields it took.
+#ifdef DC_PROF_SAMPLE_LATE
+#define DC_SAMPLE_HZ 2000
+#else
 #define DC_SAMPLE_HZ 500
+#endif
 #define DC_SAMPLE_CAP (32 * 1024)   // 128 KB (65 s at 500 Hz): the game leaves only ~1.4 MB of the 16 MB free
 static uint32_t sSamples[DC_SAMPLE_CAP];
 static volatile uint32_t sSampleCount;
+#ifdef DC_PROF_SAMPLE_LATE
+#define DC_STAGING_CAP 1024
+static uint32_t sStaging[DC_STAGING_CAP];
+static volatile uint32_t sStagingCount;
+#endif
 
 static void sample_irq(irq_t code, irq_context_t *ctx, void *data) {
     (void) code;
     (void) data;
     timer_clear(TMU1);
+    uint32_t s = ((ctx->pc - 0x8c000000u) & 0x00FFFFFFu) | ((uint32_t) sStage << 24);
+#ifdef DC_PROF_SAMPLE_LATE
+    uint32_t n = sStagingCount;
+    if (n < DC_STAGING_CAP) {
+        sStaging[n] = s;
+        sStagingCount = n + 1;
+    }
+#else
     uint32_t n = sSampleCount;
     if (n < DC_SAMPLE_CAP) {
-        sSamples[n] = ((ctx->pc - 0x8c000000u) & 0x00FFFFFFu) | ((uint32_t) sStage << 24);
+        sSamples[n] = s;
         sSampleCount = n + 1;
     }
+#endif
+}
+
+// Frame end: keep or drop the staged samples of the frame that just finished.
+static void sample_frame_end(int late) {
+#ifdef DC_PROF_SAMPLE_LATE
+    uint32_t n = sStagingCount;
+    if (late) {
+        uint32_t at = sSampleCount;
+        for (uint32_t i = 0; i < n && at < DC_SAMPLE_CAP; i++) {
+            sSamples[at++] = sStaging[i];
+        }
+        sSampleCount = at;
+    }
+    sStagingCount = 0;
+#else
+    (void) late;
+#endif
 }
 
 static void sampler_start(void) {
@@ -146,6 +311,9 @@ static void sampler_finish(void) {
     printf("DCPROF wrote /pc/sm64_samples.bin (%u samples at %u Hz)\n", (unsigned) sSampleCount, DC_SAMPLE_HZ);
 }
 #else
+static void sample_frame_end(int late) {
+    (void) late;
+}
 static void sampler_start(void) {
 }
 static void sampler_finish(void) {
@@ -154,6 +322,22 @@ static void sampler_finish(void) {
 
 void dc_prof_audio_add(unsigned int us) {
     sAudioUsTotal += us;
+}
+
+void dc_prof_asset_load(const char *name, unsigned int us, unsigned int bytes, int ok) {
+    sFrameAssetUs += us;
+    if (sAssetCount >= MAX_ASSETS) {
+        sAssetsDropped++;
+        return;
+    }
+    AssetRec *a = &sAssets[sAssetCount++];
+    a->frame = sFrameCount + sFramesDropped;   // the frame in progress, as in LateRec
+    a->us = us;
+    a->bytes = bytes;
+    a->scene = (gCurrDemoInput != NULL ? 0x8000 : 0) | ((gCurrLevelNum & 0x7F) << 8) | (gCurrAreaIndex & 0xFF);
+    a->ok = (uint8_t) (ok != 0);
+    strncpy(a->name, name, sizeof(a->name) - 1);
+    a->name[sizeof(a->name) - 1] = '\0';
 }
 
 static uint16_t clamp16(uint64_t v) {
@@ -178,6 +362,7 @@ static SceneStats *scene_stats(uint16_t scene) {
     SceneStats *s = &sScenes[sSceneCount++];
     memset(s, 0, sizeof(*s));
     s->scene = scene;
+    s->vram_min = 0xFFFFFFFFu;
     return s;
 }
 
@@ -220,32 +405,38 @@ static void write_csv(void) {
     printf("DCPROF wrote /pc/sm64_prof.csv (%u frames)\n", (unsigned) sFrameCount);
 }
 
+static void print_scene_id(const char *kind, uint16_t scene) {
+    printf("DCPROF %s level=%u area=%u demo=%u", kind, (unsigned) ((scene >> 8) & 0x7F),
+           (unsigned) (scene & 0xFF), (unsigned) (scene >> 15));
+}
+
 static void print_report(void) {
     uint32_t late = 0;
     for (int i = 0; i < sSceneCount; i++) {
         late += sScenes[i].late;
     }
-    printf("DCPROF RUN frames=%u late=%u vbl_wait=%d seconds=%u\n", (unsigned) (sFrameCount + sFramesDropped),
-           (unsigned) late, DC_VBL_WAIT, (unsigned) ((sFrameStart - sRunStart) / 1000000));
+    printf("DCPROF RUN frames=%u late=%u vbl_wait=%d seconds=%u fsaa=%d\n", (unsigned) (sFrameCount + sFramesDropped),
+           (unsigned) late, DC_VBL_WAIT, (unsigned) ((sFrameStart - sRunStart) / 1000000), DC_FSAA);
 
     // One line per scene: average and max of every component, in microseconds.
     for (int i = 0; i < sSceneCount; i++) {
         const SceneStats *s = &sScenes[i];
-        printf("DCPROF SCENE level=%u area=%u demo=%u frames=%u late=%u",
-               (unsigned) ((s->scene >> 8) & 0x7F), (unsigned) (s->scene & 0xFF),
-               (unsigned) (s->scene >> 15), (unsigned) s->frames, (unsigned) s->late);
+        print_scene_id("SCENE", s->scene);
+        printf(" frames=%u late=%u", (unsigned) s->frames, (unsigned) s->late);
         for (int c = 0; c < C_COUNT; c++) {
             printf(" %s=%u/%u", sCompNames[c], (unsigned) (s->sum[c] / (s->frames ? s->frames : 1)),
                    (unsigned) s->max[c]);
         }
-        printf("\n");
+        for (int c = 0; c < LATE_CAUSES; c++) {
+            printf(" late_%s=%u", sCauseNames[c], (unsigned) s->late_by[c]);
+        }
+        printf(" vram_free=%u\n", (unsigned) (s->vram_min == 0xFFFFFFFFu ? 0 : s->vram_min));
     }
 
     // Average per-frame event counts per scene.
     for (int i = 0; i < sSceneCount; i++) {
         const SceneStats *s = &sScenes[i];
-        printf("DCPROF COUNTS level=%u area=%u demo=%u", (unsigned) ((s->scene >> 8) & 0x7F),
-               (unsigned) (s->scene & 0xFF), (unsigned) (s->scene >> 15));
+        print_scene_id("COUNTS", s->scene);
         for (int c = 0; c < DCC_COUNT; c++) {
             printf(" %s=%u", sCountNames[c], (unsigned) (sSceneCounts[i][c] / (s->frames ? s->frames : 1)));
         }
@@ -254,6 +445,77 @@ static void print_report(void) {
             printf(" %s=%u", sPmuNames[c], (unsigned) (n ? sScenePmu[i][c] / n : 0));
         }
         printf("\n");
+    }
+    // Totals of the 60 fps frame skips (per-frame averages round them to 0): held = identical
+    // second draws not drawn, dropped = exact frames dropped after a late one (DC_FRAME_MODE_60_DROP).
+    for (int i = 0; i < sSceneCount; i++) {
+        print_scene_id("STEPS", sScenes[i].scene);
+        printf(" frames=%u held=%u dropped=%u\n", (unsigned) sScenes[i].frames,
+               (unsigned) sSceneCounts[i][DCC_HELD], (unsigned) sSceneCounts[i][DCC_DROPPED]);
+    }
+
+#ifdef DC_PROF_LISTS
+    // The largest PT/TR fill sources per scene, per-frame averages, largest first.
+    for (int i = 0; i < sSceneCount; i++) {
+        const SceneStats *s = &sScenes[i];
+        uint32_t frames = s->frames ? s->frames : 1;
+        uint8_t done[LIST_SRC_SCENE] = { 0 };
+        for (int n = 0; n < 12; n++) {
+            int best = -1;
+            for (int j = 0; j < LIST_SRC_SCENE; j++) {
+                if (!done[j] && sSceneSrc[i][j].tris && (best < 0 || sSceneSrc[i][j].px > sSceneSrc[i][best].px)) {
+                    best = j;
+                }
+            }
+            if (best < 0) {
+                break;
+            }
+            done[best] = 1;
+            const ListSrc *e = &sSceneSrc[i][best];
+            print_scene_id("LISTSRC", s->scene);
+            printf(" list=%s src=0x%08x px=%u tris=%u\n", e->kind == 2 ? "TR" : "PT", (unsigned) e->src,
+                   (unsigned) (e->px / frames), (unsigned) (e->tris / frames));
+        }
+    }
+#endif
+
+#if defined(DC_PROF_SKIP) && DC_PROF_SKIP == 999
+    // PVR render time per scene by what was left out of the frame.
+    for (int i = 0; i < sSceneCount; i++) {
+        for (int k = 0; k < SKIP_CODES; k++) {
+            const SkipStats *ss = &sSceneSkip[i][k];
+            if (!ss->frames) {
+                continue;
+            }
+            print_scene_id("SKIP", sScenes[i].scene);
+            printf(" code=%u frames=%u render=%u/%u over=%u\n", (unsigned) sSkipCodes[k], (unsigned) ss->frames,
+                   (unsigned) (ss->sum / ss->frames), (unsigned) ss->max, (unsigned) ss->over);
+        }
+    }
+#endif
+
+    // Every late frame: where it was, how many fields it took and what it cost.
+    for (uint32_t i = 0; i < sLateCount; i++) {
+        const LateRec *r = &sLate[i];
+        print_scene_id("LATE", r->scene);
+        printf(" frame=%u vbl=%u since=%u fields=%u cause=%s logic=%u geo=%u dl=%u wait=%u render=%u audio=%u asset=%u\n",
+               (unsigned) r->frame, (unsigned) r->vbl, (unsigned) r->since_scene, (unsigned) r->fields,
+               sCauseNames[r->cause], (unsigned) r->logic, (unsigned) r->geo, (unsigned) r->dl, (unsigned) r->wait,
+               (unsigned) r->render, (unsigned) r->audio, (unsigned) r->asset);
+    }
+    if (sLateDropped) {
+        printf("DCPROF LATE_DROPPED %u\n", (unsigned) sLateDropped);
+    }
+
+    // Every asset read on the main thread, in order.
+    for (uint32_t i = 0; i < sAssetCount; i++) {
+        const AssetRec *a = &sAssets[i];
+        print_scene_id("ASSET", a->scene);
+        printf(" frame=%u us=%u bytes=%u ok=%u name=%s\n", (unsigned) a->frame, (unsigned) a->us,
+               (unsigned) a->bytes, (unsigned) a->ok, a->name);
+    }
+    if (sAssetsDropped) {
+        printf("DCPROF ASSET_DROPPED %u\n", (unsigned) sAssetsDropped);
     }
 
     // The worst frames by total time, with their breakdown.
@@ -386,7 +648,20 @@ void dc_prof_frame_end(void) {
         r->us[C_AUDIO] = clamp16(audio - sAudioUsSeen);
         r->us[C_RENDER] = clamp16(st.rnd_last_time / 1000);
 
+        if (r->scene != sPrevScene) {
+            sPrevScene = r->scene;
+            sSinceScene = 0;
+        }
+        int is_late = r->fields > DC_VBL_WAIT;
+        sample_frame_end(is_late);
+
         SceneStats *s = scene_stats(r->scene);
+#ifdef DC_PROF_LISTS
+        if (s != NULL) {
+            list_src_merge((int) (s - sScenes));
+        }
+        sFrameSrcCount = 0;
+#endif
         if (s != NULL) {
             for (int c = 0; c < DCC_COUNT; c++) {
                 sSceneCounts[s - sScenes][c] += gDcProfCount[c];
@@ -396,8 +671,37 @@ void dc_prof_frame_end(void) {
                 sScenePmuFrames[s - sScenes][sPmuFrame % PMU_COUNT]++;
             }
             s->frames++;
-            if (r->fields > DC_VBL_WAIT) {
+            if (is_late) {
+                uint32_t cpu = (uint32_t) r->us[C_LOGIC] + r->us[C_GEO] + r->us[C_DL] + r->us[C_FINISH];
+                int load = r->us[C_LOGIC] >= LOAD_LOGIC_US || r->us[C_DL] >= LOAD_DL_US ||
+                           sSinceScene < LOAD_SCENE_FRAMES || sFrameAssetUs != 0;
+                int cpu_bound = cpu >= LATE_BUDGET_US;
+                int pvr_bound = r->us[C_WAIT] >= 500 || r->us[C_RENDER] >= LATE_BUDGET_US;
+                uint8_t cause = load ? LATE_LOAD
+                              : cpu_bound && pvr_bound ? LATE_BOTH
+                              : cpu_bound ? LATE_CPU
+                              : pvr_bound ? LATE_PVR
+                              : LATE_OTHER;
                 s->late++;
+                s->late_by[cause]++;
+                if (sLateCount < MAX_LATE) {
+                    LateRec *l = &sLate[sLateCount++];
+                    l->frame = sFrameCount + sFramesDropped;
+                    l->vbl = (uint32_t) vbl;
+                    l->scene = r->scene;
+                    l->since_scene = (uint16_t) (sSinceScene > 0xFFFF ? 0xFFFF : sSinceScene);
+                    l->fields = r->fields;
+                    l->cause = cause;
+                    l->logic = r->us[C_LOGIC];
+                    l->geo = r->us[C_GEO];
+                    l->dl = r->us[C_DL];
+                    l->wait = r->us[C_WAIT];
+                    l->render = r->us[C_RENDER];
+                    l->audio = r->us[C_AUDIO];
+                    l->asset = clamp16(sFrameAssetUs);
+                } else {
+                    sLateDropped++;
+                }
             }
             for (int c = 0; c < C_COUNT; c++) {
                 s->sum[c] += r->us[c];
@@ -405,6 +709,26 @@ void dc_prof_frame_end(void) {
                     s->max[c] = r->us[c];
                 }
             }
+            // Free texture VRAM, sampled now and then (the allocator walk is not free).
+            if ((s->frames & 31) == 1) {
+                uint32_t avail = (uint32_t) pvr_mem_available();
+                if (avail < s->vram_min) {
+                    s->vram_min = avail;
+                }
+            }
+#if defined(DC_PROF_SKIP) && DC_PROF_SKIP == 999
+            if (sSkipFrame % SKIP_BLOCK >= SKIP_SETTLE) {
+                SkipStats *ss = &sSceneSkip[s - sScenes][(sSkipFrame / SKIP_BLOCK) % SKIP_CODES];
+                ss->sum += r->us[C_RENDER];
+                ss->frames++;
+                if (r->us[C_RENDER] > ss->max) {
+                    ss->max = r->us[C_RENDER];
+                }
+                if (r->us[C_RENDER] > FIELD_US) {
+                    ss->over++;
+                }
+            }
+#endif
         }
         if (sFrameCount < MAX_FRAMES) {
             sFrameCount++;
@@ -413,12 +737,19 @@ void dc_prof_frame_end(void) {
         }
     }
 
+#if defined(DC_PROF_SKIP) && DC_PROF_SKIP == 999
+    sSkipFrame++;
+    gDcProfSkip = sSkipCodes[(sSkipFrame / SKIP_BLOCK) % SKIP_CODES];
+#endif
+
+    sSinceScene++;
     memset(gDcProfCount, 0, sizeof(gDcProfCount));
     if (sPmuValid) {
         sPmuValid = 0;
         sPmuFrame++;
     }
     sAudioUsSeen = audio;
+    sFrameAssetUs = 0;
     sLastVbl = vbl;
     sFrameStart = end;
     sProgress++;

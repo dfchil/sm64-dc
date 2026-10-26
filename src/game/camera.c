@@ -3007,6 +3007,18 @@ void update_lakitu(struct Camera *c) {
         vec3f_copy(sModeTransition.marioPos, sMarioCamState->pos);
     }
     clamp_pitch(gLakituState.pos, gLakituState.focus, 0x3E00, -0x3E00);
+#ifdef DC_PROF_BENCH
+    if (gCurrDemoInput != NULL) {   // the benchmark tour's orbit (game_init.c)
+        extern s16 gDcBenchYaw;
+        extern f32 gDcBenchZoom;
+        f32 dx = gLakituState.pos[0] - gLakituState.focus[0];
+        f32 dz = gLakituState.pos[2] - gLakituState.focus[2];
+        f32 sn = sins(gDcBenchYaw), cs = coss(gDcBenchYaw);
+        gLakituState.pos[0] = gLakituState.focus[0] + (dx * cs + dz * sn) * gDcBenchZoom;
+        gLakituState.pos[1] = gLakituState.focus[1] + (gLakituState.pos[1] - gLakituState.focus[1]) * gDcBenchZoom;
+        gLakituState.pos[2] = gLakituState.focus[2] + (dz * cs - dx * sn) * gDcBenchZoom;
+    }
+#endif
     gLakituState.mode = c->mode;
     gLakituState.defMode = c->defMode;
 }
