@@ -1,0 +1,6 @@
+[submodule "third_party/aicaflow"]
+	path = third_party/aicaflow
+	url = https://github.com/dfchil/AICAflow.git
+[submodule "third_party/endjinn"]
+	path = third_party/endjinn
+	url = https://github.com/dfchil/enDjinn.git

@@ -28,6 +28,9 @@
 #include "level_table.h"
 #include "course_table.h"
 #include "thread6.h"
+#ifdef DC_AICAFLOW
+#include "pc/audio/sm64_aicaflow.h"
+#endif
 
 #define PLAY_MODE_NORMAL 0
 #define PLAY_MODE_PAUSED 2
@@ -418,6 +421,12 @@ void init_mario_after_warp(void) {
             break;
     }
 
+#ifdef DC_PROF_TOUR_MUSIC
+    // Profile tour with music: the demos play their level's music, as the game would when played.
+    if (gCurrDemoInput != NULL) {
+        set_background_music(gCurrentArea->musicParam, gCurrentArea->musicParam2, 0);
+    }
+#endif
     if (gCurrDemoInput == NULL) {
         set_background_music(gCurrentArea->musicParam, gCurrentArea->musicParam2, 0);
 
@@ -1153,6 +1162,10 @@ nuke_everything();
     }
 
     sTimerRunning = 0;
+
+#ifdef DC_AICAFLOW
+    sm64_afx_scene_prepare(gCurrLevelNum);
+#endif
 
     if (sWarpDest.type != WARP_TYPE_NOT_WARPING) {
         if (sWarpDest.nodeId >= WARP_NODE_CREDITS_MIN) {
