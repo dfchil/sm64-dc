@@ -25,6 +25,7 @@
 #include "macros.h"
 #include "gl_fast_vert.h"   // dc_fast_t (the front-end's per-vertex emit struct)
 #include "pc/dc_prof.h"
+#include "sh4zam_port.h"
 
 extern int cur_frame_persp;
 extern int prev_frame_had_persp;
@@ -36,6 +37,55 @@ extern int has_done_3d;
 // than corrupting the SQ at runtime.
 _Static_assert(sizeof(dc_fast_t) == sizeof(pvr_vertex_t), "dc_fast_t must match pvr_vertex_t layout");
 _Static_assert(sizeof(pvr_poly_hdr_t) == 32, "pvr_poly_hdr_t must be one 32-byte SQ slot");
+
+// DC_FSAA=1: the PVR renders twice as wide and the scaler filters down on output, so every x the
+// front-end bakes is in a (DC_FB_W << 1)-wide space (gfx_retro_dc.c DC_FSAA_X).
+#ifndef DC_FSAA
+#define DC_FSAA 0
+#endif
+#if LOWRES
+#define DC_RENDER_W_1X 320
+#else
+#define DC_RENDER_W_1X 640
+#endif
+// Current render width (DC_FB_W << the current FSAA mode): FSAA can be switched off per course.
+#if DC_FSAA
+static int sRenderW = DC_RENDER_W_1X << DC_FSAA;
+#define DC_RENDER_W sRenderW
+#else
+#define DC_RENDER_W DC_RENDER_W_1X
+#endif
+// DC_FSAA builds draw these courses without FSAA (comma-separated level numbers): their water
+// and lava fill the TR list over much of the screen, which FSAA makes twice as expensive.
+#include "pc/dc_video_options.h"
+#include "pc/dc_overlay.h"
+#ifndef DC_FSAA_OFF_LEVELS
+// From the benchmark tour (make DC_PROF_BENCH=1, FSAA on, 60 fps strict, 2026-10-26): the levels
+// under 98% on time. TTC 87-89%, DDD 93%, Bowser 1 94%, JRB 96%, WDW 96%, WF 97-98%; every other
+// level 98% or better (LLL 100% since its lava is opaque).
+#define DC_FSAA_OFF_LEVELS 14, 23, 30, 12, 11, 24   /* TTC, DDD, BOWSER_1, JRB, WDW, WF */
+#endif
+static void pvr_post_init(void);
+#if DC_FSAA
+static void gfx_pvr_request_fsaa_for_level(int level);
+extern s16 gCurrLevelNum;
+#endif
+
+// DC_PROF_SKIP (profile builds): leave one part of the frame out of the PVR lists, so its PVR
+// cost can be read by subtraction. The CPU still translates everything; only submission stops.
+//   1 the PT list          2 the TR list            3 every 2D quad (all lists)
+//   4 the 2D TR quads      5 the 3D TR batches      6 the far-pinned (depth-off) OP geometry: the sky
+//   7 all 3D OP geometry   8 full-screen 2D TR quads (fades, covers)   9 the 2D OP quads
+//  10 the blob shadows (TR/PT batches between the DC_GFX_SHADOW tags of bin/segment2.c)
+// gDcProfSkip holds this frame's code (dc_prof.c cycles it under DC_PROF_SKIP=999).
+#ifdef DC_PROF_SKIP
+extern int gDcProfSkip;
+enum { SKIP_PT = 1, SKIP_TR, SKIP_2D, SKIP_2D_TR, SKIP_3D_TR, SKIP_SKY, SKIP_3D_OP, SKIP_FULL_2D_TR, SKIP_2D_OP,
+       SKIP_SHADOW };
+#define PROF_SKIP(code) (gDcProfSkip == (code))
+#else
+#define PROF_SKIP(code) 0
+#endif
 
 // ---------------------------------------------------------------------------
 // Shader bookkeeping — The front-end treats ShaderProgram opaquely
@@ -102,6 +152,7 @@ struct PvrTex {
     float     u_scale, v_scale; // real/padded, consumed by gfx_pvr_get_*_scale
 #ifdef DC_PROF_LISTS
     uint8_t   opaque;      // every texel's alpha is 1
+    uint32_t  src;         // the N64 texture address it was imported from (gfx_pvr_prof_tex_src)
 #endif
 };
 static struct PvrTex sTextures[PVR_TEX_MAX];
@@ -137,11 +188,16 @@ static uint32_t sCurBound = 0;   // last select_texture id == upload target
 typedef struct {
     pvr_poly_hdr_t __attribute__((aligned(32))) hdr;
     uint32_t start, count;
+#ifdef DC_PROF_SKIP
+    uint8_t is_2d;   // a batch of 2D quads (never shares a batch with 3D under DC_PROF_SKIP)
+    uint8_t is_shadow;   // a batch of blob-shadow triangles (gfx_pvr_prof_shadow)
+#endif
 #ifdef DC_PROF_LISTS
     // Where the batch's alpha comes from, for prof_count_bucket.
     uint8_t alpha_vtx;   // the vertex alpha reaches the pixel
     uint8_t alpha_tex;   // the texel alpha reaches the pixel, and the texture has alpha < 1
     uint8_t blend_src;   // alpha 1 gives the source colour (SRCALPHA/INVSRCALPHA or ONE/ZERO)
+    uint32_t src;        // the bound texture's N64 address, 0 untextured (dc_prof_list_src)
 #endif
 } PvrBatch;
 typedef struct {
@@ -179,6 +235,18 @@ static int sDropV = 0, sDropB = 0;
 // A depth/texture/shader state change affects the live OP header and the next PT and TR
 // batches. (gfx_pvr_set_blend only routes OP/PT/TR, so it does NOT dirty headers.)
 static void pvr_mark_dirty(void) { sOpDirty = 1; sTR.dirty = 1; sPunch.dirty = 1; }
+#ifdef DC_PROF_SKIP
+// Set by the front-end between the DC_GFX_SHADOW tags; a change starts new PT/TR batches so the
+// shadows never share one with other geometry.
+static uint8_t sProfShadow = 0;
+void gfx_pvr_prof_shadow(int on) {
+    if (sProfShadow != (uint8_t) !!on) {
+        sProfShadow = (uint8_t) !!on;
+        sTR.dirty = 1;
+        sPunch.dirty = 1;
+    }
+}
+#endif
 // Compile one of the SIX base headers ONCE via the official pvr_poly_cxt+pvr_poly_compile, so
 // every PER-LIST field (list_type/alpha/txralpha/blend defaults) is correct for this list. The
 // textured bases seed from whatever texture is bound on first use; their texture-specific fields
@@ -256,8 +324,14 @@ static void prof_batch_alpha(PvrBatch *bt, int kind) {
     bt->blend_src = kind != PVR_KIND_TR ||
                     (sBlendSrc == PVR_BLEND_SRCALPHA && sBlendDst == PVR_BLEND_INVSRCALPHA) ||
                     (sBlendSrc == PVR_BLEND_ONE && sBlendDst == PVR_BLEND_ZERO);
+    bt->src = textured ? sTextures[sBoundTex].src : 0;
 }
 #define PROF_BATCH_ALPHA(bt, kind) prof_batch_alpha(bt, kind)
+
+// The front-end names the N64 address of the texture it is about to upload (import_texture).
+void gfx_pvr_prof_tex_src(uint32_t addr) {
+    sTextures[sCurBound].src = addr;
+}
 #else
 #define PROF_BATCH_ALPHA(bt, kind) ((void) 0)
 #endif
@@ -265,11 +339,18 @@ static void prof_batch_alpha(PvrBatch *bt, int kind) {
 // Append n vertices (n/3 tris) of already-screen-baked dc_fast_t to a bucket,
 // starting a new batch when the bucket's header state has changed.
 static void pvr_append(PvrBucket *b, int kind, const dc_fast_t *tris, size_t n) {
+#ifdef DC_PROF_SKIP
+    if (b->cur >= 0 && b->batch[b->cur].is_2d) b->dirty = 1;
+#endif
     if (b->dirty || b->cur < 0) {
         if (b->nbatch >= b->max_batch) { if (sDropB++ < 8) printf("PVR_DROP batch %d\n", kind); return; }
         b->cur = b->nbatch++;
         pvr_compile_header(&b->batch[b->cur].hdr, kind);
         PROF_BATCH_ALPHA(&b->batch[b->cur], kind);
+#ifdef DC_PROF_SKIP
+        b->batch[b->cur].is_2d = 0;
+        b->batch[b->cur].is_shadow = sProfShadow;
+#endif
         b->batch[b->cur].start = b->nverts;
         b->batch[b->cur].count = 0;
         b->dirty = 0;
@@ -290,11 +371,18 @@ static void pvr_append(PvrBucket *b, int kind, const dc_fast_t *tris, size_t n) 
 // like pvr_append. Vertex flags are stamped at flush time (pvr_flush_bucket). NULL on overflow.
 dc_fast_t *pvr_reserve(int kind, size_t n) {
     PvrBucket *b = (kind == PVR_KIND_TR) ? &sTR : &sPunch;
+#ifdef DC_PROF_SKIP
+    if (b->cur >= 0 && b->batch[b->cur].is_2d) b->dirty = 1;
+#endif
     if (b->dirty || b->cur < 0) {
         if (b->nbatch >= b->max_batch) { if (sDropB++ < 8) printf("PVR_DROP batch %d\n", kind); return NULL; }
         b->cur = b->nbatch++;
         pvr_compile_header(&b->batch[b->cur].hdr, kind);
         PROF_BATCH_ALPHA(&b->batch[b->cur], kind);
+#ifdef DC_PROF_SKIP
+        b->batch[b->cur].is_2d = 0;
+        b->batch[b->cur].is_shadow = sProfShadow;
+#endif
         b->batch[b->cur].start = b->nverts;
         b->batch[b->cur].count = 0;
         b->dirty = 0;
@@ -329,6 +417,11 @@ static void pvr_flush_bucket(PvrBucket *b) {
     for (int i = 0; i < b->nbatch; i++) {
         PvrBatch *bt = &b->batch[i];
         if (!bt->count) continue;
+#ifdef DC_PROF_SKIP
+        if (bt->is_2d ? (PROF_SKIP(SKIP_2D) || (b == &sTR && PROF_SKIP(SKIP_2D_TR)))
+                      : (b == &sTR && PROF_SKIP(SKIP_3D_TR))) continue;
+        if (bt->is_shadow && PROF_SKIP(SKIP_SHADOW)) continue;
+#endif
         pvr_poly_hdr_t *hp = (pvr_poly_hdr_t *) sq_next(&addr);
         *hp = bt->hdr;
         sq_send((pvr_vertex_t *) hp);
@@ -359,13 +452,13 @@ static void pvr_pad16(const uint16_t *in, int iw, int ih, uint16_t *out, int ow,
 
     for (y = 0; y < ih; y++) {
         uint16_t *o = out + (y * ow);
-        memcpy(o, in + (y * iw), iw * 2);
+        shz_memcpy(o, in + (y * iw), iw * 2);
         uint16_t edge = (iw > 0) ? in[(y * iw) + iw - 1] : 0;
         for (int x = iw; x < ow; x++) o[x] = edge;
     }
     if (ih > 0) {
         const uint16_t *last = out + ((ih - 1) * ow);
-        for (; y < oh; y++) memcpy(out + (y * ow), last, ow * 2);
+        for (; y < oh; y++) shz_memcpy(out + (y * ow), last, ow * 2);
     }
 }
 
@@ -385,12 +478,16 @@ static void pvr_pad16(const uint16_t *in, int iw, int ih, uint16_t *out, int ow,
 // real alpha-BLEND surfaces go to the deferred TR bucket. At end_frame PT is flushed first
 // (writes depth, alpha-tested opaque), then TR composites over it. All three lists' bins
 // are live -> {OP, OP_MOD, TR, TR_MOD, PT}.
+#ifndef DC_PT_CHUNK
+#define DC_PT_CHUNK 64
+#endif
+_Static_assert(DC_PT_CHUNK >= 32 && DC_PT_CHUNK <= 512, "ISP_FEED_CFG punch-through chunk, vertices");
 static pvr_init_params_t sPvrParams = {
     { PVR_BINSIZE_32, PVR_BINSIZE_0, PVR_BINSIZE_32, PVR_BINSIZE_0, PVR_BINSIZE_32 },
     512 * 1024,
     1,  // dma
-    0,  // fsaa
-    0,  // autosort_disabled (0 = autosort on; needed for TR in P3)
+    DC_FSAA,  // fsaa: horizontal supersampling (DC_RENDER_W wide)
+    0,  // autosort_disabled (0 = autosort; presort measured no faster with FSAA, 2026-10-24)
     2,  // overflow buffers
     0,  // vbuf_doublebuf_disabled (0 = double-buffering on)
 };
@@ -578,6 +675,9 @@ extern void reset_texcache(void);
 void nuke_everything(void) {
     gfx_pvr_clear_all_textures();
     reset_texcache();
+#if DC_FSAA
+    gfx_pvr_request_fsaa_for_level(gCurrLevelNum);
+#endif
 }
 
 
@@ -663,7 +763,7 @@ static float prof_tri_px(const pvr_vertex_t *a, const pvr_vertex_t *b, const pvr
 
     for (int edge = 0; edge < 4 && n > 0; edge++) {
         int axis = edge & 1;
-        float bound = (edge < 2) ? 0.0f : (axis ? (float) DC_FB_H : (float) DC_FB_W);
+        float bound = (edge < 2) ? 0.0f : (axis ? (float) DC_FB_H : (float) DC_RENDER_W);
         float dir = (edge < 2) ? 1.0f : -1.0f;   // inside: dir * (p - bound) >= 0
         int m = 0;
 
@@ -705,7 +805,7 @@ static void prof_count_bucket(const PvrBucket *b, int kind) {
     for (int i = 0; i < b->nbatch; i++) {
         const PvrBatch *bt = &b->batch[i];
         const pvr_vertex_t *v = &b->verts[bt->start];
-        uint32_t strip = 0;
+        uint32_t strip = 0, batch_px = 0, batch_tris = 0;
 
         for (uint32_t k = 0; k < bt->count; k++) {
             if (++strip >= 3) {
@@ -716,6 +816,8 @@ static void prof_count_bucket(const PvrBucket *b, int kind) {
 
                 DC_PROF_COUNT(kind == PVR_KIND_TR ? DCC_TR_TRIS : DCC_PT_TRIS, 1);
                 DC_PROF_COUNT(kind == PVR_KIND_TR ? DCC_TR_PX : DCC_PT_PX, px);
+                batch_px += px;
+                batch_tris++;
                 if (opaque && kind == PVR_KIND_TR) {
                     DC_PROF_COUNT(DCC_TR_OPQ_TRIS, 1);
                     DC_PROF_COUNT(DCC_TR_OPQ_PX, px);
@@ -726,6 +828,9 @@ static void prof_count_bucket(const PvrBucket *b, int kind) {
             if (v[k].flags == PVR_CMD_VERTEX_EOL) {
                 strip = 0;
             }
+        }
+        if (batch_tris) {
+            dc_prof_list_src(kind, bt->src, batch_px, batch_tris);
         }
     }
 }
@@ -750,6 +855,7 @@ static inline void pvr_emit_op_header(void) {
 // same-state run streams headerless after the first. External — no wrapper needed. (oargb carried
 // through dc_fast_t.pad0 — do NOT zero it here.)
 void pvr_submit_op(const dc_fast_t *tris, size_t n) {
+    if (PROF_SKIP(SKIP_3D_OP) || (PROF_SKIP(SKIP_SKY) && n && tris[0].vert.z < 0.0001f)) return;
     pvr_emit_op_header();
     for (size_t i = 0; i < n; i++) {
         pvr_vertex_t *v = (pvr_vertex_t *) pvr_dr_target(sDrState);
@@ -767,6 +873,7 @@ void pvr_submit_op(const dc_fast_t *tris, size_t n) {
 // One triangle from three separately stored vertices (the front-end's baked-vertex cache).
 __attribute__((section(".sub0.sm64_hot"))) void pvr_submit_op_tri(const dc_fast_t *a, const dc_fast_t *b,
                                                                    const dc_fast_t *c) {
+    if (PROF_SKIP(SKIP_3D_OP) || (PROF_SKIP(SKIP_SKY) && a->vert.z < 0.0001f)) return;
     pvr_emit_op_header();
     uint32_t addr = pvr_dr_addr;
     pvr_vertex_t *v;
@@ -790,6 +897,34 @@ __attribute__((section(".sub0.sm64_hot"))) void pvr_submit_op_tri(const dc_fast_
 // GLdc's start_frame reset it each frame; the PVR backend must too, or it grows
 // unbounded. Positive base because PVR z is inverse-depth (negative would clip).
 extern float screen_2d_z;
+extern float gfx_frame_invw_max;
+
+// A transition cover starts (gfx_dc_tags.h, gfx_retro_dc.c gfx_dc_tag). Its OP polys write depth
+// above world_z_max, the frame's largest world 1/w, so the scene's PT and TR fail the depth test
+// under it and cost no fill. 2D drawn before the cover in PT/TR (the HUD) would land on top of it:
+// those lists composite after OP, with the depth test off. As on the N64 the cover must hide it
+// and the transition's hole must show it, so lift that 2D (the z >= 1.0 overlay band; far-pinned
+// backdrops stay) above the world and below the cover, and depth-test it. 2D drawn after the
+// cover continues above it through screen_2d_z.
+void gfx_pvr_cover_begin(float world_z_max) {
+    PvrBucket *buckets[2] = { &sPunch, &sTR };
+    for (int k = 0; k < 2; k++) {
+        PvrBucket *b = buckets[k];
+        for (int i = 0; i < b->nbatch; i++) {
+            PvrBatch *bt = &b->batch[i];
+            pvr_vertex_t *v = &b->verts[bt->start];
+            uint32_t n = bt->count, j;
+            if (bt->hdr.m1.depth_cmp != PVR_DEPTHCMP_ALWAYS || !n) continue;
+            for (j = 0; j < n && v[j].z >= 1.0f; j++) {}
+            if (j < n) continue;   // not all in the overlay band: leave the batch as it is
+            for (j = 0; j < n; j++) v[j].z += world_z_max;
+            bt->hdr.m1.depth_cmp = PVR_DEPTHCMP_GEQUAL;
+        }
+        b->dirty = 1;   // later 2D starts a batch with its own (test-off) header
+    }
+    screen_2d_z += world_z_max + 1.0f;
+}
+
 static void gfx_pvr_draw_triangles(float buf_vbo[], UNUSED size_t buf_vbo_len,
                                    size_t buf_vbo_num_tris) {
     // STAGE 3a: front-end now bakes screen-space dc_fast_t (gfx_sp_tri1 PVR path). dc_fast_t
@@ -811,8 +946,17 @@ static void gfx_pvr_draw_triangles(float buf_vbo[], UNUSED size_t buf_vbo_len,
 // gfx_pvr_set_blend: opaque HUD -> live OP; alpha-test glyphs -> PT; real alpha-blend -> TR.
 static void gfx_pvr_draw_quad_2d(void *quad, UNUSED size_t buf_vbo_len, UNUSED size_t buf_vbo_num_tris) {
     const dc_fast_t *q = (const dc_fast_t *) quad;
+#ifdef DC_PROF_SKIP
+    if (PROF_SKIP(SKIP_2D)) return;
+    if (sListKind == PVR_KIND_TR && PROF_SKIP(SKIP_FULL_2D_TR)) {
+        // Full-screen: the quad (strip order ul, ll, ur, lr) spans at least 90% of each axis.
+        float w = q[3].vert.x - q[0].vert.x, h = q[3].vert.y - q[0].vert.y;
+        if (w >= 0.9f * DC_RENDER_W && h >= 0.9f * DC_FB_H) return;
+    }
+#endif
 
     if (sListKind == PVR_KIND_OP) {
+        if (PROF_SKIP(SKIP_2D_OP)) return;
         pvr_emit_op_header();
         for (int i = 0; i < 4; i++) {
             pvr_vertex_t *o = (pvr_vertex_t *) pvr_dr_target(sDrState);
@@ -827,11 +971,18 @@ static void gfx_pvr_draw_quad_2d(void *quad, UNUSED size_t buf_vbo_len, UNUSED s
 
     PvrBucket *b = (sListKind == PVR_KIND_TR) ? &sTR : &sPunch;
     int kind     = (sListKind == PVR_KIND_TR) ? PVR_KIND_TR : PVR_KIND_PT;
+#ifdef DC_PROF_SKIP
+    if (b->cur >= 0 && !b->batch[b->cur].is_2d) b->dirty = 1;
+#endif
     if (b->dirty || b->cur < 0) {
         if (b->nbatch >= b->max_batch) { if (sDropB++ < 8) printf("PVR_DROP batch %d\n", kind); return; }
         b->cur = b->nbatch++;
         pvr_compile_header(&b->batch[b->cur].hdr, kind);
         PROF_BATCH_ALPHA(&b->batch[b->cur], kind);
+#ifdef DC_PROF_SKIP
+        b->batch[b->cur].is_2d = 1;
+        b->batch[b->cur].is_shadow = 0;
+#endif
         b->batch[b->cur].start = b->nverts;
         b->batch[b->cur].count = 0;
         b->dirty = 0;
@@ -858,6 +1009,17 @@ static void gfx_pvr_init(void) {
 #endif
 #endif
     pvr_init(&sPvrParams);
+    pvr_post_init();
+}
+
+// Everything set after pvr_init, again after a restart (gfx_pvr_switch_fsaa).
+static void pvr_post_init(void) {
+#if DC_PT_CHUNK != 64
+    // Punch-through chunk of the tile renderer: ISP_FEED_CFG (PVR register 0x098) bits 13..4, in
+    // vertices. Per tile the ISP takes PT polygons this many vertices at a time and repeats its
+    // passes per chunk. pvr_init writes 0x00800408 (chunk 64); only the chunk field changes.
+    PVR_SET(PVR_UNK_0098, 0x00800008u | ((unsigned) DC_PT_CHUNK << 4));
+#endif
 #if defined(__DREAMCAST__) && LOWRES
     PVR_SET(PVR_SCALER_CFG, 0x400);   // 240p: disable the vertical flicker/scanline filter
 #endif
@@ -878,6 +1040,53 @@ static void gfx_pvr_init(void) {
     // Headers are compiled lazily per depth/texture/list state at draw time.
 }
 
+#if DC_FSAA
+static int sFsaaWant = DC_FSAA;
+
+// nuke_everything (a course load, inside a frame whose scene is open): choose the new course's
+// mode; gfx_pvr_start_frame switches before the next scene begins.
+// The player's choice (dc_video_options.h): off, on, or on except the courses whose fill does not
+// fit 60 fps with it.
+int gDcFsaaMode = DC_FSAA_MODE;
+
+static void gfx_pvr_request_fsaa_for_level(int level) {
+    static const s16 kOff[] = { DC_FSAA_OFF_LEVELS };
+    sFsaaWant = gDcFsaaMode != DC_FSAA_MODE_OFF;
+    if (gDcFsaaMode != DC_FSAA_MODE_CURATED) return;
+    for (unsigned i = 0; i < sizeof(kOff) / sizeof(kOff[0]); i++) {
+        if (kOff[i] == level) sFsaaWant = 0;
+    }
+}
+
+extern void reset_texcache(void);
+extern void gfx_dc_set_fsaa_x(int fsaa);
+
+// Restart the PVR in the wanted FSAA mode (the DKR/enDjinn recipe). pvr_shutdown resets the VRAM
+// allocator, so every texture pointer is forgotten, never freed, and the front-end cache is wiped:
+// the course's textures upload again on first use, in the new mode.
+static void gfx_pvr_switch_fsaa(void) {
+    pvr_wait_ready();
+    pvr_shutdown();
+    sPvrParams.fsaa_enabled = sFsaaWant;
+    pvr_init(&sPvrParams);
+    pvr_post_init();
+#if DC_OVERLAY
+    dc_overlay_pvr_reset();
+#endif
+    for (uint32_t i = 0; i < PVR_TEX_MAX; i++) {
+        sTextures[i].addr = NULL;
+        sTextures[i].alloc_size = 0;
+    }
+    sTexCount = 0;
+    sBoundTex = 0;
+    sCurBound = 0;
+    reset_texcache();
+    sRenderW = DC_RENDER_W_1X << sFsaaWant;
+    gfx_dc_set_fsaa_x(sFsaaWant);
+    pvr_mark_dirty();
+}
+#endif
+
 static void gfx_pvr_on_resize(void) { }
 
 // The N64 scene clear color, an RGBA5551 value (low 16 bits) stashed by the game's
@@ -895,6 +1104,11 @@ static inline void sm_rgba5551_to_rgbf(uint16_t c, float *r, float *g, float *b)
 
 static void gfx_pvr_start_frame(void) {
     float cr, cg, cb;
+#if DC_FSAA
+    if (sFsaaWant != sPvrParams.fsaa_enabled) {
+        gfx_pvr_switch_fsaa();
+    }
+#endif
     DC_PROF_MARK(DCP_WAIT_BEGIN);
     pvr_wait_ready();
     DC_PROF_MARK(DCP_WAIT_END);
@@ -937,6 +1151,7 @@ static void gfx_pvr_start_frame(void) {
     // (menu glyph text). Prev-frame value avoids draw-order races within the frame.
     prev_frame_had_persp = cur_frame_persp;
     cur_frame_persp = 0;
+    gfx_frame_invw_max = 0.0f;   // the frame's world 1/w bound (transition covers)
     has_done_3d = 0;   // reset: no 3D drawn yet this frame (title bg -> far until flag)
 }
 
@@ -949,19 +1164,28 @@ static void gfx_pvr_end_frame(void) {
 
     // Flush the deferred buckets, each into its own list opened once. PT FIRST: alpha-test
     // cutouts are opaque pixels that write depth, so they must be down before TR composites.
-    if (sPunch.nbatch > 0) {
+    if (sPunch.nbatch > 0 && !PROF_SKIP(SKIP_PT)) {
         pvr_list_begin(PVR_LIST_PT_POLY);
         pvr_dr_init(&sDrState);
         pvr_flush_bucket(&sPunch);
         pvr_list_finish();
     }
     // TR SECOND: real alpha-blend surfaces, autosorted, composited over OP + PT (depth-tested).
-    if (sTR.nbatch > 0) {
+    const int tr = sTR.nbatch > 0 && !PROF_SKIP(SKIP_TR);
+    if (tr || DC_OVERLAY) {
         pvr_list_begin(PVR_LIST_TR_POLY);
         pvr_dr_init(&sDrState);
-        pvr_flush_bucket(&sTR);
+        if (tr) pvr_flush_bucket(&sTR);
+#if DC_OVERLAY
+        dc_overlay_draw();   // last, over everything
+#endif
         pvr_list_finish();
     }
+}
+
+// The x scale of the PVR's current mode: 2 with FSAA (twice as wide), else 1.
+int gfx_pvr_fsaa_x(void) {
+    return sPvrParams.fsaa_enabled ? 2 : 1;
 }
 
 static void gfx_pvr_finish_render(void) {

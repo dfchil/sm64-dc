@@ -144,8 +144,8 @@ void mtxf_copy(Mat4 dest, Mat4 src) {
 #endif
     // Not shz_mat4x4_copy: its paired fmov.d moves need 8-byte alignment, and matrices such as
     // an object's transform (a throwMatrix target) are only 4-byte aligned. Same reason mtxf_mul
-    // uses the unaligned XMTRX loads.
-    memcpy(dest, src, sizeof(Mat4));
+    // uses the unaligned XMTRX loads. shz_memcpy4 needs only the 4-byte alignment every Mat4 has.
+    shz_memcpy4(dest, src, sizeof(Mat4));
 }
 
 /**

@@ -1,4 +1,5 @@
 #include <PR/ultratypes.h>
+#include <string.h>
 #include <PR/gbi.h>
 #include "area.h"
 #include "engine/math_util.h"
@@ -149,8 +150,20 @@ s32 gMtxTblSize;
 static Gfx *sViewportPos;
 static Vp sPrevViewport;
 
-void mtx_patch_interpolated(void) {
+// Puts the exact matrices back into the built display list (the 60 fps patch's second draw).
+// Returns whether that changes anything: when every interpolated matrix equals its exact one and
+// no viewport was interpolated (the title's goddard head, pause, a still camera), the second draw
+// would be identical to the first, and the caller can show that frame again instead.
+s32 mtx_patch_interpolated(void) {
     s32 i;
+    s32 changed = sViewportPos != NULL;
+
+    if (sPerspectivePos != NULL && !changed) {
+        changed = memcmp((const void *) (uintptr_t) sPerspectivePos->words.w1, sPerspectiveMtx, sizeof(Mtx)) != 0;
+    }
+    for (i = 0; i < gMtxTblSize && !changed; i++) {
+        changed = memcmp((const void *) (uintptr_t) gMtxTbl[i].pos->words.w1, gMtxTbl[i].mtx, sizeof(Mtx)) != 0;
+    }
 
     if (sPerspectivePos != NULL) {
         gSPMatrix(sPerspectivePos, VIRTUAL_TO_PHYSICAL(sPerspectiveMtx), G_MTX_PROJECTION | G_MTX_LOAD | G_MTX_NOPUSH);
@@ -174,6 +187,7 @@ void mtx_patch_interpolated(void) {
     gMtxTblSize = 0;
     sPerspectivePos = NULL;
     sViewportPos = NULL;
+    return changed;
 }
 
 /**

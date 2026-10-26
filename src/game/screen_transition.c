@@ -14,6 +14,9 @@
 #include "sm64.h"
 
 #include "sh4zam_port.h"
+#ifdef TARGET_DC
+#include "pc/gfx/gfx_dc_tags.h"
+#endif
 
 u8 sTransitionColorFadeCount[4] = { 0 };
 u16 sTransitionTextureFadeCount[2] = { 0 };
@@ -102,7 +105,15 @@ s32 dl_transition_color(s8 fadeTimer, u8 transTime, struct WarpTransitionData *t
         gDPSetCombineMode(gDisplayListHead++, G_CC_SHADE, G_CC_SHADE);
         gDPSetRenderMode(gDisplayListHead++, G_RM_AA_XLU_SURF, G_RM_AA_XLU_SURF2);
         gSPVertex(gDisplayListHead++, VIRTUAL_TO_PHYSICAL(verts), 4, 0);
+#if defined(TARGET_DC) && DC_COVERS
+        /* A fade that has reached full colour is a solid cover (gfx_dc_tags.h); the steps before
+         * it stay a blended quad. */
+        if (alpha == 255) gDPNoOpTag(gDisplayListHead++, DC_GFX_COVER_BEGIN);
+#endif
         gSPDisplayList(gDisplayListHead++, dl_draw_quad_verts_0123);
+#if defined(TARGET_DC) && DC_COVERS
+        if (alpha == 255) gDPNoOpTag(gDisplayListHead++, DC_GFX_COVER_END);
+#endif
         gSPDisplayList(gDisplayListHead++, dl_screen_transition_end);
     }
     return set_and_reset_transition_fade_timer(fadeTimer, transTime);
@@ -223,7 +234,15 @@ s32 render_textured_transition(s8 fadeTimer, s8 transTime, struct WarpTransition
         // XLU draw is solid opaque black -- identical look, but now TR -> always on top.
         gDPSetRenderMode(gDisplayListHead++, G_RM_AA_XLU_SURF, G_RM_AA_XLU_SURF2);
         gSPVertex(gDisplayListHead++, VIRTUAL_TO_PHYSICAL(verts), 8, 0);
+#if defined(TARGET_DC) && DC_COVERS
+        // On the Dreamcast the fill is a COVER instead (gfx_dc_tags.h): opaque again, but above
+        // every world depth of the frame, so the Bowser-level problem above cannot return.
+        gDPNoOpTag(gDisplayListHead++, DC_GFX_COVER_BEGIN);
+#endif
         gSPDisplayList(gDisplayListHead++, dl_transition_draw_filled_region);
+#if defined(TARGET_DC) && DC_COVERS
+        gDPNoOpTag(gDisplayListHead++, DC_GFX_COVER_END);
+#endif
         //gDPPipeSync(gDisplayListHead++);
         gDPSetCombineMode(gDisplayListHead++, G_CC_MODULATEIDECALA, G_CC_MODULATEIDECALA);
         gDPSetRenderMode(gDisplayListHead++, G_RM_AA_XLU_SURF, G_RM_AA_XLU_SURF2);

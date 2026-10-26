@@ -3,6 +3,9 @@
 #include "game/ingame_menu.h"
 
 #include "make_const_nonconst.h"
+#ifdef TARGET_DC
+#include "pc/gfx/gfx_dc_tags.h"
+#endif
 
 // SM64 (US/JP/EU) Segment 02
 
@@ -2564,12 +2567,18 @@ const Gfx dl_shadow_begin[] = {
 };
 
 const Gfx dl_shadow_circle[] = {
+#ifdef DC_PROF_SKIP
+    gsDPNoOpTag(DC_GFX_SHADOW_BEGIN),
+#endif
     gsSPDisplayList(dl_shadow_begin),
     gsDPLoadTextureBlock(texture_shadow_quarter_circle, G_IM_FMT_IA, G_IM_SIZ_8b, 16, 16, 0, G_TX_WRAP | G_TX_MIRROR, G_TX_WRAP | G_TX_MIRROR, 4, 4, G_TX_NOLOD, G_TX_NOLOD),
     gsSPEndDisplayList(),
 };
 
 const Gfx dl_shadow_square[] = {
+#ifdef DC_PROF_SKIP
+    gsDPNoOpTag(DC_GFX_SHADOW_BEGIN),
+#endif
     gsSPDisplayList(dl_shadow_begin),
     gsDPLoadTextureBlock(texture_shadow_quarter_square, G_IM_FMT_IA, G_IM_SIZ_8b, 16, 16, 0, G_TX_WRAP | G_TX_MIRROR, G_TX_WRAP | G_TX_MIRROR, 4, 4, G_TX_NOLOD, G_TX_NOLOD),
     gsSPEndDisplayList(),
@@ -2592,6 +2601,9 @@ const Gfx dl_shadow_4_verts[] = {
 
 // 0x02014638 - 0x02014660
 const Gfx dl_shadow_end[] = {
+#ifdef DC_PROF_SKIP
+    gsDPNoOpTag(DC_GFX_SHADOW_END),
+#endif
     //gsDPPipeSync(),
     gsSPTexture(0xFFFF, 0xFFFF, 0, G_TX_RENDERTILE, G_OFF),
     gsSPSetGeometryMode(G_LIGHTING | G_CULL_BACK),
@@ -2630,6 +2642,9 @@ const Gfx dl_transition_draw_filled_region[] = {
 
 // 0x02014708 - 0x02014738
 const Gfx dl_skybox_begin[] = {
+#ifdef TARGET_DC
+    gsDPNoOpTag(DC_GFX_SKY_BEGIN),
+#endif
     //gsDPPipeSync(),
     gsSPClearGeometryMode(G_LIGHTING),
     gsDPSetCombineMode(G_CC_MODULATERGB, G_CC_MODULATERGB),
@@ -2650,6 +2665,9 @@ const Gfx dl_skybox_tile_tex_settings[] = {
 
 // 0x02014768 - 0x02014790
 const Gfx dl_skybox_end[] = {
+#ifdef TARGET_DC
+    gsDPNoOpTag(DC_GFX_SKY_END),
+#endif
     //gsDPPipeSync(),
     gsSPTexture(0xFFFF, 0xFFFF, 0, G_TX_RENDERTILE, G_OFF),
     gsSPSetGeometryMode(G_LIGHTING),

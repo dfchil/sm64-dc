@@ -110,6 +110,11 @@ static void gfx_dc_swap_buffers_begin(void) {
 unsigned int last_elapsed = 0;
 extern volatile uint64_t vblticker;
 uint64_t last_ticker = 0;
+// Presents that came after the vblank they were paced for (pc_main.c DC_FRAME_MODE_60_DROP).
+unsigned int gfx_dc_vbl_late = 0;
+static inline void count_vbl_miss(void) {
+    if (vblticker > last_ticker + DC_VBL_WAIT) gfx_dc_vbl_late++;
+}
 static void gfx_dc_swap_buffers_end(void) {
     /* PVR backend (gfx_pvr.c) flips inside pvr_scene_finish (finish_render). */
     // Number of microseconds a frame should take (30 fps)
@@ -129,6 +134,7 @@ static void gfx_dc_swap_buffers_end(void) {
         last_time += (FRAME_TIME_MS - elapsed);
     }
 #endif
+    count_vbl_miss();
     while (vblticker < (last_ticker + DC_VBL_WAIT))
 #ifdef KOS_GENWAIT_3ARG
         genwait_wait((void*)&vblticker, NULL, 0);
@@ -141,6 +147,19 @@ static void gfx_dc_swap_buffers_end(void) {
 //        thd_pass();
 //    }
 //    last_ticker = vblticker;
+}
+
+// Shows the current frame for one more frame time without drawing: the PVR keeps scanning out the
+// last finished scene, so only the pacing is needed (pc_main.c's identical-second-draw skip).
+void gfx_dc_hold_frame(void) {
+    count_vbl_miss();
+    while (vblticker < (last_ticker + DC_VBL_WAIT))
+#ifdef KOS_GENWAIT_3ARG
+        genwait_wait((void*)&vblticker, NULL, 0);
+#else
+        genwait_wait((void*)&vblticker, NULL, 0, NULL);
+#endif
+    last_ticker = vblticker;
 }
 
 /* Idk what this is for? */

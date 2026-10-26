@@ -24,6 +24,7 @@
 
 #include "sh4zam_port.h"
 #include "pc/dc_prof.h"
+#include "pc/gfx/gfx_dc_tags.h"
 
 int in_trilerp = 0;
 int doing_peach = 0;
@@ -96,18 +97,21 @@ struct __attribute__((aligned(32))) LoadedVertex {
 // bit 7 - lit
 // The state every vertex and triangle touches, in one section (SM_HOT_DATA): left to the linker it
 // lands scattered among the big tables, and the 16 KB direct-mapped operand cache keeps evicting it.
+// The Makefile's ordering file places the section in .sub3, 0x2c0 bytes in (DC_HOT_DATA_RESIDUE),
+// and KOS caps each .subN at 8 KB: everything marked SM_HOT_DATA must stay under 0x1d40 (7488)
+// bytes together (0x14e0 now), or the link fails with "Sub-section .sub3 is bigger than icache size".
 #define SM_HOT_DATA __attribute__((section(".data.sm64_hot")))
 SM_HOT_DATA uint8_t __attribute__((aligned(32))) clip_rej[MAX_VERTICES];
 
 // Triangle state epoch and baked-vertex cache: see tri_state_setup / tri_baked.
 static SM_HOT_DATA uint32_t sTriStateEpoch = 1;
-static SM_HOT_DATA uint32_t sVtxBakeEpoch[MAX_VERTICES + 4];
+static SM_HOT_DATA uint32_t __attribute__((aligned(8))) sVtxBakeEpoch[MAX_VERTICES + 4];   // shz_memset8
 static SM_HOT_DATA dc_fast_t __attribute__((aligned(32))) sVtxBaked[MAX_VERTICES + 4];
 
 static inline void tri_state_bump(void) {
     DC_PROF_COUNT(DCC_EPOCHS, 1);
     if (++sTriStateEpoch == 0) {   // wrapped: no stale slot may match the new epoch
-        memset(sVtxBakeEpoch, 0, sizeof(sVtxBakeEpoch));
+        shz_memset8(sVtxBakeEpoch, 0, sizeof(sVtxBakeEpoch));
         sTriStateEpoch = 1;
     }
 }
@@ -151,6 +155,19 @@ static uint8_t color_combiner_pool_size;
 // places .sub0 at an I-cache-aligned address and fails the link if it outgrows the cache, so
 // they sit side by side in it. Their cold paths are split out to keep it that small.
 #define SM_HOT __attribute__((section(".sub0.sm64_hot")))
+// Hot code that does not fit in .sub0 (cc_eval_float: ~20% of title-screen display-list
+// samples, goddard's combiners). Left in .text it lands wherever LTO puts it; one renderer edit
+// moved it onto gfx_sp_tri1 and title I-cache stalls went 8.7% -> 22.3% of display-list cycles.
+// .sub1 starts one I-cache size after .sub0, so an offset into it is an I-cache index: an ld
+// ordering file from the Makefile (DC_SM_WARM_SET) puts SM_WARM code on lines .sub0 leaves cold
+// (the middle of gfx_run_dl, from title samples) and checks after the link that it did. Re-pick
+// the set from samples when .sub0 changes much. cc_eval_float keeps `cold` for its size-optimised code
+// (without it, it doubles to ~1.4 KB); the section attribute overrides where `cold` would put it.
+#define SM_WARM __attribute__((section(".sub1.sm64_warm")))
+// tri_state_setup (4 KB, every state change) gets a fixed slot of its own the same way, in .sub2:
+// left in .text, a 0.7 ms title regression followed it when unrelated code growth moved it onto
+// gfx_sp_vertex_light. Its sets (DC_SM_WARM2_SET..) are the ones it had in the fastest build.
+#define SM_WARM2 __attribute__((section(".sub2.sm64_warm")))
 #define MEM_BARRIER() ((void) 0)
 
 static struct RSP {
@@ -246,6 +263,24 @@ int cur_frame_persp = 0;
 int prev_frame_had_persp = 0;
 int has_done_3d = 0;
 int proj_is_ortho = 0;   // current projection is orthographic (set in gfx_sp_matrix)
+// Transition covers (gfx_dc_tags.h). gfx_frame_invw_max is the largest 1/w any world vertex can
+// have this frame: the software near clip keeps w >= the near plane's w, so it is 1/w there,
+// taken from every perspective projection loaded (reset by gfx_pvr_start_frame). A cover goes
+// above it; sCover routes the tagged triangles to OP and makes them write depth.
+float gfx_frame_invw_max = 0.0f;
+static uint8_t sCover = 0;
+// Inside the skybox's display lists (gfx_dc_tags.h DC_GFX_SKY_*): pure-source blends go to OP.
+static uint8_t sSkybox = 0;
+#if DC_RAIL_TR
+static uint32_t sRailMode;   // the render mode DC_GFX_RAIL_TR_END restores
+#endif
+extern void gfx_pvr_cover_begin(float world_z_max);
+#ifdef DC_PROF_SKIP
+extern void gfx_pvr_prof_shadow(int on);
+#endif
+#ifdef DC_PROF_LISTS
+extern void gfx_pvr_prof_tex_src(uint32_t addr);
+#endif
 // Decal z-fight bias: a decal vert's z (=1/w) is scaled by this (>1 == nearer) so it wins the
 // GEQUAL depth test against its coplanar base surface. Tune up if decals still z-fight, down if
 // they punch through nearby geometry.
@@ -260,19 +295,42 @@ extern float gfx_pvr_get_v_scale(void);
 //   screen_x = sm_xscale*(_x/_w) + sm_xbias
 //   screen_y = sm_yscale*(_y/_w) + sm_ybias   (yscale<0: N64 NDC y-up -> PVR y-down)
 //   screen_z = 1/_w                            (PVR inverse depth)
+// DC_FSAA=1 (gfx_pvr.c): the PVR renders twice as wide and filters down on output, so every
+// screen x handed to it, 3D and 2D, is scaled by DC_FSAA_X. Viewports and scissors stay in the
+// game's 640-wide space; only the final map to render pixels widens.
+#ifndef DC_RAIL_TR
+#define DC_RAIL_TR 0   // BBH's chain-link fence blended in TR instead of PT (gfx_dc_tag)
+#endif
+#ifndef DC_CUTOUT_KIND
+// Where alpha-test cutouts go: 1 = PT (punch-through), 2 = TR (alpha-blended; DC_CUTOUT_TR=1).
+#define DC_CUTOUT_KIND 1
+#endif
+#ifndef DC_FSAA
+#define DC_FSAA 0
+#endif
+// The x scale follows the PVR's current FSAA mode, which can change per course (gfx_pvr.c
+// DC_FSAA_OFF_LEVELS); gfx_dc_set_fsaa_x sets it while no frame is in flight.
+static float sDcFsaaX = (float) (1 << DC_FSAA);
+#define DC_FSAA_X sDcFsaaX
 static float vpf_x = 0.0f, vpf_y = 0.0f, vpf_w = 640.0f, vpf_h = 480.0f;
-static float sm_xscale = 320.0f, sm_xbias = 320.0f;
+static float sm_xscale = 320.0f * (float) (1 << DC_FSAA), sm_xbias = 320.0f * (float) (1 << DC_FSAA);
 static float sm_yscale = -240.0f, sm_ybias = 240.0f;
 // Framebuffer half-extents in pixels (gfx_current_dimensions/2, set in gfx_init). The 2D rect
 // path (gfx_draw_rectangle) maps NDC->pixels with these, so it tracks LOWRES (320x240) instead
 // of a hardwired 640x480. The 3D bake already scales via RATIO/sm_*.
-static float fb_half_w = 320.0f, fb_half_h = 240.0f;
+static float fb_half_w = 320.0f * (float) (1 << DC_FSAA), fb_half_h = 240.0f;
+static void gfx_recompute_screen_map(void);
+void gfx_dc_set_fsaa_x(int fsaa) {
+    sDcFsaaX = (float) (1 << fsaa);
+    fb_half_w = (float) gfx_current_dimensions.width * 0.5f * sDcFsaaX;
+    gfx_recompute_screen_map();
+}
 static void gfx_recompute_screen_map(void) {
     float vw = vpf_w <= 0.0f ? 1.0f : vpf_w;
     float vh = vpf_h <= 0.0f ? 1.0f : vpf_h;
     float fb_h = (float) (int32_t) gfx_current_dimensions.height;
-    sm_xscale = vw * 0.5f;
-    sm_xbias  = vpf_x + vw * 0.5f;
+    sm_xscale = vw * 0.5f * DC_FSAA_X;
+    sm_xbias  = (vpf_x + vw * 0.5f) * DC_FSAA_X;
     sm_yscale = -(vh * 0.5f);
     sm_ybias  = fb_h - vpf_y - vh * 0.5f;
 }
@@ -313,10 +371,14 @@ static inline int pvr_blend_is_source(uint32_t oml, uint32_t omh) {
     return ((oml >> (base + 12)) & 3) == G_BL_CLR_IN && ((oml >> (base + 4)) & 3) == G_BL_CLR_IN;
 }
 
+// Same field layout as pvr_blend_is_source (P, A, M, B at base + 12, + 8, + 4, + 0). Every blended
+// mode SM64 uses (the XLU_SURF/DECAL/INTER family) decodes to A_IN / 1MA, so the result is the
+// alpha-over the fallback gave before the layout was fixed; the other arrangements are here for
+// completeness.
 static void pvr_derive_blend(uint32_t oml, uint32_t omh, uint8_t *src, uint8_t *dst) {
-    int base = ((omh & (3U << G_MDSFT_CYCLETYPE)) == G_CYC_2CYCLE) ? 16 : 24;
-    int p = (oml >> (base + 6)) & 3, m = (oml >> (base + 4)) & 3;
-    int a = (oml >> (base + 2)) & 3, b = (oml >> (base + 0)) & 3;
+    int base = ((omh & (3U << G_MDSFT_CYCLETYPE)) == G_CYC_2CYCLE) ? 16 : 18;
+    int p = (oml >> (base + 12)) & 3, a = (oml >> (base + 8)) & 3;
+    int m = (oml >> (base + 4)) & 3, b = (oml >> (base + 0)) & 3;
     if (p != G_BL_CLR_IN || m != G_BL_CLR_MEM) {
         *src = GFX_BLENDF_SRCALPHA; *dst = GFX_BLENDF_INVSRCALPHA;
         return;
@@ -633,7 +695,7 @@ static void  __attribute__((noinline)) import_texture_i4(void) {
 			rgba16_buf[idx+1] = (part2 << 12) | (part2 << 8) | (part2 << 4) | part2;
 		}
 	} else {
-		memset(rgba16_buf, 0, 8192*sizeof(uint16_t));
+		shz_memset8(rgba16_buf, 0, sizeof(rgba16_buf));   // 32-byte aligned, 16 KB
 		uint8_t* start =
 			(uint8_t*) &rdp.loaded_texture
 				.addr[(((((rdp.texture_tile.ult >> G_TEXTURE_IMAGE_FRAC)-1)/2) * (width)/2)) +
@@ -658,7 +720,11 @@ static void  __attribute__((noinline)) import_texture_i8(void) {
 	uint32_t width = rdp.texture_tile.line_size_bytes;
 	uint32_t height = rdp.loaded_texture.size_bytes / rdp.texture_tile.line_size_bytes;
 
-	memset(xform_buf, 0, width*height*2);
+	{
+		// xform_buf is 32-byte aligned: clear whole 8-byte words, never past its end.
+		size_t n = ((size_t) width * height * 2 + 7) & ~(size_t) 7;
+		shz_memset8(xform_buf, 0, n < sizeof(xform_buf) ? n : sizeof(xform_buf));
+	}
 
 	uint8_t* start = (uint8_t*) &rdp.loaded_texture
 						 .addr[((rdp.texture_tile.ult >> G_TEXTURE_IMAGE_FRAC) * (last_set_texture_image_width + 1)) +
@@ -696,6 +762,9 @@ static void  __attribute__((noinline)) import_texture(void) {
     if (gfx_texture_cache_lookup(&rendering_state.texture, rdp.loaded_texture.addr)) {
         return;
     }
+#ifdef DC_PROF_LISTS
+    gfx_pvr_prof_tex_src((uint32_t) (uintptr_t) rdp.loaded_texture.addr);
+#endif
     
     if (fmt == G_IM_FMT_RGBA) {
         if (siz == G_IM_SIZ_16b) {
@@ -790,6 +859,13 @@ static void  __attribute__((noinline)) gfx_sp_matrix(uint8_t parameters, const i
         proj_is_ortho = (rsp.P_matrix[3][3] > 0.5f) && (rsp.P_matrix[2][3] > -0.5f);
         if (!proj_is_ortho) {
             cur_frame_persp = 1;
+            // Near plane z_clip = -w_clip: with z_clip = A*z + B and w_clip = C*z (eye z), the
+            // plane's w is -B*C / (A + C), so its 1/w is -(A + C) / (B*C).
+            float a = rsp.P_matrix[2][2], b = rsp.P_matrix[3][2], c = rsp.P_matrix[2][3];
+            if (b != 0.0f && c != 0.0f) {
+                float near_invw = -(a + c) / (b * c);
+                if (near_invw > gfx_frame_invw_max) gfx_frame_invw_max = near_invw;
+            }
         }
     } else { // G_MTX_MODELVIEW
         if ((parameters & G_MTX_PUSH) && rsp.modelview_matrix_stack_size < 11) {
@@ -1140,7 +1216,8 @@ typedef struct {
     float k, kc, ka;
 } CCForm;
 
-typedef struct {
+// 8-byte aligned (and a multiple of 8 long) so the memo copies go through shz_memcpy8.
+typedef struct __attribute__((aligned(8))) {
     uint8_t replace;       // REPLACE texenv: px = texel, argb white, no offset
     uint8_t all_const;     // no slot reads shade: const_argb/const_oargb hold the result
     uint8_t bytes;         // every channel is the shade byte or a constant: keep/konst masks
@@ -1155,6 +1232,7 @@ typedef struct {
     // linear: channel = clamp(k + kc*shade[ch] + ka*shade.a), [r, g, b, a].
     CCForm lin[4];
 } CompiledCC;
+_Static_assert(sizeof(CompiledCC) % 8 == 0, "CompiledCC copies use shz_memcpy8");
 
 static CCForm cc_slot4(int mux, int ch, float tex, const float prim[4], const float env[4]) {
     CCForm f = { 0.0f, 0.0f, 0.0f };
@@ -1252,7 +1330,7 @@ static inline int cc_channel_const(const CCForm f[4]) {
 // (added post-modulate via the always-on specular bit). Carries MK64's cloud-oargb + has_texel
 // d-slot fixes.
 static void cc_compile(CompiledCC *cc, uint32_t w0, uint32_t w1, int textured, uint32_t mode) {
-    memset(cc, 0, sizeof(*cc));
+    shz_memset8(cc, 0, sizeof(*cc));   // CompiledCC is 8-byte aligned, a multiple of 8 long
     // REPLACE ignores the vertex colour (px = texel); oargb (added afterward) must be 0.
     if (mode == GFX_TEXENV_REPLACE) {
         cc->replace = 1;
@@ -1375,8 +1453,8 @@ static void cc_compile(CompiledCC *cc, uint32_t w0, uint32_t w1, int textured, u
     }
 }
 
-static void __attribute__((noinline, cold)) cc_eval_float(const CompiledCC *cc, const struct RGBA *sh,
-                                                          uint32_t *out_argb, uint32_t *out_oargb);
+static void __attribute__((noinline, cold)) SM_WARM cc_eval_float(const CompiledCC *cc, const struct RGBA *sh,
+                                                                  uint32_t *out_argb, uint32_t *out_oargb);
 static void cc_compile(CompiledCC *cc, uint32_t w0, uint32_t w1, int textured, uint32_t mode);
 
 // cc_compile runs at every triangle-state setup (~80 a frame), but a scene uses a handful of
@@ -1397,7 +1475,7 @@ static void cc_compile_cached(CompiledCC *cc, uint32_t w0, uint32_t w1, int text
     h = (h ^ (h >> 15) ^ (h >> 23)) & (CC_MEMO_SIZE - 1);
     if (sCcMemo[h].flags == flags && sCcMemo[h].w0 == w0 && sCcMemo[h].w1 == w1 && sCcMemo[h].prim == prim &&
         sCcMemo[h].env == env) {
-        *cc = sCcMemo[h].cc;
+        shz_memcpy8(cc, &sCcMemo[h].cc, sizeof(*cc));
         return;
     }
     cc_compile(cc, w0, w1, textured, mode);
@@ -1406,7 +1484,7 @@ static void cc_compile_cached(CompiledCC *cc, uint32_t w0, uint32_t w1, int text
     sCcMemo[h].prim = prim;
     sCcMemo[h].env = env;
     sCcMemo[h].flags = flags;
-    sCcMemo[h].cc = *cc;
+    shz_memcpy8(&sCcMemo[h].cc, cc, sizeof(*cc));
 }
 
 static inline void cc_eval(const CompiledCC *cc, const struct RGBA *sh, uint32_t *out_argb, uint32_t *out_oargb) {
@@ -1436,8 +1514,8 @@ static inline void cc_eval(const CompiledCC *cc, const struct RGBA *sh, uint32_t
 }
 
 // Combiners that mix shade with a constant factor: the general linear-form evaluation.
-static void __attribute__((noinline, cold)) cc_eval_float(const CompiledCC *cc, const struct RGBA *sh,
-                                                          uint32_t *out_argb, uint32_t *out_oargb) {
+static void __attribute__((noinline, cold)) SM_WARM cc_eval_float(const CompiledCC *cc, const struct RGBA *sh,
+                                                                  uint32_t *out_argb, uint32_t *out_oargb) {
     const float r255 = 1.0f / 255.0f;
     const float s[4] = { sh->r*r255, sh->g*r255, sh->b*r255, sh->a*r255 };
     uint32_t col[3];
@@ -1544,7 +1622,7 @@ static struct {
 extern void pvr_submit_op_tri(const dc_fast_t *a, const dc_fast_t *b, const dc_fast_t *c);
 
 // Apply the current RSP/RDP state to the backend and cache what the per-vertex emit needs.
-static void __attribute__((noinline, cold)) tri_state_setup(void) {
+static void __attribute__((noinline, cold)) SM_WARM2 tri_state_setup(void) {
     if (matrix_dirty) {
         matrix_dirty = 0;
     }
@@ -1564,6 +1642,7 @@ static void __attribute__((noinline, cold)) tri_state_setup(void) {
     }
 
     bool z_upd = (rdp.other_mode_l & Z_UPD) == Z_UPD;
+    if (sCover) z_upd = true;   // the cover's depth is what hides the PT/TR lists under it
     if (z_upd != rendering_state.depth_mask) {
         gfx_rapi->set_depth_mask(z_upd);
         rendering_state.depth_mask = z_upd;
@@ -1709,9 +1788,11 @@ static void __attribute__((noinline, cold)) tri_state_setup(void) {
         uint8_t alpha_uses_texel = (aa == 1 || aa == 2 || ab == 1 || ab == 2 ||
                                     ac == 1 || ac == 2 || ad == 1 || ad == 2);
         uint8_t alpha_compare_on = (rdp.other_mode_l & 3) != 0;   // G_AC_THRESHOLD/DITHER
-        uint8_t real_blend = (rdp.other_mode_l & FORCE_BL) && !pvr_blend_is_source(rdp.other_mode_l, rdp.other_mode_h);
+        uint8_t real_blend = (rdp.other_mode_l & FORCE_BL) &&
+                             !(sSkybox && pvr_blend_is_source(rdp.other_mode_l, rdp.other_mode_h));
         uint8_t cutout     = texture_edge || (alpha_uses_texel && alpha_compare_on);
-        uint8_t kind = real_blend ? 2 : (cutout ? 1 : 0);   // TR : PT : OP
+        uint8_t kind = real_blend ? 2 : (cutout ? DC_CUTOUT_KIND : 0);   // TR : PT : OP
+        if (sCover) kind = 0;   // a transition cover: opaque, live OP
         if (kind != pvr_cur_kind) {
             gfx_pvr_set_blend(kind);
             pvr_cur_kind = kind;
@@ -2240,9 +2321,12 @@ static void __attribute__((noinline)) gfx_sp_quad_2d(void) {
         uint8_t alpha_uses_texel = (aa == 1 || aa == 2 || ab == 1 || ab == 2 ||
                                     ac == 1 || ac == 2 || ad == 1 || ad == 2);
         uint8_t alpha_compare_on = (rdp.other_mode_l & 3) != 0;
-        uint8_t real_blend = (rdp.other_mode_l & FORCE_BL) && !pvr_blend_is_source(rdp.other_mode_l, rdp.other_mode_h);
+        // 2D quads keep FORCE_BL -> TR even for a pure-source blend: the screen borders and other
+        // G_RM_OPA_SURF fills drawn before the 3D scene are far-pinned, and in the OP list the scene
+        // would cover them. (The skybox's OPA_SURF triangles go to OP in tri_state_setup.)
+        uint8_t real_blend = (rdp.other_mode_l & FORCE_BL) != 0;
         uint8_t cutout     = texture_edge || (alpha_uses_texel && alpha_compare_on);
-        uint8_t kind = real_blend ? 2 : (cutout ? 1 : 0);
+        uint8_t kind = real_blend ? 2 : (cutout ? DC_CUTOUT_KIND : 0);
         if (kind != pvr_cur_kind) { gfx_pvr_set_blend(kind); pvr_cur_kind = kind; }
         if (kind == 2) {
             uint8_t bs, bd;
@@ -2300,13 +2384,14 @@ static void  __attribute__((noinline)) gfx_sp_movemem(uint8_t index, uint8_t off
             int lightidx = offset / 24 - 2;
             if (lightidx >= 0 && lightidx <= MAX_LIGHTS) { // skip lookat
                 // NOTE: reads out of bounds if it is an ambient light
-                memcpy(rsp.current_lights + lightidx, data, sizeof(Light_t));
+                // Display-list data is at least 4-byte aligned, and a Light_t is 16 bytes.
+                shz_memcpy4(rsp.current_lights + lightidx, data, sizeof(Light_t));
                 rsp.light_cols_changed = 1;
             } else {
                 if (lightidx == -2)
-                    memcpy(rsp.current_lookat, data, sizeof(Light_t));
+                    shz_memcpy4(rsp.current_lookat, data, sizeof(Light_t));
                 else if (lightidx == -1)
-                    memcpy(rsp.current_lookat + 1, data, sizeof(Light_t));
+                    shz_memcpy4(rsp.current_lookat + 1, data, sizeof(Light_t));
             }
             break;
         }
@@ -2315,7 +2400,7 @@ static void  __attribute__((noinline)) gfx_sp_movemem(uint8_t index, uint8_t off
         case G_MV_L1:
         case G_MV_L2:
             // NOTE: reads out of bounds if it is an ambient light
-            memcpy(rsp.current_lights + (index - G_MV_L0) / 2, data, sizeof(Light_t));
+            shz_memcpy4(rsp.current_lights + (index - G_MV_L0) / 2, data, sizeof(Light_t));
             rsp.light_cols_changed = 1;
             break;
 #endif
@@ -2747,6 +2832,38 @@ static Gfx __attribute__((aligned(32))) * dl_stack[GFX_DL_STACK_MAX];
 
 //int max_sp = 0;
 
+// Dreamcast display-list tags (gfx_dc_tags.h), kept out of .sub0. A cover's depth goes above
+// every world 1/w of the frame (at least 2, the ortho-3D range; decal and trilerp bias included).
+static void __attribute__((noinline, cold)) gfx_dc_tag(uint32_t tag) {
+    if (tag == DC_GFX_COVER_BEGIN) {
+        float bound = gfx_frame_invw_max > 2.0f ? gfx_frame_invw_max : 2.0f;
+        gfx_pvr_cover_begin(bound * PVR_DECAL_ZBIAS * 1.01f);
+        sCover = 1;
+    } else if (tag == DC_GFX_COVER_END) {
+        sCover = 0;
+    } else if (tag == DC_GFX_SKY_BEGIN || tag == DC_GFX_SKY_END) {
+        sSkybox = tag == DC_GFX_SKY_BEGIN;
+    }
+#if DC_RAIL_TR
+    else if (tag == DC_GFX_RAIL_TR_BEGIN) {
+        // A blended (XLU) render mode instead of the cutout's alpha test: TR rather than PT. The
+        // texture's alpha is 0 or 1, so it looks the same, edges a little softer.
+        sRailMode = rdp.other_mode_l;
+#pragma GCC diagnostic push
+#pragma GCC diagnostic ignored "-Wparentheses"   // gbi.h's GBL_c1/GBL_c2
+        rdp.other_mode_l = (sRailMode & 4) | ((G_RM_AA_ZB_XLU_SURF | G_RM_AA_ZB_XLU_SURF2) & ~7u);
+#pragma GCC diagnostic pop
+    } else if (tag == DC_GFX_RAIL_TR_END) {
+        rdp.other_mode_l = sRailMode;
+    }
+#endif
+#ifdef DC_PROF_SKIP
+    else if (tag == DC_GFX_SHADOW_BEGIN || tag == DC_GFX_SHADOW_END) {
+        gfx_pvr_prof_shadow(tag == DC_GFX_SHADOW_BEGIN);
+    }
+#endif
+}
+
 static void SM_HOT __attribute__((noinline)) gfx_run_dl(Gfx* cmd) {
     int dl_sp = 0;
 
@@ -2783,6 +2900,9 @@ static void SM_HOT __attribute__((noinline)) gfx_run_dl(Gfx* cmd) {
         }
 
         switch (opcode) {
+            case (uint8_t) G_NOOP:
+                if (cmd->words.w1) gfx_dc_tag(cmd->words.w1);
+                break;
             // RSP commands:
             case G_MTX:
 #ifdef F3DEX_GBI_2
@@ -3062,7 +3182,7 @@ void gfx_init(struct GfxWindowManagerAPI *wapi, struct GfxRenderingAPI *rapi, co
         gfx_current_dimensions.height = 1;
     }
     // 2D rect path maps NDC->framebuffer pixels with these (tracks LOWRES vs 640x480).
-    fb_half_w = (float) gfx_current_dimensions.width * 0.5f;
+    fb_half_w = (float) gfx_current_dimensions.width * 0.5f * DC_FSAA_X;
     fb_half_h = (float) gfx_current_dimensions.height * 0.5f;
 
     rsp.current_lookat[0].dir[0] = 0;
@@ -3088,6 +3208,11 @@ void gfx_run(Gfx *commands) {
     __builtin_prefetch(commands);
     gfx_sp_reset();
     tri_state_bump();   // backend state is reset per frame
+    sCover = 0;         // a cover never outlives its frame, even without its end tag
+    sSkybox = 0;
+#ifdef DC_PROF_SKIP
+    gfx_pvr_prof_shadow(0);   // nor does a shadow tag
+#endif
     
     gfx_rapi->start_frame();
     gfx_run_dl(commands);
