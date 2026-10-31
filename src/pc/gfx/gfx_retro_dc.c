@@ -76,7 +76,7 @@ struct __attribute__((aligned(32))) LoadedVertex {
     float _x, _y;
     // raw clip z, w — homogeneous clip planes, depth (1/w), and N64 fog (z/w).
     float _z, _w;
-    // 8, 12, 16
+    // 8, 12, 16: the model-space position (nothing reads it: not stored)
     float x, y, z;
     // 20, 24
     float u, v;
@@ -999,9 +999,6 @@ static void SM_HOT __attribute__((noinline)) gfx_sp_vertex_light(size_t n_vertic
 
         shz_vec4_t out = shz_xmtrx_transform_vec4(shz_vec4_init((float)vn->ob[0], (float)vn->ob[1], (float)vn->ob[2], 1.0f));
         MEM_BARRIER_PREF(vn + 4);   // Vtx is 16 bytes: two cache lines ahead
-        d->x = (float)vn->ob[0];
-        d->y = (float)vn->ob[1];
-        d->z = (float)vn->ob[2];
 
         short U = vn->tc[0] * rsp.s_scale >> 16;
         short V = vn->tc[1] * rsp.t_scale >> 16;
@@ -1103,9 +1100,6 @@ static void SM_HOT __attribute__((noinline)) gfx_sp_vertex_no(size_t n_vertices,
 
         shz_vec4_t out = shz_xmtrx_transform_vec4(shz_vec4_init((float)v->ob[0], (float)v->ob[1], (float)v->ob[2], 1.0f));
         MEM_BARRIER_PREF(v + 4);    // Vtx is 16 bytes: two cache lines ahead
-        d->x = (float)v->ob[0];
-        d->y = (float)v->ob[1];
-        d->z = (float)v->ob[2];
 
         short U = v->tc[0] * rsp.s_scale >> 16;
         short V = v->tc[1] * rsp.t_scale >> 16;
@@ -1404,7 +1398,7 @@ static void cc_compile(CompiledCC *cc, uint32_t w0, uint32_t w1, int textured, u
             cc->offset_shade = 1;
         } else {
             const float *o = (d == 3) ? prim : env;
-            off_rgb = PACK_ARGB8888((uint32_t)(o[0]*255.0f), (uint32_t)(o[1]*255.0f), (uint32_t)(o[2]*255.0f), 0);
+            off_rgb = PACK_ARGB8888((uint32_t)(int32_t)(o[0]*255.0f), (uint32_t)(int32_t)(o[1]*255.0f), (uint32_t)(int32_t)(o[2]*255.0f), 0);
         }
     }
 
@@ -1533,7 +1527,9 @@ static inline void cc_eval(const CompiledCC *cc, const struct RGBA *sh, uint32_t
     cc_eval_float(cc, sh, out_argb, out_oargb);
 }
 
-// Combiners that mix shade with a constant factor: the general linear-form evaluation.
+// Combiners that mix shade with a constant factor: the general linear-form evaluation. Every value
+// converted is in 0..255: through int32_t, a float converts in one instruction (to uint32_t the
+// SH4 goes through double precision, switching the FPU mode).
 static void __attribute__((noinline, cold)) SM_WARM cc_eval_float(const CompiledCC *cc, const struct RGBA *sh,
                                                                   uint32_t *out_argb, uint32_t *out_oargb) {
     const float r255 = 1.0f / 255.0f;
@@ -1542,21 +1538,21 @@ static void __attribute__((noinline, cold)) SM_WARM cc_eval_float(const Compiled
     uint32_t alpha;
     if (cc->linear) {
         for (int ch = 0; ch < 3; ch++) {
-            col[ch] = (uint32_t)(cc_clamp01(cc_form(&cc->lin[ch], s[ch], s[3])) * 255.0f);
+            col[ch] = (uint32_t)(int32_t)(cc_clamp01(cc_form(&cc->lin[ch], s[ch], s[3])) * 255.0f);
         }
-        alpha = (uint32_t)(cc_clamp01(cc_form(&cc->lin[3], s[3], s[3])) * 255.0f);
+        alpha = (uint32_t)(int32_t)(cc_clamp01(cc_form(&cc->lin[3], s[3], s[3])) * 255.0f);
     } else {
         for (int ch = 0; ch < 3; ch++) {
-            col[ch] = (uint32_t)(cc_apply(cc->col[ch], s[ch], s[3]) * 255.0f);
+            col[ch] = (uint32_t)(int32_t)(cc_apply(cc->col[ch], s[ch], s[3]) * 255.0f);
         }
-        alpha = (uint32_t)(cc_apply(cc->alpha, s[3], s[3]) * 255.0f);
+        alpha = (uint32_t)(int32_t)(cc_apply(cc->alpha, s[3], s[3]) * 255.0f);
     }
     if (cc->cct) {
         *out_oargb = PACK_ARGB8888(col[0], col[1], col[2], 0);
         *out_argb = PACK_ARGB8888(0, 0, 0, alpha);
     } else {
-        *out_oargb = cc->offset_shade ? PACK_ARGB8888((uint32_t)(s[0]*255.0f), (uint32_t)(s[1]*255.0f),
-                                                      (uint32_t)(s[2]*255.0f), 0)
+        *out_oargb = cc->offset_shade ? PACK_ARGB8888((uint32_t)(int32_t)(s[0]*255.0f), (uint32_t)(int32_t)(s[1]*255.0f),
+                                                      (uint32_t)(int32_t)(s[2]*255.0f), 0)
                                       : cc->const_oargb;
         *out_argb = PACK_ARGB8888(col[0], col[1], col[2], alpha);
     }
