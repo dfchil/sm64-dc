@@ -649,6 +649,11 @@ ifeq ($(DC_PROF),1)
   ifeq ($(DC_PROF_SAMPLE),1)
     PLATFORM_CFLAGS += -DDC_PROF_SAMPLE
   endif
+  # DC_SAMPLE_HZ=n DC_SAMPLE_CAP=n: a longer run than the default's 65 s, e.g. 41 and 65536 for the
+  # 26-level TAS benchmark (26 minutes). The samples stop when the buffer is full.
+  ifdef DC_SAMPLE_HZ
+    PLATFORM_CFLAGS += -DDC_SAMPLE_HZ=$(DC_SAMPLE_HZ) -DDC_SAMPLE_CAP=$(DC_SAMPLE_CAP)
+  endif
   # DC_PROF_TITLE=1: keep the normal title wait before the demos (profile the Mario head screen)
   ifeq ($(DC_PROF_TITLE),1)
     PLATFORM_CFLAGS += -DDC_PROF_TITLE

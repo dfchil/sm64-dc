@@ -66,7 +66,8 @@ for elf in "$@"; do
     acap=$!
   fi
   wait $run || true
-  [[ -n $acap ]] && { wait $acap 2>/dev/null || true; unset acap; }
+  # The capture stops with the program (CAPTURE_AUDIO_SECONDS only caps it), so it never holds the lock.
+  [[ -n $acap ]] && { sleep 2; kill -INT $acap 2>/dev/null; wait $acap 2>/dev/null || true; unset acap; }
   [[ -n $cap ]] && { kill -INT $cap 2>/dev/null; wait $cap 2>/dev/null || true; unset cap; }
   [[ -n $vcap ]] && { kill -INT $vcap 2>/dev/null; wait $vcap 2>/dev/null || true; unset vcap; }
   dctool_unlock

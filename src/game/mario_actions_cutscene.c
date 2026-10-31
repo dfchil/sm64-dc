@@ -557,6 +557,19 @@ s32 act_debug_free_move(struct MarioState *m) {
 
     set_mario_animation(m, MARIO_ANIM_A_POSE);
     vec3f_copy(pos, m->pos);
+#ifdef DC_PROF_BENCH
+    {   // the benchmark tour's fly-through (game_init.c): the route sets the position
+        extern int dc_bench_fly(Vec3f pos, s16 *yaw);
+        s16 yaw;
+        if (dc_bench_fly(pos, &yaw)) {
+            vec3f_copy(m->pos, pos);
+            m->faceAngle[1] = yaw;
+            vec3f_copy(m->marioObj->header.gfx.pos, m->pos);
+            vec3s_set(m->marioObj->header.gfx.angle, 0, m->faceAngle[1], 0);
+            return FALSE;
+        }
+    }
+#endif
 
     if (gPlayer1Controller->buttonDown & U_JPAD) {
         pos[1] += 16.0f * speed;

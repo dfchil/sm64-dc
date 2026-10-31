@@ -237,12 +237,16 @@ static SkipStats sSceneSkip[MAX_SCENES][SKIP_CODES];
 // /pc/sm64_samples.bin at exit; tools/dc_prof_samples.py resolves it against the ELF.
 // DC_PROF_SAMPLE_LATE=1 keeps only the samples of frames that turn out late: a frame's samples
 // wait in a staging buffer until its end shows how many fields it took.
+#ifndef DC_SAMPLE_HZ
 #ifdef DC_PROF_SAMPLE_LATE
 #define DC_SAMPLE_HZ 2000
 #else
 #define DC_SAMPLE_HZ 500
 #endif
+#endif
+#ifndef DC_SAMPLE_CAP
 #define DC_SAMPLE_CAP (32 * 1024)   // 128 KB (65 s at 500 Hz): the game leaves only ~1.4 MB of the 16 MB free
+#endif
 static uint32_t sSamples[DC_SAMPLE_CAP];
 static volatile uint32_t sSampleCount;
 #ifdef DC_PROF_SAMPLE_LATE

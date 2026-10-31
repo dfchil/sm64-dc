@@ -392,25 +392,92 @@ void adjust_analog_stick(struct Controller *controller) {
 // if a demo sequence exists, this will run the demo
 // input list until it is complete. called every frame.
 #ifdef DC_PROF_BENCH
-// The benchmark tour (level_select_menu.c): 3 s for the level to come in, then the camera goes
-// round Mario once in 6 s, once more 1.6 times as far out, and the demo ends 1 s later. Mario
-// gets no input. The game's own camera cannot orbit (C-left turns it a step or two), so
-// camera.c turns its result by gDcBenchYaw and stretches it by gDcBenchZoom.
+// The benchmark tour (level_select_menu.c). After 3 s for the level to come in, Mario flies a route
+// through the level's first area (tools/dc_bench_paths.py: spread-out object positions) in the
+// debug free-move action, through walls, in about 40 s; objects wake up along it as in play, and
+// the camera follows him. The demo ends 1 s after the last point. A level without a route turns
+// the camera round Mario instead (camera.c applies gDcBenchYaw and gDcBenchZoom).
+#include <math.h>
+#include "level_table.h"
+#include "level_update.h"
+#include "mario.h"
+#include "engine/math_util.h"
+#include "dc_bench_paths.h"
 s16 gDcBenchYaw;
 f32 gDcBenchZoom = 1.0f;
+static const s16 (*sBenchRoute)[3];
+static u32 sBenchRouteCount, sBenchLeg;
+static f32 sBenchSpeed;
+static u8 sBenchFlying, sBenchDone;
+
+// act_debug_free_move: the position to fly to this tick. Returns FALSE when not flying.
+int dc_bench_fly(Vec3f pos, s16 *yaw) {
+    if (!sBenchFlying || sBenchLeg >= sBenchRouteCount) {
+        return sBenchFlying;
+    }
+    f32 dx = sBenchRoute[sBenchLeg][0] - pos[0];
+    f32 dy = sBenchRoute[sBenchLeg][1] - pos[1];
+    f32 dz = sBenchRoute[sBenchLeg][2] - pos[2];
+    f32 dist = sqrtf(dx * dx + dy * dy + dz * dz);
+    if (dist <= sBenchSpeed) {
+        pos[0] += dx;
+        pos[1] += dy;
+        pos[2] += dz;
+        if (++sBenchLeg >= sBenchRouteCount) sBenchDone = 1;
+    } else {
+        f32 k = sBenchSpeed / dist;
+        pos[0] += dx * k;
+        pos[1] += dy * k;
+        pos[2] += dz * k;
+    }
+    *yaw = atan2s(dz, dx);
+    return TRUE;
+}
+
+static void bench_route_start(void) {
+    sBenchRoute = NULL;
+    sBenchRouteCount = sBenchLeg = 0;
+    for (u32 i = 0; i < ARRAY_COUNT(sBenchPaths); i++) {
+        if (sBenchPaths[i].level == gCurrLevelNum) {
+            sBenchRoute = sBenchPaths[i].points;
+            sBenchRouteCount = sBenchPaths[i].count;
+        }
+    }
+    if (sBenchRoute == NULL || gMarioState->marioObj == NULL) return;
+    f32 length = 0.0f;
+    for (u32 i = 1; i < sBenchRouteCount; i++) {
+        f32 dx = sBenchRoute[i][0] - sBenchRoute[i - 1][0], dy = sBenchRoute[i][1] - sBenchRoute[i - 1][1];
+        f32 dz = sBenchRoute[i][2] - sBenchRoute[i - 1][2];
+        length += sqrtf(dx * dx + dy * dy + dz * dz);
+    }
+    sBenchSpeed = length / 1200.0f;
+    if (sBenchSpeed < 16.0f) sBenchSpeed = 16.0f;
+    if (sBenchSpeed > 120.0f) sBenchSpeed = 120.0f;
+    sBenchLeg = 1;   // point 0 is Mario's start
+    sBenchFlying = 1;
+    set_mario_action(gMarioState, ACT_DEBUG_FREE_MOVE, 0);
+}
 
 static int bench_demo_inputs(void) {
-    static u32 tick;
+    static u32 tick, doneAt;
     OSContPad *pad = gControllers[0].controllerData;
     if (gCurrDemoInput == NULL) {
-        tick = 0;
+        tick = doneAt = 0;
         gDcBenchYaw = 0;
         gDcBenchZoom = 1.0f;
+        sBenchFlying = sBenchDone = 0;
         return FALSE;
     }
     u32 t = tick++;
     pad->stick_x = 0;
     pad->stick_y = 0;
+    pad->button = 0;
+    if (t == 90) bench_route_start();
+    if (sBenchFlying) {
+        if (sBenchDone && !doneAt) doneAt = t;
+        if ((doneAt && t >= doneAt + 30) || t >= 1800) pad->button = END_DEMO;
+        return TRUE;
+    }
     pad->button = t >= 480 ? END_DEMO : 0;
     gDcBenchYaw = t < 90 ? 0 : (s16) ((t - 90) * 65536 / 180);
     gDcBenchZoom = t < 270 ? 1.0f : 1.6f;
