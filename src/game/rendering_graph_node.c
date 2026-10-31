@@ -157,6 +157,10 @@ static Vp sPrevViewport;
 s32 mtx_patch_interpolated(void) {
     s32 i;
     s32 changed = sViewportPos != NULL;
+    extern s32 gd_interp_exact(void);
+
+    // The goddard head's vertices too (goddard/skin.c): the step's own back for the second draw.
+    changed |= gd_interp_exact();
 
     if (sPerspectivePos != NULL && !changed) {
         changed = memcmp((const void *) (uintptr_t) sPerspectivePos->words.w1, sPerspectiveMtx, sizeof(Mtx)) != 0;
