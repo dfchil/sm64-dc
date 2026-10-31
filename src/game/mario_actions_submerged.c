@@ -439,7 +439,7 @@ static void common_swimming_step(struct MarioState *m, s16 swimStrength) {
 
     update_swimming_yaw(m);
     update_swimming_pitch(m);
-    update_swimming_speed(m, swimStrength * 0.1f); // / 10.0f);
+    update_swimming_speed(m, swimStrength / 10.0f);
 
     switch (perform_water_step(m)) {
         case WATER_STEP_HIT_FLOOR:

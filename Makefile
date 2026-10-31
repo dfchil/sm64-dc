@@ -616,6 +616,11 @@ endif
 # hot sections. DC_SHZ_FIPR=1 brings back FIPR dot products (SHZ_SH4_DOT_FIPR; 0.10 uses
 # fmul/fadd), but that code does not fit them either (.sub2 over the I-cache size).
 DC_SHZ_FSCA ?= 1
+# DC_TRIG_TABLE=1 (default): sins/coss/sincoss from the game's sine table as on the N64, so game
+# logic is frame-exact with the original (an N64 TAS plays the same); 0 uses FSCA, faster but its
+# values differ slightly (src/engine/math_util.c, include/sh4zam_port.h).
+DC_TRIG_TABLE ?= 1
+PLATFORM_CFLAGS += -DDC_TRIG_TABLE=$(DC_TRIG_TABLE)
 PLATFORM_CFLAGS += -DDC_SHZ_FSCA=$(DC_SHZ_FSCA)
 DC_SHZ_FIPR ?= 0
 ifeq ($(DC_SHZ_FIPR),1)
@@ -711,8 +716,9 @@ endif
   # DC_SM_WARM_SET.. by an ld ordering file. .sub1 starts one I-cache size after .sub0, so the offset
   # into .sub1 is the I-cache index. Pick the set from samples: lines .sub0 leaves cold.
   DC_SM_WARM_SET ?= 174
-  # tri_state_setup in .sub2 at I-cache set DC_SM_WARM2_SET (gfx_retro_dc.c SM_WARM2).
-  DC_SM_WARM2_SET ?= 126
+  # tri_state_setup in .sub2 at I-cache set DC_SM_WARM2_SET (gfx_retro_dc.c SM_WARM2). It is ~4.1 KB
+  # and must end within .sub2's 8 KB: set 126 left 24 bytes, too few once it grew to 0x1048.
+  DC_SM_WARM2_SET ?= 122
   # The renderer's hot data (.data.sm64_hot: rsp, rdp, sTri, the vertex bake buffers) at a fixed
   # offset from .sub0 mod the 16 KB operand cache, so it keeps its O-cache sets relative to the hot
   # code and its literal pools when code or .rodata grows (.sub0 moves in 8 KB steps). It goes into
@@ -1190,6 +1196,15 @@ $(BUILD_DIR)/src/pc/gfx/gfx_pvr.o: CFLAGS += -O3
 # bhv_haunted_chair_loop above -Os, so keep this file at -Os whatever DC_OPT is (and out of
 # LTO, which would otherwise recompile it at the link-time level).
 $(BUILD_DIR)/src/game/obj_behaviors_2.o: CFLAGS += -Os -fno-lto
+# DC_EXACT_LOGIC=1: the game logic (src/game, src/engine) without the float shortcuts the rest of
+# the build takes (-ffast-math reorders, -ffp-contract=fast fuses multiply-add into FMAC, rounding
+# once where the N64 rounds twice; -fsingle-precision-constant makes the double constants float),
+# so it computes what the N64 does and an N64 TAS stays in sync. Delete src/game and src/engine
+# objects when switching; make does not track flags.
+DC_EXACT_LOGIC ?= 0
+ifeq ($(DC_EXACT_LOGIC),1)
+$(BUILD_DIR)/src/game/%.o $(BUILD_DIR)/src/engine/%.o: CFLAGS += -fno-fast-math -ffp-contract=off -fno-single-precision-constant -DDC_EXACT_MATH=1
+endif
 # Bisection aid: these sources (e.g. DC_OS_FILES="src/goddard/objects.c") are built at -Os
 # whatever DC_OPT is. Delete their .o files when the list changes; make does not track flags.
 DC_OS_FILES ?=

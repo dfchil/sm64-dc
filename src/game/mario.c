@@ -1230,9 +1230,9 @@ void squish_mario_model(struct MarioState *m) {
             m->squishTimer -= 1;
 
             m->marioObj->header.gfx.scale[1] =
-                1.0f - ((sSquishScaleOverTime[15 - m->squishTimer] * 0.6f) * 0.01f); // / 100.0f);
+                1.0f - ((sSquishScaleOverTime[15 - m->squishTimer] * 0.6f) / 100.0f);
             m->marioObj->header.gfx.scale[0] =
-                ((sSquishScaleOverTime[15 - m->squishTimer] * 0.4f) * 0.01f /* / 100.0f */) + 1.0f;
+                ((sSquishScaleOverTime[15 - m->squishTimer] * 0.4f) / 100.0f) + 1.0f;
 
             m->marioObj->header.gfx.scale[2] = m->marioObj->header.gfx.scale[0];
         } else {

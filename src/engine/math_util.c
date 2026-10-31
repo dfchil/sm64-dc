@@ -125,10 +125,18 @@ void vec3f_normalize(Vec3f dest) {
 //    dest[0] *= invsqrt;
 //    dest[1] *= invsqrt;
 //    dest[2] *= invsqrt;
+#if DC_EXACT_MATH
+    // The N64's arithmetic (sh4zam's normalize scales by an approximate reciprocal square root).
+    f32 invsqrt = 1.0f / sqrtf(dest[0] * dest[0] + dest[1] * dest[1] + dest[2] * dest[2]);
+    dest[0] *= invsqrt;
+    dest[1] *= invsqrt;
+    dest[2] *= invsqrt;
+#else
     shz_vec3_t out = shz_vec3_normalize(shz_vec3_deref(dest));
     dest[0] = out.x;
     dest[1] = out.y;
     dest[2] = out.z;
+#endif
 }
 
 /// Copy matrix 'src' to 'dest'
@@ -178,8 +186,11 @@ void mtxf_translate(Mat4 dest, Vec3f b) {
     //dest[3][2] = b[2];
 }
 
-f32 sins(u16 arg0) {
-#if 0
+// DC_TRIG_TABLE=1 (default): the game's own tables, as on the N64, so that game logic (Mario's
+// movement, the camera, objects) computes exactly what the original does; 0 takes FSCA's values
+// (sinf with -mfsca), which differ slightly and make e.g. an N64 TAS drift.
+f32 (sins)(u16 arg0) {
+#if DC_TRIG_TABLE
     return gSineTable[arg0 >> 4];
 #else
     float farg0 = (float)arg0 * TRIG_ARG_SCALE;
@@ -187,8 +198,8 @@ f32 sins(u16 arg0) {
 #endif
 }
 
-f32 coss(u16 arg0) {
-#if 0
+f32 (coss)(u16 arg0) {
+#if DC_TRIG_TABLE
     return gCosineTable[arg0 >> 4];
 #else
     float farg0 = (float)arg0 * TRIG_ARG_SCALE;
@@ -483,7 +494,7 @@ void mtxf_align_terrain_triangle(Mat4 mtx, Vec3f pos, s16 yaw, f32 radius) {
         point2[1] = pos[1];
     }
 
-    avgY = (point0[1] + point1[1] + point2[1]) * 0.3333f; // / 3;
+    avgY = (point0[1] + point1[1] + point2[1]) / 3;
 
     vec3f_set(forward, ys, 0, yc); // sins(yaw), 0, coss(yaw));
     find_vector_perpendicular_to_plane(yColumn, point0, point1, point2);
@@ -525,7 +536,28 @@ void mtxf_align_terrain_triangle(Mat4 mtx, Vec3f pos, s16 yaw, f32 radius) {
 #define MEM_BARRIER() asm volatile("" : : : "memory");
 
 void mtxf_mul(Mat4 dest, Mat4 a, Mat4 b) {
-#if 1
+#if DC_EXACT_MATH
+    // The N64's sums in the N64's order (FTRV keeps its own precision). Through a temporary, as
+    // dest may be a or b.
+    Mat4 temp;
+    s32 i, j;
+    for (i = 0; i < 4; i++) {
+        f32 entry0 = a[i][0];
+        f32 entry1 = a[i][1];
+        f32 entry2 = a[i][2];
+        for (j = 0; j < 3; j++) {
+            temp[i][j] = entry0 * b[0][j] + entry1 * b[1][j] + entry2 * b[2][j];
+            if (i == 3) {
+                temp[i][j] += b[3][j];
+            }
+        }
+    }
+    for (i = 0; i < 4; i++) {
+        for (j = 0; j < 3; j++) {
+            dest[i][j] = temp[i][j];
+        }
+    }
+#elif 1
     shz_xmtrx_load_unaligned_4x4((const float*)b);
     shz_xmtrx_apply_unaligned_4x4((const float *)a);
     shz_xmtrx_store_unaligned_4x4((float *)dest);
@@ -561,6 +593,15 @@ void mtxf_scale_vec3f(Mat4 dest, Mat4 mtx, Vec3f s) {
  * true for transformation matrices if the translation has a w component of 1.
  */
 void mtxf_mul_vec3s(Mat4 mtx, Vec3s b) {
+#if DC_EXACT_MATH
+    f32 x = b[0];
+    f32 y = b[1];
+    f32 z = b[2];
+
+    b[0] = x * mtx[0][0] + y * mtx[1][0] + z * mtx[2][0] + mtx[3][0];
+    b[1] = x * mtx[0][1] + y * mtx[1][1] + z * mtx[2][1] + mtx[3][1];
+    b[2] = x * mtx[0][2] + y * mtx[1][2] + z * mtx[2][2] + mtx[3][2];
+#else
     shz_xmtrx_load_unaligned_4x4((const float *)mtx);
 
     register f32 x = b[0];
@@ -571,6 +612,7 @@ void mtxf_mul_vec3s(Mat4 mtx, Vec3s b) {
     b[0] = out.x;
     b[1] = out.y;
     b[2] = out.z;
+#endif
 
 //    b[0] = x * mtx[0][0] + y * mtx[1][0] + z * mtx[2][0] + mtx[3][0];
 //    b[1] = x * mtx[0][1] + y * mtx[1][1] + z * mtx[2][1] + mtx[3][1];
@@ -923,7 +965,7 @@ s32 anim_spline_poll(Vec3f result) {
         result[2] += weights[i] * gSplineKeyframe[i][3];
     }
 
-    if ((gSplineKeyframeFraction += gSplineKeyframe[0][0]*0.001f  /* / 1000.0f */) >= 1) {
+    if ((gSplineKeyframeFraction += gSplineKeyframe[0][0] / 1000.0f) >= 1) {
         gSplineKeyframe++;
         gSplineKeyframeFraction--;
         switch (gSplineState) {

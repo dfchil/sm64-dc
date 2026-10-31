@@ -330,7 +330,7 @@ static void chain_chomp_released_break_gate(void) {
         o->oHomeX = 3288.0f;
         o->oHomeZ = -1770.0f;
         o->oMoveAngleYaw = cur_obj_angle_to_home();
-        o->oForwardVel = cur_obj_lateral_dist_to_home() * 0.02f; // / 50.0f;
+        o->oForwardVel = cur_obj_lateral_dist_to_home() / 50.0f;
         o->oVelY = 120.0f;
     }
 }

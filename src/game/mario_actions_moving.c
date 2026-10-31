@@ -213,9 +213,8 @@ void update_sliding_angle(struct MarioState *m, f32 accel, f32 lossFactor) {
     //! Speed is capped a frame late (butt slide HSG)
     m->forwardVel = shz_sqrtf(m->slideVelX * m->slideVelX + m->slideVelZ * m->slideVelZ);
     if (m->forwardVel > 100.0f) {
-        f32 invspeed = shz_divf(100.0f, m->forwardVel);
-        m->slideVelX = m->slideVelX * invspeed; // 100.0f / m->forwardVel;
-        m->slideVelZ = m->slideVelZ * invspeed; // 100.0f / m->forwardVel;
+        m->slideVelX = m->slideVelX * 100.0f / m->forwardVel;
+        m->slideVelZ = m->slideVelZ * 100.0f / m->forwardVel;
     }
 
     if (newFacingDYaw < -0x4000 || newFacingDYaw > 0x4000) {
@@ -239,7 +238,7 @@ s32 update_sliding(struct MarioState *m, f32 stopSpeed) {
 
     //! 10k glitch
     if (forward < 0.0f && m->forwardVel >= 0.0f) {
-        forward *= 0.5f + 0.5f * m->forwardVel * 0.01f; // / 100.0f;
+        forward *= 0.5f + 0.5f * m->forwardVel / 100.0f;
     }
 
     switch (mario_get_floor_class(m)) {
@@ -275,9 +274,8 @@ s32 update_sliding(struct MarioState *m, f32 stopSpeed) {
     newSpeed = shz_sqrtf(m->slideVelX * m->slideVelX + m->slideVelZ * m->slideVelZ);
 
     if (oldSpeed > 0.0f && newSpeed > 0.0f) {
-        f32 speedratio = shz_divf(oldSpeed, newSpeed);
-        m->slideVelX = m->slideVelX * speedratio; // oldSpeed / newSpeed;
-        m->slideVelZ = m->slideVelZ * speedratio; // oldSpeed / newSpeed;
+        m->slideVelX = m->slideVelX * oldSpeed / newSpeed;
+        m->slideVelZ = m->slideVelZ * oldSpeed / newSpeed;
     }
 
     update_sliding_angle(m, accel, lossFactor);
@@ -357,7 +355,6 @@ s32 apply_landing_accel(struct MarioState *m, f32 frictionFactor) {
 
     return stopped;
 }
-#define recip58 0.01724138f
 void update_shell_speed(struct MarioState *m) {
     f32 maxTargetSpeed;
     f32 targetSpeed;
@@ -385,7 +382,7 @@ void update_shell_speed(struct MarioState *m) {
     if (m->forwardVel <= 0.0f) {
         m->forwardVel += 1.1f;
     } else if (m->forwardVel <= targetSpeed) {
-        m->forwardVel += 1.1f - m->forwardVel * recip58;
+        m->forwardVel += 1.1f - m->forwardVel / 58.0f;
     } else if (m->floor->normal.y >= 0.95f) {
         m->forwardVel -= 1.0f;
     }
@@ -441,7 +438,6 @@ s32 update_decelerating_speed(struct MarioState *m) {
 
     return stopped;
 }
-#define recip43 0.02325581f
 void update_walking_speed(struct MarioState *m) {
     f32 maxTargetSpeed;
     f32 targetSpeed;
@@ -455,13 +451,13 @@ void update_walking_speed(struct MarioState *m) {
     targetSpeed = m->intendedMag < maxTargetSpeed ? m->intendedMag : maxTargetSpeed;
 
     if (m->quicksandDepth > 10.0f) {
-        targetSpeed *= shz_divf(6.25f , m->quicksandDepth);
+        targetSpeed *= 6.25 / m->quicksandDepth;
     }
 
     if (m->forwardVel <= 0.0f) {
         m->forwardVel += 1.1f;
     } else if (m->forwardVel <= targetSpeed) {
-        m->forwardVel += 1.1f - m->forwardVel * recip43; // / 43.0f;
+        m->forwardVel += 1.1f - m->forwardVel / 43.0f;
     } else if (m->floor->normal.y >= 0.95f) {
         m->forwardVel -= 1.0f;
     }
@@ -731,7 +727,7 @@ void tilt_body_walking(struct MarioState *m, s16 startYaw) {
         dYaw = m->faceAngle[1] - startYaw;
         //! (Speed Crash) These casts can cause a crash if (dYaw * forwardVel / 12) or
         //! (forwardVel * 170) exceed or equal 2^31.
-        val02 = -(s16)(dYaw * m->forwardVel * 0.08333333f); // / 12.0f);
+        val02 = -(s16)(dYaw * m->forwardVel / 12.0f);
         val00 = (s16)(m->forwardVel * 170.0f);
 
         if (val02 > 0x1555) {
@@ -764,7 +760,7 @@ void tilt_body_ground_shell(struct MarioState *m, s16 startYaw) {
     //! (Speed Crash) These casts can cause a crash if (dYaw * forwardVel / 12) or
     //! (forwardVel * 170) exceed or equal 2^31. Harder (if not impossible to do)
     //! while on a Koopa Shell making this less of an issue.
-    s16 val04 = -(s16)(dYaw * m->forwardVel * 0.08333333f); // / 12.0f);
+    s16 val04 = -(s16)(dYaw * m->forwardVel / 12.0f);
     s16 val02 = (s16)(m->forwardVel * 170.0f);
 
     if (val04 > 0x1800) {
@@ -1416,7 +1412,7 @@ void common_slide_action(struct MarioState *m, u32 endAction, u32 airAction, s32
                 s16 wallAngle = atan2s(m->wall->normal.z, m->wall->normal.x);
                 f32 slideSpeed = shz_sqrtf(m->slideVelX * m->slideVelX + m->slideVelZ * m->slideVelZ);
 
-                if ((slideSpeed *= 0.9f) < 4.0f) {
+                if ((slideSpeed *= 0.9) < 4.0f) {
                     slideSpeed = 4.0f;
                 }
 

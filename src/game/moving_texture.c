@@ -313,7 +313,7 @@ Gfx *geo_wdw_set_initial_water_level(s32 callContext, UNUSED struct GraphNode *n
         gWdwWaterLevelSet = 0;
     } else if (callContext == GEO_CONTEXT_RENDER && gEnvironmentRegions != NULL
                && gWdwWaterLevelSet == 0) {
-        if (gPaintingMarioYEntry <= 1382.4f) {
+        if (gPaintingMarioYEntry <= 1382.4) {
             wdwWaterHeight = 31;
         } else if (gPaintingMarioYEntry >= 1600.0f) {
             wdwWaterHeight = 2816;

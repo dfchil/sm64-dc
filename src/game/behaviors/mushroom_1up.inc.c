@@ -144,7 +144,7 @@ void sliding_1up_move(void) {
         o->oForwardVel += 25.0f;
         o->oVelY = 0;
     } else {
-        o->oForwardVel *= 0.98f;
+        o->oForwardVel *= 0.98;
     }
 
     if (o->oForwardVel > 40.0)
