@@ -214,6 +214,58 @@ void *sTextureTransitionID[] = {
     texture_transition_bowser_half,
 };
 
+#if defined(TARGET_DC) && DC_COVERS && DC_MASK_MESH
+// The masks as polygons (tools/dc_mask_mesh.py): what is solid in the texture goes to the OP list as
+// a cover, a soft ring around the hole to TR, and over the hole nothing is drawn. The textured square
+// is a blended layer in every tile it touches, twice as many with FSAA, and most of it adds nothing.
+#include "screen_transition_mesh.h"
+
+static const Gfx *const sTransitionMesh[][2] = {
+    { dl_mask_star_cover, dl_mask_star_feather },
+    { dl_mask_circle_cover, dl_mask_circle_feather },
+    { dl_mask_mario_cover, dl_mask_mario_feather },
+    { dl_mask_bowser_cover, dl_mask_bowser_feather },
+};
+
+// The transition's square: the mesh's -MASK_MESH_ONE..MASK_MESH_ONE, turned and placed as
+// make_tex_transition_vertex does.
+static void mtx_transition_mesh(Mtx *mtx, s8 fadeTimer, s16 centerTransX, s16 centerTransY, s16 texTransRadius) {
+    u16 angle = sTransitionTextureFadeCount[fadeTimer];
+    f32 scale = texTransRadius / (f32) MASK_MESH_ONE;
+    Mat4 m;
+
+    mtxf_identity(m);
+    m[0][0] = scale * coss(angle);
+    m[0][1] = scale * sins(angle);
+    m[1][0] = -m[0][1];
+    m[1][1] = m[0][0];
+    m[3][0] = centerTransX;
+    m[3][1] = centerTransY;
+    mtxf_to_mtx(mtx, m);
+}
+
+static void render_transition_mesh(Vtx *verts, Mtx *mtx, struct WarpTransitionData *transData, s16 texTransRadius, s8 texID) {
+    gSPDisplayList(gDisplayListHead++, dl_proj_mtx_fullscreen);
+    // The primitive colour, as the mesh's vertices only hold alpha (the star that opens a level from
+    // the file select is white).
+    gDPSetCombineLERP(gDisplayListHead++, 0, 0, 0, PRIMITIVE, 0, 0, 0, SHADE, 0, 0, 0, PRIMITIVE, 0, 0, 0, SHADE);
+    gDPSetPrimColor(gDisplayListHead++, 0, 0, transData->red, transData->green, transData->blue, 255);
+    gDPSetRenderMode(gDisplayListHead++, G_RM_AA_XLU_SURF, G_RM_AA_XLU_SURF2);
+    gSPVertex(gDisplayListHead++, VIRTUAL_TO_PHYSICAL(verts), 8, 0);
+    gDPNoOpTag(gDisplayListHead++, DC_GFX_COVER_BEGIN);
+    gSPDisplayList(gDisplayListHead++, dl_transition_draw_filled_region);
+    if (texTransRadius > 0) {
+        gSPMatrix(gDisplayListHead++, VIRTUAL_TO_PHYSICAL(mtx), G_MTX_MODELVIEW | G_MTX_LOAD | G_MTX_NOPUSH);
+        gSPDisplayList(gDisplayListHead++, sTransitionMesh[texID][0]);
+    }
+    gDPNoOpTag(gDisplayListHead++, DC_GFX_COVER_END);
+    if (texTransRadius > 0) {
+        gSPDisplayList(gDisplayListHead++, sTransitionMesh[texID][1]);
+    }
+    gSPDisplayList(gDisplayListHead++, dl_screen_transition_end);
+}
+#endif
+
 s32 render_textured_transition(s8 fadeTimer, s8 transTime, struct WarpTransitionData *transData, s8 texID, s8 transTexType) {
     f32 texTransTime = calc_tex_transition_time(fadeTimer, transTime, transData);
     u16 texTransPos = convert_tex_transition_angle_to_pos(transData);
@@ -222,6 +274,21 @@ s32 render_textured_transition(s8 fadeTimer, s8 transTime, struct WarpTransition
     s16 texTransRadius = calc_tex_transition_radius(fadeTimer, transTime, transData);
     Vtx *verts = alloc_display_list(8 * sizeof(*verts));
 
+#if defined(TARGET_DC) && DC_COVERS && DC_MASK_MESH
+    {
+        Mtx *mtx = alloc_display_list(sizeof(*mtx));
+
+        if (verts != NULL && mtx != NULL) {
+            // The fill stops a pixel inside the mesh's square, so no gap opens between them.
+            load_tex_transition_vertex(verts, fadeTimer, transData, centerTransX, centerTransY,
+                                       texTransRadius > 0 ? texTransRadius - 1 : 0, transTexType);
+            mtx_transition_mesh(mtx, fadeTimer, centerTransX, centerTransY, texTransRadius);
+            render_transition_mesh(verts, mtx, transData, texTransRadius, texID);
+            sTransitionTextureFadeCount[fadeTimer] += transData->texTimer;
+        }
+        return set_and_reset_transition_fade_timer(fadeTimer, transTime);
+    }
+#endif
     if (verts != NULL) {
         load_tex_transition_vertex(verts, fadeTimer, transData, centerTransX, centerTransY, texTransRadius, transTexType);
         gSPDisplayList(gDisplayListHead++, dl_proj_mtx_fullscreen)

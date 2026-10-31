@@ -43,6 +43,7 @@ enum DcProfCount {
 #ifdef DC_PROF
 extern unsigned int gDcProfCount[DCC_COUNT];
 #define DC_PROF_COUNT(c, n) (gDcProfCount[c] += (n))
+extern unsigned int gDcProfSceneTag;   // DC_PROF_TRANS: added to the frame's area (area.c)
 void dc_prof_mark(int mark);
 void dc_prof_frame_end(void);
 void dc_prof_request_exit(void);

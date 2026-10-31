@@ -398,7 +398,35 @@ static void draw_credits_window_mask(Vp *window) {
     gDPSetCycleType(gDisplayListHead++, G_CYC_1CYCLE);   // restore for the 2D text/HUD below
 }
 
+#ifdef DC_PROF_TRANS
+#include "pc/dc_prof.h"
+// The benchmark: every textured transition in turn, closing then opening over the running demo.
+static void prof_trans_step(void) {
+    static const u8 types[] = { WARP_TRANSITION_FADE_INTO_STAR, WARP_TRANSITION_FADE_FROM_STAR,
+                                WARP_TRANSITION_FADE_INTO_CIRCLE, WARP_TRANSITION_FADE_FROM_CIRCLE,
+                                WARP_TRANSITION_FADE_INTO_MARIO, WARP_TRANSITION_FADE_FROM_MARIO,
+                                WARP_TRANSITION_FADE_INTO_BOWSER, WARP_TRANSITION_FADE_FROM_BOWSER };
+    static u32 step, gap;
+
+    if (gWarpTransition.isActive || gCurrDemoInput == NULL) {
+        return;
+    }
+    gWarpTransition.pauseRendering = FALSE;
+    gDcProfSceneTag = 0;
+    if (++gap >= 60) {
+        u32 t = step++ % ARRAY_COUNT(types);
+
+        gap = 0;
+        play_transition(types[t], 45, 0, 0, 0);
+        gDcProfSceneTag = 16 * (t & 1 ? (t >> 1) + 5 : (t >> 1) + 1);
+    }
+}
+#endif
+
 void render_game(void) {
+#ifdef DC_PROF_TRANS
+    prof_trans_step();
+#endif
     if (gCurrentArea != NULL && !gWarpTransition.pauseRendering) {
         geo_process_root(gCurrentArea->unk04, D_8032CE74, D_8032CE78, gFBSetColor);
 

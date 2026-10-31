@@ -98,7 +98,12 @@ typedef struct {
     uint16_t max[C_COUNT];
 } SceneStats;
 
+#ifdef DC_PROF_TRANS
+#define MAX_SCENES 192   // nine per level
+#else
 #define MAX_SCENES 64
+#endif
+unsigned int gDcProfSceneTag;
 static SceneStats sScenes[MAX_SCENES];
 
 unsigned int gDcProfCount[DCC_COUNT];
@@ -646,7 +651,7 @@ void dc_prof_frame_end(void) {
         FrameRec overflow;
         FrameRec *r = sFrameCount < MAX_FRAMES ? &sFrames[sFrameCount] : &overflow;
         uint16_t demo = gCurrDemoInput != NULL ? 0x8000 : 0;
-        r->scene = demo | ((gCurrLevelNum & 0x7F) << 8) | (gCurrAreaIndex & 0xFF);
+        r->scene = demo | ((gCurrLevelNum & 0x7F) << 8) | ((gCurrAreaIndex + gDcProfSceneTag) & 0xFF);
         r->fields = (uint8_t) (vbl - sLastVbl > 255 ? 255 : vbl - sLastVbl);
         r->vtx_kb = (uint8_t) (st.vtx_buffer_used / 1024 > 255 ? 255 : st.vtx_buffer_used / 1024);
         r->us[C_TOTAL] = clamp16(end - sFrameStart);

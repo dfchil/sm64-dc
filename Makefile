@@ -654,6 +654,12 @@ ifeq ($(DC_PROF),1)
   ifdef DC_SAMPLE_HZ
     PLATFORM_CFLAGS += -DDC_SAMPLE_HZ=$(DC_SAMPLE_HZ) -DDC_SAMPLE_CAP=$(DC_SAMPLE_CAP)
   endif
+  # DC_PROF_TRANS=1: every textured screen transition in turn during the demos, with a gap between
+  # them. Their frames are reported as scenes of their own: area = 16 * n + area, n = 1..8 for
+  # star, circle, Mario and Bowser closing, then opening (area.c).
+  ifeq ($(DC_PROF_TRANS),1)
+    PLATFORM_CFLAGS += -DDC_PROF_TRANS
+  endif
   # DC_PROF_TITLE=1: keep the normal title wait before the demos (profile the Mario head screen)
   ifeq ($(DC_PROF_TITLE),1)
     PLATFORM_CFLAGS += -DDC_PROF_TITLE
@@ -747,6 +753,10 @@ endif
   # (src/pc/gfx/gfx_dc_tags.h), for A/B runs.
   DC_COVERS ?= 1
   PLATFORM_CFLAGS += -DDC_COVERS=$(DC_COVERS)
+  # DC_MASK_MESH=0: the star, circle, Mario and Bowser transitions keep their textured square instead
+  # of the polygon meshes in src/game/screen_transition_mesh.h (they need DC_COVERS), for A/B runs.
+  DC_MASK_MESH ?= 1
+  PLATFORM_CFLAGS += -DDC_MASK_MESH=$(DC_MASK_MESH)
   PLATFORM_LDFLAGS += -Wl,--section-ordering-file=$(BUILD_DIR)/sm_warm.ld
   # DC_AICAFLOW=1: music and sounds as AICAflow assets (src/pc/audio/sm64_aicaflow.c) from
   # DC_AICAFLOW_ROOT (default /pc/afx), made by tools/aica/sm64_afx.py. No sequencer thread, no
