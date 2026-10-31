@@ -163,6 +163,13 @@ static uint8_t color_combiner_pool_size;
 #else
 #define SM_HOT __attribute__((section(".sub0.sm64_hot")))
 #endif
+// DC_NATIVE: most vertices load through the native renderer's own loops (native/gfx_native.inc.c),
+// which take these functions' place in .sub0.
+#if DC_NATIVE
+#define SM_HOT_VTX
+#else
+#define SM_HOT_VTX SM_HOT
+#endif
 // Hot code that does not fit in .sub0 (cc_eval_float: ~20% of title-screen display-list
 // samples, goddard's combiners). Left in .text it lands wherever LTO puts it; one renderer edit
 // moved it onto gfx_sp_tri1 and title I-cache stalls went 8.7% -> 22.3% of display-list cycles.
@@ -500,7 +507,14 @@ static struct ColorCombiner *gfx_lookup_or_create_color_combiner(uint32_t cc_id)
 
 void gfx_clear_texidx(unsigned int texidx);
 
+#if DC_NATIVE
+static uint32_t sNatGen;   // native/gfx_native.inc.c
+#endif
+
 void reset_texcache(void) {
+#if DC_NATIVE
+    sNatGen++;   // the compiled display lists' headers point at the old textures
+#endif
     gfx_texture_cache.pool_pos = 0;
     memset(&gfx_texture_cache, 0, sizeof(gfx_texture_cache));
 }
@@ -943,30 +957,44 @@ static void  __attribute__((noinline)) gfx_sp_vertex_no(size_t n_vertices, size_
 static void  __attribute__((noinline)) gfx_sp_vertex_light(size_t n_vertices, size_t dest_index, const Vtx *vertices);
 
 
-static void SM_HOT __attribute__((noinline)) gfx_sp_vertex(size_t n_vertices, size_t dest_index, const Vtx *vertices) {
+// The lights in the form the vertex loops read: directions into model space (per modelview) and
+// colours as floats.
+static inline void gfx_vertex_lights_prep(void) {
+    if (rsp.lights_changed) {
+        int i;
+        for (i = 0; i < rsp.current_num_lights - 1; i++) {
+            calculate_normal_dir(&rsp.current_lights[i], rsp.current_lights_coeffs[i]);
+        }
+        calculate_normal_dir(&rsp.current_lookat[0], rsp.current_lookat_coeffs[0]);
+        calculate_normal_dir(&rsp.current_lookat[1], rsp.current_lookat_coeffs[1]);
+        rsp.lights_changed = false;
+    }
+    if (rsp.light_cols_changed) {
+        int i;
+        for (i = 0; i < rsp.current_num_lights; i++) {
+            // The ambient light (last) adds as is; directional ones scale by the N.L dot of the
+            // normal, whose components are in 1/127 units.
+            float scale = (i == rsp.current_num_lights - 1) ? 1.0f : recip127;
+            rsp.current_lights_colf[i][0] = rsp.current_lights[i].col[0] * scale;
+            rsp.current_lights_colf[i][1] = rsp.current_lights[i].col[1] * scale;
+            rsp.current_lights_colf[i][2] = rsp.current_lights[i].col[2] * scale;
+        }
+        rsp.light_cols_changed = false;
+    }
+}
+
+#if DC_NATIVE
+static int nat_vertex_from_vtx(size_t n, size_t dest, const Vtx *vertices);   // native/gfx_native.inc.c
+#endif
+
+static void SM_HOT_VTX __attribute__((noinline)) gfx_sp_vertex(size_t n_vertices, size_t dest_index, const Vtx *vertices) {
+#if DC_NATIVE
+    // The native renderer's vertex loops, which stay in the instruction cache.
+    if (nat_vertex_from_vtx(n_vertices, dest_index, vertices)) return;
+#endif
     shz_xmtrx_load_4x4((const shz_mat4x4_t *)&rsp.MP_matrix);
     if (rsp.geometry_mode & G_LIGHTING) {
-        if (rsp.lights_changed) {
-            int i;
-            for (i = 0; i < rsp.current_num_lights - 1; i++) {
-                calculate_normal_dir(&rsp.current_lights[i], rsp.current_lights_coeffs[i]);
-            }
-            calculate_normal_dir(&rsp.current_lookat[0], rsp.current_lookat_coeffs[0]);
-            calculate_normal_dir(&rsp.current_lookat[1], rsp.current_lookat_coeffs[1]);
-            rsp.lights_changed = false;
-        }
-        if (rsp.light_cols_changed) {
-            int i;
-            for (i = 0; i < rsp.current_num_lights; i++) {
-                // The ambient light (last) adds as is; directional ones scale by the N.L dot of the
-                // normal, whose components are in 1/127 units.
-                float scale = (i == rsp.current_num_lights - 1) ? 1.0f : recip127;
-                rsp.current_lights_colf[i][0] = rsp.current_lights[i].col[0] * scale;
-                rsp.current_lights_colf[i][1] = rsp.current_lights[i].col[1] * scale;
-                rsp.current_lights_colf[i][2] = rsp.current_lights[i].col[2] * scale;
-            }
-            rsp.light_cols_changed = false;
-        }
+        gfx_vertex_lights_prep();
         gfx_sp_vertex_light(n_vertices, dest_index, vertices);
     } else {
         gfx_sp_vertex_no(n_vertices, dest_index, vertices);
@@ -977,7 +1005,7 @@ static void SM_HOT __attribute__((noinline)) gfx_sp_vertex(size_t n_vertices, si
     }
 }
 
-static void SM_HOT __attribute__((noinline)) gfx_sp_vertex_light(size_t n_vertices, size_t dest_index, const Vtx *vertices) {
+static void SM_HOT_VTX __attribute__((noinline)) gfx_sp_vertex_light(size_t n_vertices, size_t dest_index, const Vtx *vertices) {
     size_t i;
     // The batch's lights in locals: the loop stores into rsp.loaded_vertices, which GCC must assume
     // may alias rsp.current_lights_*, so reading them from rsp would reload them per vertex.
@@ -1091,7 +1119,7 @@ static void SM_HOT __attribute__((noinline)) gfx_sp_vertex_light(size_t n_vertic
     }
 }
 
-static void SM_HOT __attribute__((noinline)) gfx_sp_vertex_no(size_t n_vertices, size_t dest_index, const Vtx *vertices) {
+static void SM_HOT_VTX __attribute__((noinline)) gfx_sp_vertex_no(size_t n_vertices, size_t dest_index, const Vtx *vertices) {
     size_t i;
 
 	for (i = 0; i < n_vertices; i++, dest_index++) {
@@ -1894,11 +1922,25 @@ static inline void tri_bake_vertex(dc_fast_t *bv, const struct LoadedVertex *v) 
     bv->pad0.vertindex = oargb | ((uint32_t) v->fog << 24);
 }
 
+#if DC_NATIVE
+// DC_NATIVE: baked out of line, once, not inlined at each of gfx_sp_tri1's three corners, so that
+// .sub0 holds the decode loop and the native loops too.
+static void SM_HOT __attribute__((noinline)) tri_bake_slot(uint8_t idx) {
+    DC_PROF_COUNT(DCC_BAKES, 1);
+    tri_bake_vertex(&sVtxBaked[idx], &rsp.loaded_vertices[idx]);
+    sVtxBakeEpoch[idx] = sTriStateEpoch;
+}
+#endif
+
 static inline const dc_fast_t *tri_baked(uint8_t idx) {
     if (sVtxBakeEpoch[idx] != sTriStateEpoch) {
+#if DC_NATIVE
+        tri_bake_slot(idx);
+#else
         DC_PROF_COUNT(DCC_BAKES, 1);
         tri_bake_vertex(&sVtxBaked[idx], &rsp.loaded_vertices[idx]);
         sVtxBakeEpoch[idx] = sTriStateEpoch;
+#endif
     }
     return &sVtxBaked[idx];
 }
@@ -2880,7 +2922,18 @@ static void __attribute__((noinline, cold)) gfx_dc_tag(uint32_t tag) {
 #endif
 }
 
-static void SM_HOT __attribute__((noinline)) gfx_run_dl(Gfx* cmd) {
+#if DC_NATIVE
+static int nat_try(Gfx *dl);   // native/gfx_native.inc.c
+#endif
+
+
+// DC_NATIVE_DL_COLD=1: the decode loop out of .sub0 (which then keeps the native loops alone).
+#if DC_NATIVE && defined(DC_NATIVE_DL_COLD)
+#define SM_HOT_DL
+#else
+#define SM_HOT_DL SM_HOT
+#endif
+static void SM_HOT_DL __attribute__((noinline)) gfx_run_dl(Gfx* cmd) {
     int dl_sp = 0;
 
     for (;;) {
@@ -2969,6 +3022,15 @@ static void SM_HOT __attribute__((noinline)) gfx_run_dl(Gfx* cmd) {
                 break;
 
             case G_DL:
+#if DC_NATIVE
+                if (nat_try((Gfx *) seg_addr(cmd->words.w1))) {
+                    if (C0(16, 1) == 0) break;   // called: on after the call
+                    if (dl_sp == 0) return;      // branched to: it ended this list
+                    cmd = dl_stack[--dl_sp];
+                    --cmd;
+                    break;
+                }
+#endif
                 __builtin_prefetch(seg_addr(cmd->words.w1));
                 if (C0(16, 1) == 0) {
                   
@@ -3142,6 +3204,10 @@ static void SM_HOT __attribute__((noinline)) gfx_run_dl(Gfx* cmd) {
     }
 }
 
+#if DC_NATIVE
+#include "native/gfx_native.inc.c"
+#endif
+
 static void gfx_sp_reset() {
     rsp.modelview_matrix_stack_size = 1;
     rendering_state.fog_col_change = 0;
@@ -3220,6 +3286,17 @@ void gfx_start_frame(void) {
     gfx_wapi->handle_events();
 }
 
+#if DC_NATIVE && !defined(TARGET_PC_ENDJINN)
+extern void gfx_pvr_render_frame(void (*op_renderer)(void *data), void *data);
+
+// The OP list's renderer (gfx_pvr_render_frame): the frame's display list.
+static void gfx_run_op(void *commands) {
+    gfx_rapi->start_frame();
+    gfx_run_dl(commands);
+    gfx_rapi->end_frame();
+}
+#endif
+
 void gfx_run(Gfx *commands) {
     __builtin_prefetch(commands);
     gfx_sp_reset();
@@ -3230,9 +3307,16 @@ void gfx_run(Gfx *commands) {
     gfx_pvr_prof_shadow(0);   // nor does a shadow tag
 #endif
     
+#if DC_NATIVE && defined(TARGET_PC_ENDJINN)
+    sNatFrame++;   // SM64_NAT_DBG
+#endif
+#if DC_NATIVE && !defined(TARGET_PC_ENDJINN)
+    gfx_pvr_render_frame(gfx_run_op, commands);
+#else
     gfx_rapi->start_frame();
     gfx_run_dl(commands);
     gfx_rapi->end_frame();
+#endif
     DC_PROF_MARK(DCP_DL);
     gfx_wapi->swap_buffers_begin();
 }

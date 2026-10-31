@@ -112,7 +112,8 @@ static uint64_t sSceneCounts[MAX_SCENES][DCC_COUNT];
 static uint64_t sScenePmu[MAX_SCENES][PMU_COUNT];
 static uint32_t sScenePmuFrames[MAX_SCENES][PMU_COUNT];
 static const char *const sCountNames[DCC_COUNT] = { "tris", "fast", "bakes", "epochs", "setups", "verts",
-    "op_tris", "op_px", "pt_tris", "pt_px", "pt_opq_px", "tr_tris", "tr_px", "tr_opq_tris", "tr_opq_px", "held", "dropped" };
+    "op_tris", "op_px", "pt_tris", "pt_px", "pt_opq_px", "tr_tris", "tr_px", "tr_opq_tris", "tr_opq_px", "held", "dropped",
+    "nat_draws", "nat_compiles", "nat_chunks", "nat_culled" };
 static int sSceneCount;
 
 #ifdef DC_PROF_LISTS

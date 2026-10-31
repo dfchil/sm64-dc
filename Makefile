@@ -601,6 +601,14 @@ ifeq ($(DC_OVERLAY),1)
   PLATFORM_CFLAGS += -I$(ENDJINN_DIR)/include -DENJ_CBASEPATH=\"/cd/\" -DENJ_FSAA=$(DC_FSAA)
 endif
 PLATFORM_CFLAGS += -DDC_HOLD_IDENTICAL=$(DC_HOLD_IDENTICAL)
+# DC_NATIVE=1: the native renderer (src/pc/gfx/native/gfx_native.inc.c): static display lists compiled to
+# PVR-ready meshes, the frame rendered through enDjinn's deferred render lists (enj_render.c).
+DC_NATIVE ?= 0
+PLATFORM_CFLAGS += -DDC_NATIVE=$(DC_NATIVE)
+# DC_NATIVE_DL_COLD=1: the display-list decode loop out of the I-cache-pinned .sub0 (A/B of layouts).
+ifeq ($(DC_NATIVE_DL_COLD),1)
+  PLATFORM_CFLAGS += -DDC_NATIVE_DL_COLD
+endif
 # The default video options (src/pc/dc_video_options.h): DC_FSAA_MODE (DC_FSAA=1 builds) 0 off,
 # 1 on, 2 on except the water and lava courses (default); DC_FRAME_MODE (DC_60FPS=1 builds) 0 30 fps,
 # 1 60 fps that slows down when late, 2 60 fps that drops a late step's second frame (default).
@@ -1064,14 +1072,21 @@ else
 SOUND_OBJ_FILES += $(SOUND_BIN_DIR)/aica_pool.o $(SOUND_BIN_DIR)/aica_sample_table.o
 endif
 
+# The few enDjinn sources the overlay's quick font and the native renderer's render lists need,
+# built with its own C dialect.
+ENDJINN_SRCS :=
 ifeq ($(DC_OVERLAY),1)
-# The few enDjinn sources the overlay's quick font needs, built with its own C dialect.
-ENDJINN_SRCS := enj_qfont.c enj_font.c enj_draw.c enj_bitmap.c
+ENDJINN_SRCS += enj_qfont.c enj_font.c enj_draw.c enj_bitmap.c
+endif
+ifeq ($(DC_NATIVE),1)
+ENDJINN_SRCS += enj_render.c
+endif
+ifneq ($(ENDJINN_SRCS),)
 ENDJINN_O_FILES := $(addprefix $(BUILD_DIR)/endjinn/,$(ENDJINN_SRCS:.c=.o))
 SOUND_OBJ_FILES += $(ENDJINN_O_FILES)
 $(BUILD_DIR)/endjinn/%.o: $(ENDJINN_DIR)/code/%.c
 	@mkdir -p $(dir $@)
-	$(CC) -std=gnu23 -O2 -c -I$(ENDJINN_DIR)/include -DENJ_CBASEPATH=\"/cd/\" -DENJ_FSAA=$(DC_FSAA) -DENJ_INJECT_QFONT=1 -o $@ $<
+	$(CC) -std=gnu23 -O2 -c -I$(ENDJINN_DIR)/include -I$(KOS_BASE)/utils -DENJ_CBASEPATH=\"/cd/\" -DENJ_FSAA=$(DC_FSAA) -DENJ_INJECT_QFONT=1 -o $@ $<
 endif
 
 $(SOUND_BIN_DIR)/aica_pool.c: $(SOUND_BIN_DIR)/sound_data.tbl $(SOUND_BIN_DIR)/sound_data.ctl $(AICA_TOOLS)

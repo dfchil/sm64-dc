@@ -274,7 +274,19 @@ static void pvr_ensure_base(int textured, int kind, int list) {
 // Build a poly header for the current state. pvr_poly_compile runs only ONCE per base (6 total);
 // per draw this copies the matching base and bit-patches the texture fields + per-draw state
 // in place (OoT technique) — no per-draw recompile. Per-list state stays from the base.
+#if DC_NATIVE
+// A native segment's precompiled header (gfx_native.inc.c), used for its kind instead of the
+// current state while the segment draws.
+static const pvr_poly_hdr_t *sForcedHdr[3];
+#endif
+
 static void pvr_compile_header(pvr_poly_hdr_t *out, int kind) {
+#if DC_NATIVE
+    if (sForcedHdr[kind] != NULL) {
+        *out = *sForcedHdr[kind];
+        return;
+    }
+#endif
     int list = (kind == PVR_KIND_TR) ? PVR_LIST_TR_POLY
              : (kind == PVR_KIND_PT) ? PVR_LIST_PT_POLY
              :                         PVR_LIST_OP_POLY;
@@ -839,6 +851,27 @@ static void prof_count_bucket(const PvrBucket *b, int kind) {
 #define PROF_COUNT_OP(a, b, c) ((void) 0)
 #endif
 
+#if DC_NATIVE
+// The native renderer (gfx_native.inc.c). A segment is compiled with the header the current state
+// gives (gfx_pvr_header_for) and later drawn with that header (gfx_pvr_native_header) without the
+// state; gfx_pvr_native_end hands the lists back to the current state.
+void gfx_pvr_header_for(int kind, pvr_poly_hdr_t *out) {
+    pvr_compile_header(out, kind);
+}
+
+void gfx_pvr_native_header(int kind, const pvr_poly_hdr_t *hdr) {
+    sForcedHdr[kind] = hdr;
+    if (kind == PVR_KIND_OP) sOpDirty = 1;
+    else if (kind == PVR_KIND_PT) sPunch.dirty = 1;
+    else sTR.dirty = 1;
+}
+
+void gfx_pvr_native_end(void) {
+    sForcedHdr[0] = sForcedHdr[1] = sForcedHdr[2] = NULL;
+    pvr_mark_dirty();
+}
+#endif
+
 // (Re)emit the live OP header to the open OP list when depth/texture state changed.
 static inline void pvr_emit_op_header(void) {
     if (!sOpDirty) return;
@@ -1107,6 +1140,7 @@ static inline void sm_rgba5551_to_rgbf(uint16_t c, float *r, float *g, float *b)
 
 static void gfx_pvr_start_frame(void) {
     float cr, cg, cb;
+#if !DC_NATIVE
 #if DC_FSAA
     if (sFsaaWant != sPvrParams.fsaa_enabled) {
         gfx_pvr_switch_fsaa();
@@ -1116,12 +1150,16 @@ static void gfx_pvr_start_frame(void) {
     pvr_wait_ready();
     DC_PROF_MARK(DCP_WAIT_END);
     pvr_scene_begin();
+#endif
     // drive the PVR background plane from the game's clear_color (set last game-loop iteration).
     sm_rgba5551_to_rgbf((uint16_t) clear_color, &cr, &cg, &cb);
     pvr_set_bg_color(cr, cg, cb);
     // OP list open + live for the whole frame (guaranteed-opaque geometry only).
     // Anything with alpha (blend or alpha-test cutout) is deferred to the TR bucket.
+    // DC_NATIVE: enj_render_scene has opened it already (gfx_pvr_render_frame).
+#if !DC_NATIVE
     pvr_list_begin(PVR_LIST_OP_POLY);
+#endif
     pvr_dr_init(&sDrState);
     sCurrentList = PVR_LIST_OP_POLY;
     // 2D depth base: PVR z is 1/w, larger == nearer. The per-rect +0.0005 increment
@@ -1158,11 +1196,72 @@ static void gfx_pvr_start_frame(void) {
     has_done_3d = 0;   // reset: no 3D drawn yet this frame (title bg -> far until flag)
 }
 
+#if DC_NATIVE
+// enDjinn's deferred rendering (enj_render.c): the frame is queued as list renderers, and
+// enj_render_scene waits for the PVR, begins the scene, opens each list that has renderers queued,
+// calls them in order and finishes the scene. The display list runs in the OP list's renderer, so
+// opaque geometry still streams live while it is translated; PT and TR fill their buckets then, and
+// their renderers are queued from it only when there is something to send (a list without
+// renderers is never opened). Native geometry (gfx_native.c) queues renderers of its own.
+extern void enj_render_list_add(pvr_list_t renderlist, void (*renderer)(void *data), void *data);
+extern void enj_render_scene(void);
+
+// enj_render.c asks enDjinn's state (enj_state_t) whether enj_startup set up the PVR, to skip the
+// lists it gave no bins. SM64 sets up the PVR itself and links no enj_state.c: a state that never
+// started makes every list count as enabled, and only lists with bins get renderers queued here.
+void *enj_state_get(void) {
+    static uint32_t __attribute__((aligned(32))) state[64];   // zero: flags.started = 0
+    return state;
+}
+
+static void pvr_render_pt(UNUSED void *data) {
+    pvr_dr_init(&sDrState);
+    pvr_flush_bucket(&sPunch);
+}
+
+static void pvr_render_tr(UNUSED void *data) {
+    pvr_dr_init(&sDrState);
+    if (!PROF_SKIP(SKIP_TR)) pvr_flush_bucket(&sTR);
+#if DC_OVERLAY
+    dc_overlay_draw();   // last, over everything
+#endif
+}
+
+static void (*sOpRenderer)(void *);
+static void pvr_render_op(void *data) {
+    DC_PROF_MARK(DCP_WAIT_END);
+    sOpRenderer(data);
+}
+
+void gfx_pvr_render_frame(void (*op_renderer)(void *data), void *data) {
+#if DC_FSAA
+    if (sFsaaWant != sPvrParams.fsaa_enabled) {
+        gfx_pvr_switch_fsaa();
+    }
+#endif
+    sOpRenderer = op_renderer;
+    enj_render_list_add(PVR_LIST_OP_POLY, pvr_render_op, data);
+    DC_PROF_MARK(DCP_WAIT_BEGIN);
+    enj_render_scene();
+}
+#endif
+
 static void gfx_pvr_end_frame(void) {
+#if !DC_NATIVE
     pvr_list_finish();   // close the OP list (opened once this frame)
+#endif
 #ifdef DC_PROF_LISTS
     prof_count_bucket(&sPunch, PVR_KIND_PT);
     prof_count_bucket(&sTR, PVR_KIND_TR);
+#endif
+#if DC_NATIVE
+    if (sPunch.nbatch > 0 && !PROF_SKIP(SKIP_PT)) {
+        enj_render_list_add(PVR_LIST_PT_POLY, pvr_render_pt, NULL);
+    }
+    if ((sTR.nbatch > 0 && !PROF_SKIP(SKIP_TR)) || DC_OVERLAY) {
+        enj_render_list_add(PVR_LIST_TR_POLY, pvr_render_tr, NULL);
+    }
+    return;
 #endif
 
     // Flush the deferred buckets, each into its own list opened once. PT FIRST: alpha-test
@@ -1192,8 +1291,10 @@ int gfx_pvr_fsaa_x(void) {
 }
 
 static void gfx_pvr_finish_render(void) {
-    // Submits the scene to the GPU and flips.
+    // Submits the scene to the GPU and flips (DC_NATIVE: enj_render_scene did).
+#if !DC_NATIVE
     pvr_scene_finish();
+#endif
 }
 
 struct GfxRenderingAPI gfx_pvr_api = {

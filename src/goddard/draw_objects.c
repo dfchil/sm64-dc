@@ -1120,6 +1120,9 @@ create_shape_gddl(struct ObjShape *s) {
     enddl = gd_enddlsplist_parent();
     shape->gdDls[0] = shapedl;
     shape->gdDls[1] = shapedl;
+#if DC_NATIVE
+    gd_native_stable_dl(shapedl, enddl);
+#endif
 
     if (shape->name[0] != '\0') {
         printf("Generated '%s' (%d) display list ok.(%d)\n", shape->name, shapedl, enddl);
