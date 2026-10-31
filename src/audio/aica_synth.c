@@ -74,6 +74,9 @@ typedef struct {
     u32 sentFreq;      /* last freq/vol/pan pushed to the channel; gates redundant updates */
     u8  sentVol, sentPan;
     u8  rateScale;     /* per-sample playback-freq scale (/256, 0 = none) for resampled voices */
+#ifdef DC_AUDIO_RECORD
+    u8  sentRev;       /* last reverb send logged (the recorder logs a change of it as an UPDATE) */
+#endif
 } Voice;
 static Voice sVoices[MAX_VOICES];
 static u32 sWaveAram[NUM_WAVEFORMS][NUM_WAVE_BANDS];
@@ -124,18 +127,27 @@ static AicaRecord sRecRing[AICA_RECORD_RING];
 volatile u32 gAicaRecHead, gAicaRecTail;   /* head: audio thread; tail: main thread */
 u32 gAicaRecTick, gAicaRecDropped;
 u64 gAicaRecStartUs;   /* SH4 time of the first sub-update, for the measured sub-update rate */
-void aica_record(u8 cmd, u8 ch, u8 vol, u8 pan, u32 freq, u32 key) {
+void aica_record(u8 cmd, u8 ch, u8 vol, u8 pan, u32 freq, u32 key, u8 reverb) {
     u32 head = gAicaRecHead;
     if (head - gAicaRecTail >= AICA_RECORD_RING) { gAicaRecDropped++; return; }
     AicaRecord *r = &sRecRing[head % AICA_RECORD_RING];
     r->tick = gAicaRecTick; r->cmd = cmd; r->ch = ch; r->vol = vol; r->pan = pan;
-    r->freq = freq; r->key = key;
+    r->freq = freq; r->key = key; r->reverb = reverb;
     gAicaRecHead = head + 1;
 }
 const AicaRecord *aica_record_at(u32 index) { return &sRecRing[index % AICA_RECORD_RING]; }
-#define AICA_REC(cmd, ch, vol, pan, freq, key) aica_record(cmd, ch, vol, pan, freq, key)
+/* The reverb send of the note being sent: the AICA voice driver has no send, so it is only
+   logged (the N64 mixer's wet send, which AICAflow flows carry as DSP_SEND). */
+static u8 sRecReverb;
+#define AICA_REC(cmd, ch, vol, pan, freq, key) aica_record(cmd, ch, vol, pan, freq, key, sRecReverb)
+#define AICA_REC_NOTE(note) (sRecReverb = (note)->reverb)
+#define AICA_REC_CHANGED(v, note) ((v)->sentRev != (note)->reverb)
+#define AICA_REC_SENT(v, note) ((v)->sentRev = (note)->reverb)
 #else
 #define AICA_REC(cmd, ch, vol, pan, freq, key) ((void) 0)
+#define AICA_REC_NOTE(note) ((void) 0)
+#define AICA_REC_CHANGED(v, note) 0
+#define AICA_REC_SENT(v, note) ((void) 0)
 #endif
 
 
@@ -571,10 +583,12 @@ void AicaSynth_RefreshActive(void) {
             freq = calc_freq(note, 0, v->rateScale);
         vol = calc_vol(note);
         pan = calc_pan(note);
+        AICA_REC_NOTE(note);
 
-        if (freq != v->sentFreq || (u8)vol != v->sentVol || (u8)pan != v->sentPan) {
+        if (freq != v->sentFreq || (u8)vol != v->sentVol || (u8)pan != v->sentPan || AICA_REC_CHANGED(v, note)) {
             chan_update(v->channel, freq, vol, pan);
             v->sentFreq = freq; v->sentVol = (u8)vol; v->sentPan = (u8)pan;
+            AICA_REC_SENT(v, note);
 #if AICA_PAN_LOG
             {
                 static u32 lines = 0;
@@ -623,6 +637,7 @@ void AicaSynth_Update(void) {
 
         vol = calc_vol(note);
         pan = calc_pan(note);
+        AICA_REC_NOTE(note);
 
         if (rc == 2) {
             /* Streamed long sample: dedicated channel + SH4-fed PCM ring. */
@@ -665,6 +680,7 @@ void AicaSynth_Update(void) {
                      note->sound == NULL ? key | (wave_band(norm_sc(note->sampleCount)) << 24) : key);
             chan_start(chn, &res, freq, vol, pan);
             v->sentFreq = freq; v->sentVol = (u8)vol; v->sentPan = (u8)pan;
+            AICA_REC_SENT(v, note);
 #if AICA_OCTAVE_LOG
             /* Find ADPCM samples the game pitches past ~+1 octave (note->frequency
                > ~2). Those pitch-clamp on AICA ADPCM and need FORCE_PCM. nf=1.89
@@ -696,9 +712,10 @@ void AicaSynth_Update(void) {
 #endif
         } else {
             if (entry) cache_release(entry);
-            if (freq != v->sentFreq || (u8)vol != v->sentVol || (u8)pan != v->sentPan) {
+            if (freq != v->sentFreq || (u8)vol != v->sentVol || (u8)pan != v->sentPan || AICA_REC_CHANGED(v, note)) {
                 chan_update(v->channel, freq, vol, pan);
                 v->sentFreq = freq; v->sentVol = (u8)vol; v->sentPan = (u8)pan;
+                AICA_REC_SENT(v, note);
             }
         }
     }

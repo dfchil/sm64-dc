@@ -273,6 +273,7 @@ static void rec_item(int seq, u32 sound) {
     h.wave_count = 4;
     h.band_count = 1;
     h.wave_samples = 64;
+    h.record_bytes = sizeof(AicaRecord);
     fwrite(&h, sizeof(h), 1, f);
     for (int w = 0; w < 4; w++) {
         fwrite(gWaveSamples[w], sizeof(s16), 64, f);
@@ -307,7 +308,7 @@ static void rec_item(int seq, u32 sound) {
     }
     u32 subs = gAicaRecTick - sub0;
     u32 us = (u32) (timer_us_gettime64() - us0);
-    AicaRecord end = { gAicaRecTick, AICA_REC_END, 0, 0, 0, us, subs };
+    AicaRecord end = { gAicaRecTick, AICA_REC_END, 0, 0, 0, us, subs, 0, { 0 } };
     fwrite(&end, sizeof(end), 1, f);
     fclose(f);
     printf("AUDIOREC %s: %u records, %d jumps, %u sub-updates in %u us\n", path, (unsigned) records, w.jumps,

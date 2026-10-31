@@ -13,7 +13,12 @@
  * Loading is synchronous; a planned per-area residency comes later.
  *
  * Fade timers are the sequencer's units: audio sub-updates, 240 per second,
- * so 8 per 30 Hz game tick (sm64_afx_tick). */
+ * so 8 per 30 Hz game tick (sm64_afx_tick).
+ *
+ * Reverb is the N64 mixer's: one feedback delay line, its length and feedback from the audio
+ * session preset (sound_reset), as the scene's DSP program (AICAflow's delay prefab). Songs carry
+ * each voice's send in their flows (from the recording); sounds are built with a full send that
+ * is scaled here, through lane 0, to what get_sound_reverb would give the sound now. */
 #ifdef DC_AICAFLOW
 
 #include <stdio.h>
@@ -24,6 +29,7 @@
 #include <aicaflow/bank.h>
 
 #include "sm64_aicaflow.h"
+#include "sm64_sfx_reverb.h"
 extern s16 gCurrLevelNum;
 #include "pc/dc_prof.h"
 
@@ -89,6 +95,8 @@ typedef struct {
     u8 continuous;
     u8 gain;     /* last sent */
     s8 pan;      /* last sent lane pan offset */
+    u8 script;   /* the sound script's reverb (sSfxScriptReverb) */
+    u8 send;     /* last sent lane DSP send */
 } SfxVoice;
 static SfxVoice sSfxVoice[SFX_VOICES];
 static u32 sSfxNext, sTick;
@@ -419,6 +427,93 @@ static void asset_free(Asset *a) {
     retire(a, 0);
 }
 
+/* Songs of the level's pack let go mid-scene by song_make_room, read back from the pack when
+ * they play again. */
+static u8 sEvictedSeq[128];
+
+/* Room in AICA RAM for a song that is not loaded (an event song the pack left out, which then
+ * replaces the level's music): once `stopping` (the song it replaces) and the other retired
+ * assets are gone, the pack's songs that are not playing let go of their flows; their samples
+ * stay, in the scene banks. */
+static void song_make_room(afx_instance_t stopping) {
+    for (int p = 0; p < MUSIC_PLAYERS; p++) {   /* songs that have ended (a jingle) let go */
+        Music *m = &sMusic[p];
+        if (m->asset.id && gone(m->inst)) {
+            retire(&m->asset, 0);
+            m->inst = 0;
+        }
+    }
+    for (int wait = 0; wait < 50; wait++) {
+        retry_stops();
+        free_retired();
+        int busy = !gone(stopping);
+        for (int i = 0; i < RETIRING; i++) busy |= sRetiring[i].asset.id != 0;
+        if (!busy) break;
+        thd_sleep(1);
+    }
+    for (int i = 0; i < SONG_CACHE; i++) {
+        Asset *s = &sSongs[i];
+        int playing = 0;
+        for (int p = 0; p < MUSIC_PLAYERS; p++) playing |= sMusic[p].inst && sMusic[p].asset.id == s->id;
+        if (!s->id || s->core || playing) continue;
+        for (int p = 0; p < MUSIC_PLAYERS; p++)   /* a stopped player's copy of it */
+            if (sMusic[p].asset.id == s->id) memset(&sMusic[p].asset, 0, sizeof(sMusic[p].asset));
+        sEvictedSeq[(s->id - 1) & 0x7f] = 1;
+        asset_free(s);
+    }
+    free_retired();
+    afx_mem_stats_t mem;
+    if (afx_mem_stats(&mem) == 0)
+        printf("AICAFLOW: made room: AICA RAM free %lu KB (largest %lu KB)\n", (unsigned long) (mem.free_bytes / 1024),
+               (unsigned long) (mem.largest_free_block / 1024));
+}
+
+/* A song song_make_room let go: its entry alone, read from the level's pack into the cache. */
+static int pack_reload(const char *stem) {
+    char path[128];
+    snprintf(path, sizeof(path), "%s/scene_%02d.smp", DC_AICAFLOW_ROOT, (int) sSceneLevel);
+    FILE *f = fopen(path, "rb");
+    if (f == NULL) return -1;
+    u32 head[5];
+    PackEntry2 e;
+    int result = -1;
+    if (fread(head, 1, sizeof(head), f) == sizeof(head) && head[0] == PACK_MAGIC && head[1] == 2) {
+        for (u32 i = 0; i < head[2] && fread(&e, sizeof(e), 1, f) == 1; i++) {
+            if (strncmp(e.stem, stem, sizeof(e.stem)) != 0) continue;
+            u32 id;
+            Asset *slot = pack_slot(e.stem, &id);
+            void *piece = slot && (e.bank == 1 ? sCoreBankUp : sLevelBankUp) ? memalign(32, e.afx_size) : NULL;
+            if (piece && fseek(f, (long) e.afx_off, SEEK_SET) == 0 && fread(piece, 1, e.afx_size, f) == e.afx_size) {
+                PackEntry2 local = e;
+                local.afx_off = 0;
+                result = pack_entry_load2(slot, piece, &local, e.bank == 1 ? &sCoreBank : &sLevelBank, id, 0);
+            }
+            free(piece);
+            break;
+        }
+    }
+    fclose(f);
+    return result;
+}
+
+/* A song that is not loaded, into a: from the pack if song_make_room let it go, else from its own
+ * files; when AICA RAM runs short, song_make_room and one more try. */
+static int song_fetch(Asset *a, const char *stem, u8 seq, afx_instance_t stopping) {
+    int result = -1;
+    for (int attempt = 0; attempt < 2; attempt++) {
+        if (attempt) song_make_room(stopping);
+        if (sEvictedSeq[seq] && (result = pack_reload(stem)) == 0) {
+            sEvictedSeq[seq] = 0;
+            for (int i = 0; i < SONG_CACHE; i++)
+                if (sSongs[i].id == (u32) seq + 1) *a = sSongs[i];
+            return 0;
+        }
+        if (!sEvictedSeq[seq] || result != -AFX_NO_AICA_RAM) result = asset_load(a, stem, (u32) seq + 1);
+        if (result != -AFX_NO_AICA_RAM) break;
+    }
+    return result;
+}
+
 /* The previous scene ends: everything it played stops, and everything but scene_core leaves AICA
  * RAM, so the new scene starts with the room it needs. The stops are waited for (a level load
  * has time to spare) before the assets are freed. */
@@ -458,12 +553,24 @@ static void scene_end(void) {
     level_bank_release();
     /* A song or sound that failed for want of AICA RAM gets another chance. */
     memset(sMissingSeq, 0, sizeof(sMissingSeq));
+    memset(sEvictedSeq, 0, sizeof(sEvictedSeq));
     sMissingSfxCount = 0;
 }
 
 /* Called from init_level, and from the first song or sound of a level that does not run it (the
  * title). The level's pack is read each time the level starts. */
+/* The title and file select are the menu scene (level 1), also when the title comes back after a
+ * demo and gCurrLevelNum is still the demo's level: sMenuOver is that level, until a level starts
+ * (init_level) or gCurrLevelNum changes. */
+static s16 sMenuOver = -1;
+
+static s16 scene_level(void) {
+    if (gCurrLevelNum != sMenuOver) sMenuOver = -1;
+    return sMenuOver >= 0 ? 1 : gCurrLevelNum;
+}
+
 void sm64_afx_scene_prepare(s16 level) {
+    if (level != 1) sMenuOver = -1;
     if (!sReady || level == sSceneLevel) return;
     if (sSceneLevel >= 0) scene_end();
     sSceneLevel = level;
@@ -485,7 +592,47 @@ int sm64_afx_init(void) {
         sMusic[p].scale = 1.0f;
     }
     sReady = result == 0;
+    /* The ring goes in before any asset, at the arena's start; sound_reset replaces the program
+     * in the same place when a preset changes it. */
+    sm64_sound_reverb_preset(0);
     return result;
+}
+
+/* The N64 send (0..127, reverb / 128 of the voice) as AICA IMXL, which steps 3 dB from -42 dB (1)
+ * to 0 dB (15): the least send level of each code. tools/aica/sm64_afx.py maps songs' sends the
+ * same way. */
+static const u8 sSendLevel[15] = { 1, 2, 2, 3, 4, 5, 7, 10, 14, 20, 28, 39, 54, 77, 108 };
+static u8 send_code(u8 reverb) {
+    u8 code = 0;
+    while (code < 15 && reverb >= sSendLevel[code]) code++;
+    return code;
+}
+
+/* SM64's reverb (synthesis.c, US): each update starts its output with the ring's oldest samples
+ * at unity and writes back those times reverbGain / 32768 plus the notes' sends. The delay
+ * prefab is that at 44.1 kHz; its input coefficient (6) raised to unity as AICAflow's own
+ * calibrated echo (afx_dsp_program_demo) does, where the prefab keeps a quarter for headroom.
+ * The longest preset (0x1000 at 32 kHz, 5645 samples) fits the smallest ring (RBL 0, 8 Ki). */
+void sm64_afx_reverb(u16 windowSize, u16 gain) {
+#if DC_AICAFLOW_REVERB
+    static u16 sReverbSamples;
+    static s16 sReverbFeedback;
+    if (!sReady) return;
+    u16 samples = (u16) (((u32) windowSize * 44100u + 16000u) / 32000u);
+    s16 feedback = (s16) ((gain > 24576 ? 24576 : gain) & ~7);
+    if (samples == sReverbSamples && feedback == sReverbFeedback) return;
+    afx_dsp_program_t program;
+    int result = afx_dsp_program_delay(&program, samples, feedback, false);
+    if (!result) result = afx_dsp_program_coefficient(&program, 6, 32760);
+    if (!result) result = afx_dsp_scene_program_ring(&program, sizeof(program), 0);
+    printf("AICAFLOW: reverb %u samples, feedback %d: %d\n", samples, feedback, result);
+    if (result) samples = 0;   /* DSP is off: try again at the next preset */
+    sReverbSamples = samples;
+    sReverbFeedback = feedback;
+#else
+    (void) windowSize;
+    (void) gain;
+#endif
 }
 
 static void music_apply_gain(Music *m) {
@@ -499,15 +646,17 @@ static void music_apply_gain(Music *m) {
 
 void sm64_afx_play_sequence(u8 player, u8 seqId, u16 fadeTimer) {
     if (!sReady || player >= MUSIC_PLAYERS || player == 2) return;   /* player 2 runs the SFX scripts */
-    sm64_afx_scene_prepare(gCurrLevelNum);
-    Music *m = &sMusic[player];
     u8 seq = seqId & 0x7f;
+    if ((seq == 0x02 || seq == 0x21) && gCurrLevelNum != 1) sMenuOver = gCurrLevelNum;   /* title, file select */
+    sm64_afx_scene_prepare(scene_level());
+    Music *m = &sMusic[player];
     DBG("AFXDBG t=%lu play player=%u seq=%02X fade=%u loaded=%lx\n", (unsigned long) sTicks, player, seqId, fadeTimer,
         (unsigned long) m->asset.id);
-    afx_instance_t old = m->inst;
+    afx_instance_t old = m->inst, stopping = 0;
     m->inst = 0;
     if (m->asset.id != (u32) seq + 1) {
         retire(&m->asset, old);   /* stops it; freed once it is gone */
+        stopping = old;
         old = 0;
     }
     if (old) stop_inst(old);
@@ -517,7 +666,7 @@ void sm64_afx_play_sequence(u8 player, u8 seqId, u16 fadeTimer) {
         if (sMissingSeq[seq]) return;
         char stem[16];
         snprintf(stem, sizeof(stem), "seq%02X", seq);
-        if (asset_load(&m->asset, stem, (u32) seq + 1)) {
+        if (song_fetch(&m->asset, stem, seq, stopping)) {
             sMissingSeq[seq] = 1;
             printf("AICAFLOW: no asset for sequence %02X; silent\n", seq);
             return;
@@ -569,7 +718,9 @@ void sm64_afx_set_volume(u8 player, f32 scale, u16 fadeTimer) {
 
 /* Volume by the source's distance and pan by its direction, as the game computes them, sent
  * when they change: the instance's gain, and the pan offset of lane 0 (sounds are built with a
- * lane map holding every channel in lane 0; AICA pan steps are about 3 dB, 15 per side). */
+ * lane map holding every channel in lane 0; AICA pan steps are about 3 dB, 15 per side). The
+ * reverb send follows the volume: the lane scales the flows' full send (IMXL 15) to code c with
+ * c * 17 (the firmware's rounded product / 255). */
 static void sfx_place(SfxVoice *v) {
     f32 volume, pan;
     sm64_sound_dynamics(v->bits, v->pos, &volume, &pan);
@@ -584,11 +735,17 @@ static void sfx_place(SfxVoice *v) {
         afx_instance_lanes_set(v->inst, AFX_LANE_PAN, 0, 1u, values);
         v->pan = offset;
     }
+    u8 send = (u8) (send_code(sm64_sound_reverb(v->bits, volume, v->script)) * 17);
+    if (send != v->send) {
+        u8 values[32] = { send };
+        afx_instance_lanes_set(v->inst, AFX_LANE_DSP_SEND, 0, 1u, values);
+        v->send = send;
+    }
 }
 
 void sm64_afx_play_sound(s32 soundBits, f32 *pos) {
     if (!sReady) return;
-    sm64_afx_scene_prepare(gCurrLevelNum);
+    sm64_afx_scene_prepare(scene_level());
     u32 key = (u32) soundBits & 0xF0FF0000u;
     Asset *a = NULL;
     for (int i = 0; i < SFX_ASSETS && !a; i++)
@@ -639,6 +796,10 @@ void sm64_afx_play_sound(s32 soundBits, f32 *pos) {
     }
     slot->gain = 255;
     slot->pan = 0;
+    slot->send = 255;
+    slot->script = 0;
+    for (u32 i = 0; i < sizeof(sSfxScriptReverb) / sizeof(sSfxScriptReverb[0]); i++)
+        if (sSfxScriptReverb[i].key == key) slot->script = sSfxScriptReverb[i].reverb;
     sfx_place(slot);
 }
 

@@ -29,6 +29,12 @@ def main():
     ap.add_argument("--build", required=True, help="the recording build's us_dc directory")
     ap.add_argument("--stage", required=True)
     ap.add_argument("--work", default="build/afx/work")
+    # Tolerance 2 (0.75 dB): on hardware (2026-10-27 A/B of all songs against the exact
+    # conversion) as close in level and spectrum as tolerance 1, and the songs 37% smaller; the
+    # sounds (2026-10-28, 40 of them) within the noise of the exact ones played twice, 8% smaller.
+    ap.add_argument("--hw-env", metavar="TOL", default="2",
+                    help="passed to sm64_afx.py: fades on the AICA envelope (default 2; 0 = off)")
+    ap.add_argument("--afx-sm64", help="passed to sm64_afx.py")
     args = ap.parse_args()
     run, stage, work = Path(args.run), Path(args.stage) / "afx", Path(args.work)
     stage.mkdir(parents=True, exist_ok=True)
@@ -56,7 +62,8 @@ def main():
             continue
         out = work / name
         cmd = [sys.executable, str(HERE / "sm64_afx.py"), str(log), "--table", str(table), "--pool", str(pool),
-               "--out", str(out)] + (["--loop"] if loop else ["--tail", "2"]) + ([] if m.group(2) else ["--lanes"])
+               "--out", str(out)] + (["--loop"] if loop else ["--tail", "2"]) + ([] if m.group(2) else ["--lanes", "--full-send"])
+        cmd += (["--hw-env", args.hw_env] if args.hw_env not in (None, "0") else []) + (["--afx-sm64", args.afx_sm64] if args.afx_sm64 else [])
         r = subprocess.run(cmd, capture_output=True, text=True)
         if r.returncode:
             rows.append((name, "conversion failed", "", r.stdout.strip().splitlines()[-1:] + r.stderr.strip().splitlines()[-1:]))

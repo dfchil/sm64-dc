@@ -18,6 +18,7 @@ use sm64_afx.words(), which reproduces KOS's driver.
 """
 import argparse
 import json
+import os
 import struct
 import sys
 from pathlib import Path
@@ -26,7 +27,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 import sm64_afx as conv
 
 FIELDS = 18
-F_PITCH, F_DIRECT, F_MIX = conv.FIELD_PITCH, conv.FIELD_DIRECT, conv.FIELD_MIX
+F_PITCH, F_DIRECT, F_MIX, F_ENV_AD = conv.FIELD_PITCH, conv.FIELD_DIRECT, conv.FIELD_MIX, conv.FIELD_ENV_AD
 
 
 def afx_timeline(path, zones, total):
@@ -70,10 +71,12 @@ def afx_timeline(path, zones, total):
                     f[fld] = next(it)
             state[ch] = [setup, f]
             at += size_
-        elif op in (0x11, 0x15):
+        elif op in (0x11, 0x15, 0x17, 0x18):
             ch = stream[at + 1]
-            if op == 0x15:
-                mask, vals, size_ = 1 << F_MIX, struct.unpack_from("<H", stream, at + 2), 4
+            if op != 0x11:     # the compact forms: MIX, ENV_AD, or both
+                mask = {0x15: 1 << F_MIX, 0x17: 1 << F_ENV_AD, 0x18: 1 << F_ENV_AD | 1 << F_MIX}[op]
+                n = bin(mask).count("1")
+                vals, size_ = struct.unpack_from(f"<{n}H", stream, at + 2), 2 + 2 * n
             else:
                 mask = struct.unpack_from("<I", stream, at + 2)[0]
                 n = bin(mask).count("1")
@@ -123,7 +126,7 @@ def log_timeline(meta):
     while i < len(records):
         tick = records[i][0]
         while i < len(records) and records[i][0] == tick:
-            t, cmd, ch, vol, pan, freq, key = records[i]
+            t, cmd, ch, vol, pan, freq, key = records[i][:7]
             if cmd == conv.START:
                 w = conv.words(freq, vol, pan)
                 state[ch] = (conv.zone_key(key), w[F_PITCH], w[F_DIRECT], w[F_MIX])
@@ -150,13 +153,43 @@ def state_at(changes, t, cache):
     return changes[k][1] if changes and changes[0][0] <= t else frozenset()
 
 
+def signed_pan(direct):
+    return -(direct & 0x0F) if direct & 0x10 else direct & 0x0F
+
+
+def close(a, b, pan_tol, level_tol):
+    """Two sounding states agree: each voice pairs with one on the other side of the same sample,
+    pitch and DIRECT bits but pan, within pan_tol pan steps and level_tol TL steps (a flow made with
+    AICAforge's lossy simplification, AFX_SIMPLIFY)."""
+    if a == b:
+        return True
+    if not (pan_tol or level_tol):
+        return False
+    xs = [v for v, n in a for _ in range(n)]
+    ys = [v for v, n in b for _ in range(n)]
+    if len(xs) != len(ys):
+        return False
+    for key, pitch, direct, mix in xs:
+        for i, (k2, p2, d2, m2) in enumerate(ys):
+            if (k2 == key and p2 == pitch and (d2 & ~0x1F) == (direct & ~0x1F) and (m2 & 0xFF) == (mix & 0xFF)
+                    and abs(signed_pan(d2) - signed_pan(direct)) <= pan_tol and abs((m2 >> 8) - (mix >> 8)) <= level_tol):
+                del ys[i]
+                break
+        else:
+            return False
+    return True
+
+
+TOL = (0, 0)
+
+
 def disagreements(x, y, lo, hi):
     """Intervals in [lo, hi) where the change lists x and y give different states."""
     points = sorted({t for t, _ in x if lo <= t < hi} | {t for t, _ in y if lo <= t < hi} | {lo})
     cx, cy = [0], [0]
     out, start = [], None
     for t in points:
-        same = state_at(x, t, cx) == state_at(y, t, cy)
+        same = close(state_at(x, t, cx), state_at(y, t, cy), *TOL)
         if not same and start is None:
             start = t
         if same and start is not None:
@@ -171,7 +204,13 @@ def main():
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("afx")
     ap.add_argument("--tolerance", type=int, default=3)
+    ap.add_argument("--pan-tol", type=int, help="pan steps a value may differ (default: from AFX_SIMPLIFY, else 0)")
+    ap.add_argument("--level-tol", type=int, help="TL steps a value may differ (default: from AFX_SIMPLIFY, else 0)")
     args = ap.parse_args()
+    global TOL
+    env = [int(v) for v in os.environ.get("AFX_SIMPLIFY", "0,0").split(",")]
+    TOL = (args.pan_tol if args.pan_tol is not None else env[0],
+           args.level_tol if args.level_tol is not None else env[1])
     meta = json.loads(Path(args.afx).with_suffix(".json").read_text())
     log, log_end = log_timeline(meta)
     afx, loops = afx_timeline(args.afx, meta["zones"], log_end)

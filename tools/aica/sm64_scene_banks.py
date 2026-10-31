@@ -15,6 +15,12 @@ scene_core.smp holds the global set, read once; scene_LL.smp (LL = gCurrLevelNum
 level's own assets. A level flow whose samples are all in the core bank binds to that instead,
 so its samples are not in the level bank at all.
 
+Each level pack is fitted to the AICA RAM left after the core pack and the reverb ring (--arena-kb,
+--reverb-kb): its music, then its sounds (smallest flow first), then other songs (jingles, event
+music). A song left out is loaded from its own files when it plays, so the
+songs packed are chosen to leave room for the largest left out where that lets more of them play
+(see fit). The bank holds only the samples of what is in the pack.
+
 Pack format (little-endian): "SMPK", version 2, entry count, bank offset, bank bytes (a whole
 AFB file); per entry a 24-byte NUL-padded stem, the bank it binds (0 = this pack's, 1 = the core
 pack's), the offset and size of its AFX in the file, and a reserved word; files 32-byte aligned.
@@ -113,10 +119,66 @@ def write_pack(path, bank_file, entries):
     return len(out)
 
 
+def fit(ranked, core_samples, budget, music):
+    """The assets of ranked (in load order) that go in a level pack, and those left out.
+
+    An asset whose samples are all in the core bank costs its flow; any other its flow and the
+    samples it adds to the level bank. The level's music and sounds go first while they fit. Of
+    the other songs, the set packed is the one that lets the most of them play: a song left out
+    plays when the room it needs on its own (its files, which the runtime loads when it plays)
+    is free beside the pack; ties go to the larger set packed, which loads nothing mid-scene."""
+    core = set(core_samples)
+
+    def cost(a, have):
+        s = a.samples()
+        if set(s) <= core:
+            return len(a.afx)
+        return len(a.afx) + sum(len(v) for k, v in s.items() if k not in have)
+
+    def alone(a):
+        return len(a.afx) + sum(-len(v) % 32 + len(v) for v in a.samples().values())
+
+    def place(assets, have, used):
+        taken, out = [], []
+        for a in assets:
+            c = cost(a, have)
+            if used + c <= budget:
+                taken.append(a)
+                used += c
+                if not set(a.samples()) <= core:
+                    have = have | set(a.samples())
+            else:
+                out.append(a)
+        return taken, out, have, used
+
+    later = [a for a in ranked if a.stem.startswith("seq") and a.stem not in music]
+    first, first_out, have, used = place([a for a in ranked if a not in later], set(), 0)
+    best = None
+    for bits in range(1 << len(later)):
+        packed, out, _, total = place([a for i, a in enumerate(later) if bits >> i & 1], have, used)
+        if out:
+            continue
+        rest = [a for i, a in enumerate(later) if not bits >> i & 1]
+        room = budget - total >= max((alone(a) for a in rest), default=0)
+        score = (len(packed) + (len(rest) if room else 0), len(packed))
+        if best is None or score > best[0]:
+            best = (score, packed, rest, room)
+    _, packed, rest, room = best
+    for a in first_out:
+        print(f"  warning: {a.stem} does not fit", file=sys.stderr)
+    if rest and not room:
+        print(f"  note: no room beside the whole pack for {' '.join(a.stem for a in rest)} (the runtime lets idle songs go for them)", file=sys.stderr)
+    return first + packed, rest + first_out
+
+
 def main():
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("assets", type=Path, help="sm64_scene_assets.py --json output")
     ap.add_argument("--stage", type=Path, default=ROOT / "build/afx/stage")
+    # afx_mem_stats on hardware: used + free with nothing loaded but the firmware's own state.
+    ap.add_argument("--arena-kb", type=int, default=2023, help="AICA RAM arena (default %(default)s)")
+    ap.add_argument("--reverb-kb", type=int, default=16, help="reverb ring, 0 without (default %(default)s)")
+    ap.add_argument("--margin-kb", type=int, default=8, help="kept free (default %(default)s)")
     args = ap.parse_args()
     stage = args.stage / "afx"
     lists = json.loads(args.assets.read_text())
@@ -135,28 +197,36 @@ def main():
     core_bank, core_offsets, core_id = make_bank(core_samples)
     size = write_pack(stage / "scene_core.smp", core_bank,
                       [(a.stem, 0, a.bound(core_offsets, core_id)) for a in core])
-    print(f"scene_core.smp: {len(core)} assets, bank {len(core_bank) // 1024} KB, pack {size // 1024} KB")
+    core_cost = len(core_bank) + sum(len(a.afx) for a in core)
+    budget = (args.arena_kb - args.reverb_kb - args.margin_kb) * 1024 - core_cost
+    print(f"scene_core.smp: {len(core)} assets, bank {len(core_bank) // 1024} KB, pack {size // 1024} KB; "
+          f"{budget // 1024} KB left for a level")
     numbers = level_numbers()
     report = [f"core {len(core)} assets bank {len(core_bank)}"]
     by_number = {}
     for lvl, stems in sorted(lists["levels"].items()):
         if lvl in numbers and stems:
-            by_number.setdefault(numbers[lvl], (lvl, set()))[1].update(stems)
-    for number, (lvl, stems) in sorted(by_number.items()):
-        own = load(sorted(stems))
+            entry = by_number.setdefault(numbers[lvl], (lvl, set(), set()))
+            entry[1].update(stems)
+            entry[2].update(lists.get("music", {}).get(lvl, []))
+    for number, (lvl, stems, music) in sorted(by_number.items()):
+        def rank(a):
+            return (0 if a.stem in music else 1 if a.stem.startswith("sfx_") else 2, len(a.afx), a.stem)
+        own, left_out = fit(sorted(load(stems), key=rank), core_samples, budget, music)
         on_core = [a for a in own if set(a.samples()) <= set(core_samples)]
-        rest = [a for a in own if a not in on_core]
         samples = {}
-        for a in rest:
-            samples.update(a.samples())
+        for a in own:
+            if a not in on_core:
+                samples.update(a.samples())
         bank, offsets, bank_id = make_bank(samples)
-        entries = [(a.stem, 1, a.bound(core_offsets, core_id)) for a in on_core]
-        entries += [(a.stem, 0, a.bound(offsets, bank_id)) for a in rest]
+        entries = [(a.stem, 1, a.bound(core_offsets, core_id)) if a in on_core else
+                   (a.stem, 0, a.bound(offsets, bank_id)) for a in own]
         size = write_pack(stage / f"scene_{number:02d}.smp", bank, entries)
         flows = sum(struct.unpack_from("<I", e[2], 20)[0] for e in entries)
+        out = f" left out {' '.join(a.stem for a in left_out)}" if left_out else ""
         print(f"scene_{number:02d}.smp {lvl:17s} {len(own):3d} assets ({len(on_core)} on core), "
-              f"bank {len(bank) // 1024:4d} KB, flows {flows // 1024:4d} KB")
-        report.append(f"{number:02d} {lvl} {len(own)} assets bank {len(bank)} flows {flows}")
+              f"bank {len(bank) // 1024:4d} KB, flows {flows // 1024:4d} KB{out}")
+        report.append(f"{number:02d} {lvl} {len(own)} assets bank {len(bank)} flows {flows}{out}")
     (stage / "scenes.txt").write_text("\n".join(report) + "\n")
 
 

@@ -5,7 +5,7 @@
 
 A level's objects come from its level script (OBJECT lines), its areas' macro objects and special
 objects, and everything those spawn (SPAWN_OBJ / SPAWN_CHILD in behavior scripts, spawn_object*(...,
-bhvX) in the behavior's C file), taken transitively. A behavior can play the SOUND_* and SEQ_*
+bhvX) in the behavior's C file: a name passed to a spawn call, not any mention), taken transitively. A behavior can play the SOUND_* and SEQ_*
 names of the C files its CALL_NATIVE functions live in. Everything the rest of src/game plays
 (Mario, camera, menus, level logic, generic object helpers) is global: possible in every level,
 except songs: those the general code plays belong to the levels SONG_RULES gives them to (the
@@ -76,9 +76,14 @@ def c_files():
         rel = os.path.relpath(f, ROOT)
         for fn in re.findall(r"^\w[\w\s\*]*?\b(\w+)\s*\([^;{]*\)\s*\{", src, re.M):
             func_file.setdefault(fn, rel)
+        # Behaviors a file spawns: names passed to a spawn call (a plain mention, such as a check of
+        # which behavior spawned an object, spawns nothing).
+        spawned = set()
+        for call in re.findall(r"\b\w*spawn\w*\s*\(([^;]*)", src):
+            spawned |= set(re.findall(r"\b(bhv\w+)\b", call))
         file_info[rel] = (set(re.findall(r"\b(SOUND_[A-Z0-9_]+)\b", src)),
                           set(re.findall(r"\b(SEQ_[A-Z0-9_]+)\b", src)),
-                          set(re.findall(r"\b(bhv\w+)\b", src)))
+                          spawned)
     return func_file, file_info
 
 
@@ -96,9 +101,9 @@ def level_behaviors():
         n += 1
     special_by_id = {int(m[1], 16): m[2] for m in re.finditer(r"\{\s*0x([0-9A-Fa-f]+)\s*,[^,]*,[^,]*,[^,]*,\s*(bhv\w+|NULL)\s*\}", read("include/special_presets.h"))}
     out = collections.defaultdict(set)
-    for d in sorted(glob.glob(str(ROOT / "levels/*/"))):
-        lvl = Path(d).name
-        for f in glob.glob(d + "**/*.c", recursive=True):
+    for d in sorted(p for p in (ROOT / "levels").iterdir() if p.is_dir()):
+        lvl = d.name
+        for f in glob.glob(str(d / "**" / "*.c"), recursive=True):
             src = Path(f).read_text(errors="replace")
             out[lvl] |= set(re.findall(r"/\*beh\*/\s*(bhv\w+)", src))
             for name in re.findall(r"MACRO_OBJECT\w*\(/\*preset\*/\s*(macro_\w+)", src):
@@ -136,11 +141,17 @@ SONG_RULES = {
     "SEQ_EVENT_POWERUP": "caps:wing caps:vanish", "SEQ_EVENT_METAL_CAP": "caps:metal",
     "SEQ_LEVEL_INSIDE_CASTLE": "castle_inside", "SEQ_EVENT_ENDLESS_STAIRS": "castle_inside",
     "SEQ_EVENT_TOAD_MESSAGE": "castle_inside",
-    "SEQ_EVENT_CUTSCENE_INTRO": "castle_grounds", "SEQ_EVENT_PEACH_MESSAGE": "castle_grounds",
+    "SEQ_EVENT_CUTSCENE_INTRO": "castle_grounds", "SEQ_EVENT_PEACH_MESSAGE": "castle_grounds castle_inside",
     "SEQ_EVENT_CUTSCENE_LAKITU": "castle_grounds",
     "SEQ_EVENT_CUTSCENE_COLLECT_KEY": "bowser_1 bowser_2", "SEQ_EVENT_CUTSCENE_VICTORY": "bowser_3",
     "SEQ_EVENT_CUTSCENE_CREDITS": "ending", "SEQ_EVENT_CUTSCENE_ENDING": "ending",
-    "SEQ_MENU_TITLE_SCREEN": "intro menu", "SEQ_MENU_FILE_SELECT": "menu", "SEQ_MENU_STAR_SELECT": "menu",
+    "SEQ_MENU_TITLE_SCREEN": "intro menu", "SEQ_MENU_FILE_SELECT": "menu",
+    # The act select runs in the course's own level (gCurrLevelNum is the course's by then).
+    "SEQ_MENU_STAR_SELECT": "menu bob wf jrb ccm bbh hmc lll ssl ddd sl wdw ttm thi ttc rr",
+    # Played through wrappers (play_star_fanfare, play_race_fanfare), so no SEQ_ name in the
+    # callers' files: the course-complete fanfare where a course is left to, the race start.
+    "SEQ_EVENT_HIGH_SCORE": "castle_inside castle_grounds castle_courtyard",
+    "SEQ_EVENT_RACE": "bob thi ccm",
 }
 CAP_BOXES = {"macro_box_wing_cap": "wing", "macro_box_metal_cap": "metal", "macro_box_vanish_cap": "vanish"}
 
@@ -196,18 +207,22 @@ def main():
     behavior_files = {f for f in file_info if "/behaviors/" in f or f.endswith("behavior_actions.c")}
     global_files = set(file_info) - behavior_files
     g_sounds = set().union(*(file_info[f][0] for f in global_files))
+    # The act select (src/menu/star_select.c) runs in every course's own level.
+    g_sounds |= set(re.findall(r"\b(SOUND_[A-Z0-9_]+)\b", read("src/menu/star_select.c")))
     g_seqs = {q for q, where in SONG_RULES.items() if where == "*"}
     stage = ROOT / args.stage / "afx"
 
     def stems(sounds, songs):
         out = {f"sfx_{keys[s]:08X}" for s in sounds if s in keys}
+        # Mario's terrain sounds are played with m->terrainSoundAddend added: SOUND_TERRAIN_* << 16.
+        out |= {f"sfx_{keys[s] + (t << 16):08X}" for s in sounds if s in keys and "_TERRAIN_" in s for t in range(8)}
         out |= {f"seq{seqs[q]:02X}" for q in songs if q in seqs and seqs[q] != 0}
         return out
 
     g_stems = stems(g_sounds, g_seqs)
     g_flows, g_samples = asset_cost(g_stems, stage)
     print(f"global: {len(g_stems)} assets, flows {g_flows / 1024:.0f} KB + samples {sum(g_samples.values()) / 1024:.0f} KB")
-    result = {"global": sorted(g_stems), "levels": {}}
+    result = {"global": sorted(g_stems), "levels": {}, "music": {}}
     rows = []
     # The title screen, file select and star select (level 1: levels/intro, levels/menu) are run
     # by src/menu and goddard's Mario head, outside src/game.
@@ -227,6 +242,13 @@ def main():
             songs |= menu_seqs
         own = stems(sounds, songs) - g_stems
         result["levels"][lvl] = sorted(own)
+        # The level's own music (its script's, and the menus' for the title screen): what a pack
+        # loads first, so that when AICA RAM runs short an event song is what is left out.
+        script = ROOT / f"levels/{lvl}/script.c"
+        music = set(re.findall(r"\b(SEQ_[A-Z_]+)\b", script.read_text())) if script.exists() else set()
+        if lvl in ("intro", "menu"):
+            music |= menu_seqs | {q for q, where in SONG_RULES.items() if lvl in where.split()}
+        result["music"][lvl] = sorted(stems(set(), music))
         flows, samples = asset_cost(own, stage)
         total = dict(g_samples, **samples)
         rows.append((lvl, len(own), flows, sum(samples.values()), g_flows + flows, sum(total.values())))

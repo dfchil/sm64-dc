@@ -757,6 +757,10 @@ endif
     ifneq ($(DC_AICAFLOW_ROOT),)
       PLATFORM_CFLAGS += -DDC_AICAFLOW_ROOT=\"$(DC_AICAFLOW_ROOT)\"
     endif
+    # DC_AICAFLOW_REVERB=1: the N64 reverb as the scene's DSP program; its 16 KiB delay ring is in
+    # the scene packs' AICA RAM budget (tools/aica/sm64_scene_banks.py --reverb-kb).
+    DC_AICAFLOW_REVERB ?= 1
+    PLATFORM_CFLAGS += -DDC_AICAFLOW_REVERB=$(DC_AICAFLOW_REVERB)
   endif
 endif
 ifeq ($(TARGET_WEB),1)
@@ -1037,6 +1041,10 @@ $(BUILD_DIR)/aicaflow_firmware.c: $(AICAFLOW_DIR)/firmware/aicaflow.drv
 	$(PYTHON) -c 'import sys; d = open(sys.argv[1], "rb").read(); print("const unsigned char gAicaflowFirmware[] __attribute__((aligned(32))) = {" + ",".join(str(b) for b in d) + "};\nconst unsigned int gAicaflowFirmwareSize = sizeof(gAicaflowFirmware);")' $< > $@
 $(BUILD_DIR)/aicaflow_firmware.o: $(BUILD_DIR)/aicaflow_firmware.c
 	$(CC) -c -o $@ $<
+# Each sound's script reverb (sound scripts do not run under AICAflow), for the reverb send.
+$(BUILD_DIR)/sm64_sfx_reverb.h: sound/sequences/00_sound_player.s tools/aica/sm64_sfx_reverb.py
+	$(PYTHON) tools/aica/sm64_sfx_reverb.py $< > $@
+$(BUILD_DIR)/src/pc/audio/sm64_aicaflow.o: $(BUILD_DIR)/sm64_sfx_reverb.h
 else
 SOUND_OBJ_FILES += $(SOUND_BIN_DIR)/aica_pool.o $(SOUND_BIN_DIR)/aica_sample_table.o
 endif

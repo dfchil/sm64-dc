@@ -1053,7 +1053,14 @@ void note_init_all(void) {
 #ifdef VERSION_EU
         note->synthesisState.synthesisBuffers = soundAlloc(&gNotesAndBuffersPool, sizeof(struct NoteSynthesisBuffers));
 #else
-        note->synthesisBuffers = NULL; // soundAlloc(&gNotesAndBuffersPool, sizeof(struct NoteSynthesisBuffers));
+        // The port's AICA synth makes its own wave buffers (aica_synth.c) and no note reads these,
+        // but build_synthetic_wave still writes a wave into note->synthesisBuffers->samples: give
+        // the notes one shared buffer. With NULL here, those writes went to address 0x120 (on the
+        // Dreamcast, through the page-0 mapping into the start of RAM).
+        {
+            static struct NoteSynthesisBuffers sSharedBuffers;
+            note->synthesisBuffers = &sSharedBuffers;
+        }
 #endif
     }
 }

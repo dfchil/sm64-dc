@@ -4,6 +4,7 @@
  *       -I$AICAFORGE/src tools/aica/afx_sm64.c $AICAFORGE/src/afx_compile_c.c \
  *       $AICAFORGE/dependencies/AICAflow/driver/format/src/codec.c -lm -o build/afx_sm64
  *   build/afx_sm64 song.job song.afb song.afx     (writes song.afc too)
+ *   AFX_SIMPLIFY=2,1 build/afx_sm64 ...           (lossy: see afx_c_simplify_events)
  *
  * The job: "SJOB", zone count, event count, duration ticks, loop tick (~0 for
  * none), tick rate numerator, channels, tick rate denominator (0 = 1); then each zone (format, loop, loop start, loop
@@ -105,6 +106,18 @@ int main(int argc, char **argv) {
         at += 52;
     }
     (void)channels;
+    /* AFX_SIMPLIFY="pan,level": AICAforge's lossy trace simplification (afx_c_simplify_events),
+     * pan steps and 0.375 dB level steps a dropped change may differ from the last one kept. */
+    const char *simplify = getenv("AFX_SIMPLIFY");
+    if (simplify) {
+        unsigned pan = 0, level = 0;
+        if (sscanf(simplify, "%u,%u", &pan, &level) != 2 || pan > 15 || level > 255)
+            return fprintf(stderr, "AFX_SIMPLIFY must be pan,level (got %s)\n", simplify), 2;
+        afx_c_simplify_t options = {.pan_tolerance = (uint8_t)pan, .level_tolerance = (uint8_t)level,
+                                    .loop_tick = loop_tick == UINT32_MAX ? AFX_C_NO_LOOP : loop_tick};
+        if (afx_c_simplify_events(events, &event_count, &options))
+            return fprintf(stderr, "cannot simplify %s\n", argv[1]), 1;
+    }
     afx_c_output_t out;
     int result = loop_tick == UINT32_MAX
         ? afx_c_compile_events(events, event_count, duration, rate, zones, zone_count, &out)

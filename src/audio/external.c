@@ -1287,6 +1287,37 @@ u8 get_sound_reverb(UNUSED u8 bankIndex, UNUSED u8 item, UNUSED u8 channelIndex)
     return 0;
 }
 
+#ifdef DC_AICAFLOW
+// A sound's reverb send (0..127), as get_sound_reverb gives it to the SFX channels: the script's
+// IO slot 5 value, the area's echo level (none for SOUND_NO_ECHO sounds) and more the quieter the
+// sound is (volume from sm64_sound_dynamics).
+u8 sm64_sound_reverb(u32 soundBits, f32 volume, u8 scriptReverb) {
+    u8 area;
+    u8 level;
+    u8 reverb;
+    if (soundBits & SOUND_NO_ECHO) {
+        level = 0;
+        area = 0;
+    } else {
+        level = (gCurrLevelNum > LEVEL_MAX ? LEVEL_MAX : gCurrLevelNum);
+        area = gCurrAreaIndex - 1;
+        if (area > 2) {
+            area = 2;
+        }
+    }
+    reverb = (u8)(scriptReverb + gAreaEchoLevel[level][area] + (US_FLOAT(1.0) - volume) * VAL);
+    if (reverb > 0x7f) {
+        reverb = 0x7f;
+    }
+    return reverb;
+}
+
+// The session preset's reverb to the AICAflow layer, for its DSP program.
+void sm64_sound_reverb_preset(u8 presetId) {
+    sm64_afx_reverb(gAudioSessionPresets[presetId].reverbWindowSize, gAudioSessionPresets[presetId].reverbGain);
+}
+#endif
+
 #undef VAL
 static void noop_8031EEC8(void) {
 }
@@ -2534,6 +2565,9 @@ void sound_reset(u8 presetId) {
     }
 #endif
     sGameLoopTicked = 0;
+#ifdef DC_AICAFLOW
+    sm64_sound_reverb_preset(presetId);
+#endif
     disable_all_sequence_players();
     sound_init();
 #if defined(VERSION_JP) || defined(VERSION_US) || defined(VERSION_SH)

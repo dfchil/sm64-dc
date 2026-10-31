@@ -26,6 +26,11 @@ the first jump, and the flow ends at the first jump with LOOP. Voices still
 sounding there are keyed off, as the game's restart of its channels cuts
 them. Record at least two passes.
 
+Reverb: a song's voices carry the note's reverb send (logs with 20-byte records) as DSP_SEND,
+IMXL by level on MIXS0, which the scene's reverb program reads (src/pc/audio/sm64_aicaflow.c).
+--full-send gives every voice IMXL 15 instead, for sounds: the game scales it per lane at run
+time, as their reverb depends on the area and the sound's distance.
+
 Writes <out>.job (afx_sm64's input), <out>.json (what tools/aica/sm64_afx_verify.py
 needs) and, through afx_sm64 (tools/aica/afx_sm64.c), <out>.afb/.afx/.afc.
 """
@@ -38,9 +43,24 @@ import sys
 from pathlib import Path
 
 REC = struct.Struct("<IBBBBII")
+REC20 = struct.Struct("<IBBBBIIB3x")   # with the note's reverb send
 START, UPDATE, STOP, SEQ_JUMP, END = 1, 2, 3, 4, 5
 KEY_SYNTH, KEY_STREAM = 0x80000000, 0x40000000
-FIELD_PITCH, FIELD_DIRECT, FIELD_MIX = 6, 9, 10
+FIELD_ENV_AD, FIELD_ENV_DR, FIELD_PITCH, FIELD_DSP_SEND, FIELD_DIRECT, FIELD_MIX = 4, 5, 6, 8, 9, 10
+# The AICA amplitude EG's decay (D1R/D2R/RR) time over its whole range, 1023 steps of 3/32 dB, for
+# R = 0..31 with KRS = 0xF (rate 2R), measured on a console through the EG monitor (2026-10-27):
+# ~7% slower than MAME's DRTimes, halving every 2 R. R 0 holds. Reaching the end stops the voice.
+EG_FULL_MS = [None, 124006, 95165, 62955, 47581, 31722, 23654, 15861, 11861, 7900, 5948, 3953, 2970, 1978,
+              1484, 990.4, 743.7, 493.7, 373.6, 246.8, 185.0, 123.2, 92.57, 61.82, 46.04, 30.77, 23.02, 15.52,
+              11.51, 7.76, 5.88, 5.88]
+# TL steps (0.375 dB, 4 EG steps) per AICAflow tick.
+EG_SLOPE = [0.0] + [1023.0 / 4.0 / ms * 1000.0 / (44100 / 44) for ms in EG_FULL_MS[1:]]
+EG_ENV_DR = 0x3C1F            # KRS 0xF (no pitch scaling), DL 0, RR 31 (key-off as before)
+EG_TOP = 250.0                # EG attenuation (TL steps) a sounding voice keeps below: 255.75 ends it
+FULL_SEND = 0xF0
+# The least N64 send (0..127, reverb / 128 of the voice) of each AICA IMXL code 1..15, which steps
+# 3 dB from -42 dB to 0 dB; the same table is send_code in src/pc/audio/sm64_aicaflow.c.
+SEND_LEVELS = [1, 2, 2, 3, 4, 5, 7, 10, 14, 20, 28, 39, 54, 77, 108]
 OP_NOTE, OP_PATCH, OP_KEYOFF = 0x10, 0x11, 0x12
 BUDGET_COMMANDS, BUDGET_WRITES = 38, 171
 AFX_RATE_NUM, AFX_RATE_DEN = 44100, 44          # AICA Timer A: 44 counts of 44.1 kHz
@@ -70,6 +90,11 @@ def words(freq, vol, pan):
             FIELD_MIX: (LOGS[min(vol, 255)] << 8) | 0x24}
 
 
+def dsp_send(reverb):
+    """The DSP_SEND word for an N64 reverb send: IMXL in the high nibble, MIXS0."""
+    return sum(1 for level in SEND_LEVELS if (reverb & 0x7F) >= level) << 4
+
+
 def zone_key(key):
     if key & KEY_SYNTH:
         return f"synth:{key & 0xFF}:{(key >> 24) & 0xF}"
@@ -97,7 +122,11 @@ def read_log(path):
     for _ in range(wave_count):
         waves.append(list(struct.unpack_from(f"<{wave_samples}h", data, at)))
         at += wave_samples * 2
-    records = [REC.unpack_from(data, i) for i in range(at, len(data) - REC.size + 1, REC.size)]
+    # Header word 5: the record size, 0 in logs from before the reverb send (16 bytes, send 0).
+    if struct.unpack_from("<I", data, 20)[0] == REC20.size:
+        records = [REC20.unpack_from(data, i) for i in range(at, len(data) - REC20.size + 1, REC20.size)]
+    else:
+        records = [REC.unpack_from(data, i) + (0,) for i in range(at, len(data) - REC.size + 1, REC.size)]
     return upf, waves, records
 
 
@@ -146,20 +175,25 @@ def band_buffer(wave, band):
     return (cycle * (64 // count))[:64]
 
 
-def build_voices(records):
-    """One voice per occupancy of a game channel: its NOTE words, then each change of words."""
+def build_voices(records, full_send=False):
+    """One voice per occupancy of a game channel: its NOTE words, then each change of words.
+    A NOTE leaves out a send of 0, its setup's."""
+    def voice_words(freq, vol, pan, reverb):
+        w = words(freq, vol, pan)
+        w[FIELD_DSP_SEND] = FULL_SEND if full_send else dsp_send(reverb)
+        return w
     voices, open_ = [], {}
-    for t, cmd, ch, vol, pan, freq, key in records:
+    for t, cmd, ch, vol, pan, freq, key, reverb in records:
         if cmd == START:
             if ch in open_:
                 open_.pop(ch)["stop"] = t
-            v = dict(id=len(voices), ch=ch, key=key, start=t, stop=None, words=words(freq, vol, pan))
-            v["events"] = [(t, "note", dict(v["words"]))]
+            v = dict(id=len(voices), ch=ch, key=key, start=t, stop=None, words=voice_words(freq, vol, pan, reverb))
+            v["events"] = [(t, "note", {f: x for f, x in v["words"].items() if f != FIELD_DSP_SEND or x})]
             voices.append(v)
             open_[ch] = v
         elif cmd == UPDATE and ch in open_:
             v = open_[ch]
-            w = words(freq, vol, pan)
+            w = voice_words(freq, vol, pan, reverb)
             changed = {f: x for f, x in w.items() if v["words"].get(f) != x}
             if changed:
                 v["events"].append((t, "patch", changed))
@@ -167,6 +201,151 @@ def build_voices(records):
         elif cmd == STOP and ch in open_:
             open_.pop(ch)["stop"] = t
     return voices
+
+
+def eg_ad(r):
+    """ENV_AD for decay rate R (D1R = D2R, so DL does not matter) and an instant attack."""
+    return (r << 11) | (r << 6) | 31
+
+
+MUTE_TL = 255
+
+
+def fit_eg(v, tol):
+    """Let the AICA's EG carry a voice's level fall. The recording's TL steps are targets; the
+    voice's total level is its TL register plus the EG's attenuation, which falls at one of the
+    hardware's rates from key-on. A target holds until the next one, so the total is checked
+    against it in the middle of its hold (at its change, the EG would always run ahead of the
+    stairs and the voice end up quieter). Greedily, at each point where the total would leave
+    `tol` TL steps of the target, choose a rate (an ENV_AD write) and/or a TL correction that keeps it
+    within for the most target changes ahead. The EG never goes past the lowest target still to
+    come (TL cannot go below 0) nor near its end (that stops the voice). Rewrites the voice's
+    events: the NOTE gets ENV_AD/ENV_DR, PATCHes keep their other fields, their MIX only where a
+    correction is due. Returns the number of TL writes saved."""
+    ev = v["events"]
+    idx = [k for k, e in enumerate(ev) if FIELD_MIX in e[2] or k == 0]
+    t = [ev[k][0] for k in idx]
+    T = [float(ev[k][2][FIELD_MIX] >> 8) for k in idx]
+    n = len(t)
+    if n < 3:
+        return 0
+    tm = [(t[j] + t[j + 1]) / 2 for j in range(n - 1)] + [t[-1]]   # the middle of each hold
+    sufmin = T[:]
+    for j in range(n - 2, -1, -1):
+        sufmin[j] = min(T[j], sufmin[j + 1])
+
+    def run(i, reg, e0, r):
+        """Target changes after i kept within tol with TL `reg` and rate r from level e0 at t[i],
+        or -1 if target i itself is not. The change it stops at must still be reachable (EG at
+        or under every target from there on), so the next decision can correct: shortened until
+        it is (rate 0 always is)."""
+        s, L = EG_SLOPE[r], -1
+        for j in range(i, n):
+            if j > i and T[j] >= MUTE_TL:
+                break
+            e = e0 + s * (tm[j] - t[i])
+            if e > min(sufmin[j], EG_TOP) or abs(reg + e - T[j]) > tol:
+                break
+            L += 1
+        while L >= 0 and i + L + 1 < n and e0 + s * (t[i + L + 1] - t[i]) > min(sufmin[i + L + 1], EG_TOP):
+            L -= 1
+        return L
+
+    reg, e, r = T[0], 0.0, 0
+    plan = {0: (reg, 0)}            # target index -> (TL written or None, rate written or None)
+    i = 0
+    while True:
+        if i and T[i] >= MUTE_TL:
+            # A mute is written as it is: TL 255 plus the EG does not silence the voice on the
+            # hardware (a sound ended at TL 173 + EG played on at -65 dB). The EG stops there, so
+            # a target after it is still in reach.
+            plan[i] = (MUTE_TL, 0 if r else None)
+            reg, r = MUTE_TL, 0
+            if i + 1 >= n:
+                break
+            i += 1
+            continue
+        best = None
+        for correct in (False, True) if i else (True,):
+            for rr in range(32):
+                reg_i = round(T[i] - e - EG_SLOPE[rr] * (tm[i] - t[i])) if correct else reg
+                if reg_i < 0 or reg_i > 255:
+                    continue
+                L = run(i, reg_i, e, rr)
+                if L < 0:
+                    continue
+                # stream bytes: a TL-only correction is a PATCH_LEVEL (4), a rate change needs a
+                # PATCH (6 + 2 per word), and an event tick of its own a WAIT (about 2)
+                tl_w, rate_w = correct and i > 0, rr != r
+                cost = 0 if i == 0 else (4 if not rate_w else 6 + 2 * (tl_w + rate_w)) + 2
+                key = ((L + 1) / max(cost, 1), L, -cost)
+                if best is None or key > best[0]:
+                    best = (key, correct, reg_i, rr)
+        _, correct, reg_new, r_new = best
+        if i == 0:
+            plan[0] = (round(reg_new), r_new)
+        elif correct or r_new != r:
+            plan[i] = (round(reg_new) if correct else None, r_new if r_new != r else None)
+        if correct:
+            reg = round(reg_new)
+        L = best[0][1]
+        nxt = i + L + 1
+        if nxt >= n:
+            break
+        e = e + EG_SLOPE[r_new] * (t[nxt] - t[i])
+        r = r_new
+        i = nxt
+    before = n - 1
+    # rewrite the events
+    uses_eg = any(rate for _, rate in plan.values())
+    for j, k in enumerate(idx):
+        tk, kind, w = ev[k]
+        w = dict(w)
+        tl, rate = plan.get(j, (None, None))
+        if j == 0:
+            w[FIELD_MIX] = (tl << 8) | (w[FIELD_MIX] & 0xFF)
+            if uses_eg:
+                w[FIELD_ENV_AD] = eg_ad(rate)
+                w[FIELD_ENV_DR] = EG_ENV_DR      # KRS 0xF: the rates do not follow the pitch
+        else:
+            del w[FIELD_MIX]
+            if tl is not None:
+                w[FIELD_MIX] = (tl << 8) | (ev[k][2][FIELD_MIX] & 0xFF)
+            if rate is not None:
+                w[FIELD_ENV_AD] = eg_ad(rate)
+        ev[k] = (tk, kind, w)
+    v["events"] = [e for e in ev if e[1] == "note" or e[2]]
+    after = sum(1 for e in v["events"][1:] if FIELD_MIX in e[2])
+    v["eg_check"] = (t, T, tol)
+    return before - after
+
+
+def check_eg(v):
+    """Replays a fitted voice: its total level (TL + EG) at every target change, against the target."""
+    t, T, tol = v["eg_check"]
+    t = [(t[j] + t[j + 1]) / 2 for j in range(len(t) - 1)] + [t[-1]]   # fit_eg's check points
+    reg = r = 0
+    e, last = 0.0, None
+    worst = 0.0
+    evs = v["events"]
+    k = 0
+    for j in range(len(t)):
+        while k < len(evs) and evs[k][0] <= t[j]:
+            tk, kind, w = evs[k]
+            if last is not None:
+                e = min(e + EG_SLOPE[r] * (tk - last), 255.75)
+            last = tk
+            if kind == "note":
+                e = 0.0
+                r = 0
+            if FIELD_MIX in w:
+                reg = w[FIELD_MIX] >> 8
+            if FIELD_ENV_AD in w:
+                r = (w[FIELD_ENV_AD] >> 6) & 31
+            k += 1
+        ej = min(e + EG_SLOPE[r] * (t[j] - last), 255.75)
+        worst = max(worst, abs(min(reg + ej, MUTE_TL) - min(T[j], MUTE_TL)))   # past TL 255 is silence
+    return worst
 
 
 def sounding(voices, t):
@@ -265,6 +444,10 @@ def main():
     ap.add_argument("--sub-rate", type=float, help="sub-updates per second (default: the log's measurement)")
     ap.add_argument("--tail", type=int, default=0, help="ticks appended after the last event of a one-shot")
     ap.add_argument("--lanes", action="store_true", help="add a lane map, so the game can pan the flow (sounds)")
+    ap.add_argument("--hw-env", type=float, metavar="TOL",
+                    help="let the AICA's EG carry level falls, within TOL TL steps (0.375 dB) of the recording")
+    ap.add_argument("--full-send", action="store_true",
+                    help="every voice at full reverb send, for the game to scale per lane (sounds)")
     ap.add_argument("--afx-sm64", default=str(Path(__file__).resolve().parent.parent.parent / "build" / "afx_sm64"))
     args = ap.parse_args()
     upf, waves, raw = read_log(args.log)
@@ -309,7 +492,7 @@ def main():
             zone_of[zk] = len(zones) - 1
         return zone_of[zk]
 
-    voices = build_voices(records)
+    voices = build_voices(records, args.full_send)
     last_tick = max((v["stop"] if v["stop"] is not None else v["events"][-1][0]) for v in voices)
     loop_tick = end = None
     links = {}
@@ -325,6 +508,18 @@ def main():
     channel_of = allocate(voices, end, links)
     events = []
     carried = set(links) | set(links.values())
+    if args.hw_env is not None:
+        # A voice carried across the LOOP is left alone: after the jump its events assume the EG
+        # level of the other pass.
+        saved, worst = 0, 0.0
+        for v in voices:
+            if v["id"] not in carried and v["start"] < end:
+                saved += fit_eg(v, args.hw_env)
+                if "eg_check" in v:
+                    worst = max(worst, check_eg(v))
+        if worst > args.hw_env + 0.5:
+            sys.exit(f"EG fit leaves a voice {worst:.2f} TL steps off its recording")
+        print(f"EG: {saved} TL writes left to the hardware envelope; worst {worst:.2f} TL steps off")
     for v in voices:
         if v["start"] >= end:
             continue
@@ -379,7 +574,7 @@ def main():
             fields = [w.get(fld, 0) for fld in range(18)]
             f.write(struct.pack("<IIBBHI18H", t, i, op, ch, setup, mask, *fields))
     out.with_suffix(".json").write_text(json.dumps(dict(
-        log=str(Path(args.log).resolve()), player=args.player, sub_rate=sub_rate, sub_rate_source=how,
+        log=str(Path(args.log).resolve()), player=args.player, full_send=args.full_send, sub_rate=sub_rate, sub_rate_source=how,
         first_sub=first, afx_rate=[AFX_RATE_NUM, AFX_RATE_DEN], loop_tick=loop_tick, end=end,
         zones=[z["key"] for z in zones], events=len(spread), delayed_events=delayed), indent=1))
     print(f"{len(zones)} setups, {len(spread)} events ({delayed} moved later to fit a tick's budget) on "
