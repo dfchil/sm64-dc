@@ -35,6 +35,8 @@ DC_OPT ?= -Os
 # report + /pc/sm64_prof.csv and exit back to dcload after DC_AUTO_EXIT_SECONDS
 DC_PROF ?= 0
 DC_AUTO_EXIT_SECONDS ?= 150
+# Seconds without a finished frame before the profile build reports where it hangs and exits
+DC_HANG_SECONDS ?= 10
 # 60 fps on Dreamcast: every 30 Hz logic step is drawn twice, interpolated then exact
 DC_60FPS ?= 0
 # Vblanks per presented frame on Dreamcast (2 = stock 30 fps cap, 1 = uncapped / 60 fps)
@@ -642,7 +644,7 @@ PLATFORM_CFLAGS += -DDC_PT_CHUNK=$(DC_PT_CHUNK)
 # Above -Os GCC flags stock SM64 code (mario_actions_moving.c) as maybe-uninitialized.
 PLATFORM_CFLAGS += -Wno-error=maybe-uninitialized
 ifeq ($(DC_PROF),1)
-  PLATFORM_CFLAGS += -DDC_PROF -DDC_AUTO_EXIT_SECONDS=$(DC_AUTO_EXIT_SECONDS)
+  PLATFORM_CFLAGS += -DDC_PROF -DDC_AUTO_EXIT_SECONDS=$(DC_AUTO_EXIT_SECONDS) -DDC_HANG_SECONDS=$(DC_HANG_SECONDS)
   # DC_PROF_SAMPLE=1: also sample the PC at 500 Hz into /pc/sm64_samples.bin (tools/dc_prof_samples.py)
   ifeq ($(DC_PROF_SAMPLE),1)
     PLATFORM_CFLAGS += -DDC_PROF_SAMPLE
@@ -663,6 +665,15 @@ ifeq ($(DC_PROF),1)
   # DC_PROF_TOUR_MUSIC=1: the tour's demos play their level's music (attract demos normally don't).
   ifeq ($(DC_PROF_TOUR_MUSIC),1)
     PLATFORM_CFLAGS += -DDC_PROF_TOUR_MUSIC
+  endif
+  # DC_TAS=1: a Mupen64 movie from power-on (/pc/afx/tas.m64) plays the game instead of the controller
+  # (src/pc/controller/controller_entry_point.c), with a blank in-memory save: a real playthrough
+  # as the profile workload. Not with DC_PROF_TOUR/BENCH.
+  # DC_TAS_TRACE_EVERY=n (default 300): every n-th sample the game state goes to the console as
+  # a TASREF line (src/game/tas_trace.c), to compare with tools/tasref's N64 trace.
+  DC_TAS_TRACE_EVERY ?= 300
+  ifeq ($(DC_TAS),1)
+    PLATFORM_CFLAGS += -DDC_TAS -DDC_TAS_TRACE_EVERY=$(DC_TAS_TRACE_EVERY)
   endif
   # DC_PROF_BENCH=1: the tour visits every level and turns the camera round instead of playing
   # demo inputs (level_select_menu.c, game_init.c bench_demo_inputs); implies DC_PROF_TOUR.

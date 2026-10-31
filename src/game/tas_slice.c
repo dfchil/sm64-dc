@@ -1,0 +1,379 @@
+// make DC_TAS=1: TAS slices. A slice is the movie from the moment a level is entered, with the
+// game state carried over from before: the save data, the random seed, the timers, Mario's lives
+// and health, the act and the few globals that cross a level change. The pc-endjinn host captures
+// one per level change (the courses and the castle's grounds, inside and courtyard) while it plays
+// the whole movie (SM64_SLICE_CAPTURE=file); a replay starts the game, sends its first level change
+// to a slice's level instead, restores that state there and plays the movie on from the slice's
+// sample, and when the level is left goes on to the next slice in the playlist. Every level of a
+// 120-star run is reached in seconds, and plays exactly as in the full run (tools/tasref/compare.py
+// checks it against the N64).
+#ifdef DC_TAS
+
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+
+#include "sm64.h"
+#include "area.h"
+#include "buffers/buffers.h"
+#include "camera.h"
+#include "game_init.h"
+#include "ingame_menu.h"
+#include "level_update.h"
+#include "mario_misc.h"
+#include "moving_texture.h"
+#include "object_helpers.h"
+#include "object_list_processor.h"
+#include "paintings.h"
+#include "rendering_graph_node.h"
+#include "save_file.h"
+#include "tas_slice.h"
+#if defined(DC_PROF) && !defined(TARGET_PC_ENDJINN)
+#include "pc/dc_prof.h"
+#endif
+
+#define WARP_TYPE_CHANGE_LEVEL 1   // level_update.c
+
+extern s8 D_8032C9E0;
+extern s8 sYoshiDead;
+// camera.c, level_update.c, object_list_processor.c, behavior_actions.c globals without a header.
+extern Vec3f sFixedModeBasePosition;
+extern f32 gCameraZoomDist;
+extern struct CameraStoredInfo sCameraStoreCutscene;
+extern struct HandheldShakePoint sHandheldShakeSpline[4];
+extern s16 sAvoidYawVel;
+extern struct CameraFOVStatus sFOVState;
+extern u32 gPrevLevel;
+extern s32 sDelayedWarpArg;
+extern s32 gEnvironmentLevels[20];
+extern struct SpawnParticlesInfo D_8032F270;
+extern s8 gDialogLineNum;
+extern struct CutsceneVariable sCutsceneVars[10];
+extern u32 gTimeStopState;
+extern s16 gPaintingUpdateCounter, gLastPaintingUpdateCounter;
+extern s16 sWasAtSurface, sSwimStrength, D_80339FD0, D_80339FD2;
+extern f32 D_80339FD4;
+extern struct ModeTransitionInfo sModeInfo;
+extern struct TransitionInfo sModeTransition;
+extern s16 sCameraYawAfterDoorCutscene, sCutsceneDialogID;
+extern u8 sCutsceneDialogResponse;
+extern s16 gSnowParticleMaxCount, gSnowParticleCount;
+extern Vec3i gSnowCylinderLastPos;
+extern s16 sSourceWarpNodeId;
+extern f32 sObjSavedPosX, sObjSavedPosY, sObjSavedPosZ;
+extern s8 gDialogCameraAngleIndex;
+extern s32 gCurrLevelArea;
+extern u8 gMenuHoldKeyIndex;
+extern u8 gMenuHoldKeyTimer;
+extern s16 sPrevCheckMarioRoom;
+extern s8 gMainMenuDataModified;
+extern u16 tas_random_seed16(void);
+extern void tas_random_seed16_set(u16 seed);
+extern unsigned int dc_tas_frame(void);
+extern void dc_tas_seek(unsigned int sample);
+
+// What crosses a level change, as plain bytes: no pointers, so a slice captured on the host plays
+// on the Dreamcast too (both little-endian, same layouts).
+#define ITEM(x) { &(x), sizeof(x), #x }
+static const struct {
+    void *addr;
+    u32 size;
+    const char *name;
+} sItems[] = {
+    ITEM(gGlobalTimer), ITEM(gAreaUpdateCounter), ITEM(gSaveBuffer), ITEM(gCurrSaveFileNum),
+    ITEM(gSaveFileModified), ITEM(gWarpCheckpoint), ITEM(gCurrCourseNum), ITEM(gCurrActNum),
+    ITEM(gSavedCourseNum), ITEM(gCurrCourseStarFlags), ITEM(gLastCompletedCourseNum),
+    ITEM(gLastCompletedStarNum), ITEM(gSpecialTripleJump), ITEM(gHudDisplay), ITEM(sTimerRunning),
+    ITEM(gShouldNotPlayCastleMusic), ITEM(D_8032C9E0), ITEM(sYoshiDead), ITEM(gTTCSpeedSetting),
+    ITEM(gMarioCurrentRoom), ITEM(gPaintingMarioYEntry), ITEM(gPaintingMarioFloorType),
+    ITEM(gPaintingMarioXPos), ITEM(gPaintingMarioYPos), ITEM(gPaintingMarioZPos), ITEM(gRedCoinsCollected),
+    ITEM(gCameraMovementFlags), ITEM(sSelectionFlags), ITEM(sCButtonsPressed), ITEM(gLakituState),
+    ITEM(sFixedModeBasePosition), ITEM(gCameraZoomDist), ITEM(sCameraStoreCutscene),
+    ITEM(sHandheldShakeSpline), ITEM(sAvoidYawVel), ITEM(sFOVState), ITEM(gPrevLevel), ITEM(sDelayedWarpArg),
+    ITEM(gEnvironmentLevels), ITEM(D_8032F270), ITEM(gDialogLineNum), ITEM(gLastDialogLineNum),
+    ITEM(gDialogTextAlpha), ITEM(gDialogColorFadeTimer), ITEM(gControllerPads[0]), ITEM(gMarioStates[0].slideYaw),
+    ITEM(sCutsceneVars), ITEM(gTimeStopState), ITEM(gPaintingUpdateCounter), ITEM(gLastPaintingUpdateCounter),
+    ITEM(sWasAtSurface), ITEM(sSwimStrength), ITEM(D_80339FD0), ITEM(D_80339FD2), ITEM(D_80339FD4),
+    ITEM(sModeInfo), ITEM(sModeTransition), ITEM(sCameraYawAfterDoorCutscene), ITEM(sCutsceneDialogID),
+    ITEM(sCutsceneDialogResponse), ITEM(gSnowParticleMaxCount), ITEM(gSnowParticleCount),
+    ITEM(gSnowCylinderLastPos), ITEM(sSourceWarpNodeId), ITEM(gBodyStates[0]), ITEM(sObjSavedPosX),
+    ITEM(sObjSavedPosY), ITEM(sObjSavedPosZ), ITEM(gDialogCameraAngleIndex), ITEM(gCurrLevelArea),
+    ITEM(gMarioStates[0].twirlYaw), ITEM(gMarioStates[0].fadeWarpOpacity),
+    // The pause menu's key repeat: the cursor moves by its timer, which the last menu left.
+    ITEM(gMenuHoldKeyIndex), ITEM(gMenuHoldKeyTimer), ITEM(sPrevCheckMarioRoom),
+    // A coin score or sound mode change not yet saved: the save writes the menu data's backup.
+    ITEM(gMainMenuDataModified),
+    // Mario's action too: coming from the file select he has none (ACT_UNINITIALIZED), and a
+    // warp then spawns no Mario (init_mario_after_warp).
+    ITEM(gMarioStates[0].action), ITEM(gMarioStates[0].numLives), ITEM(gMarioStates[0].health), ITEM(gMarioStates[0].numStars),
+    ITEM(gMarioStates[0].numCoins), ITEM(gMarioStates[0].numKeys), ITEM(gMarioStates[0].flags),
+    ITEM(gMarioStates[0].capTimer), ITEM(gMarioStates[0].prevNumStarsForDialog),
+    ITEM(gMarioStates[0].unkB0), ITEM(gMarioStates[0].hurtCounter), ITEM(gMarioStates[0].healCounter),
+    // init_mario leaves these as the last level had them: a slide's velocity, say, which the next
+    // level's first slide or water exit picks up (the moat door's hyperspeed after VCUTM).
+    ITEM(gMarioStates[0].slideVelX), ITEM(gMarioStates[0].slideVelZ), ITEM(gMarioStates[0].prevAction),
+    ITEM(gMarioStates[0].actionState), ITEM(gMarioStates[0].actionArg), ITEM(gMarioStates[0].peakHeight),
+    ITEM(gMarioStates[0].wallKickTimer), ITEM(gMarioStates[0].doubleJumpTimer), ITEM(gMarioStates[0].unkC4),
+    ITEM(gControllers[0].rawStickX), ITEM(gControllers[0].rawStickY), ITEM(gControllers[0].stickX),
+    ITEM(gControllers[0].stickY), ITEM(gControllers[0].stickMag), ITEM(gControllers[0].buttonDown),
+    ITEM(gControllers[0].buttonPressed),
+};
+
+// A slice in the file: its header, then the items in sItems order.
+struct SliceHeader {
+    u32 sample;   // the movie's next sample at init_level
+    struct WarpDest warp;
+    u16 seed;
+    u16 itemBytes;
+};
+
+static u8 *sSlices;       // the slices file
+static u32 sSliceCount, sSliceBytes;
+static s32 sPlaylist[256];
+static u32 sPlayCount, sPlayNext;
+static struct SliceHeader *sPending;   // set by a redirected warp, restored at init_level
+static s32 sPlaying = -1;             // the slice being played
+// The slice that just ended, and where its level change went before the redirect: the full movie
+// went there too, and its next slice holds the state it had then.
+static s32 sEnded = -1;
+static struct WarpDest sEndedWarp;
+static s16 sEndedAct;
+static s32 sEndedActSelect;           // the movie went through the act selector, the replay doesn't
+static u32 sSlicesExact;
+static FILE *sCapture;
+
+static u32 item_bytes(void) {
+    u32 n = 0;
+    for (u32 i = 0; i < ARRAY_COUNT(sItems); i++) {
+        n += sItems[i].size;
+    }
+    return n;
+}
+
+// A slice's bytes in the file, padded so the next header is 4-byte aligned (the SH4 faults on a
+// misaligned load).
+static u32 slice_bytes(void) {
+    return (sizeof(struct SliceHeader) + item_bytes() + 3) & ~3u;
+}
+
+static struct SliceHeader *slice_at(u32 index) {
+    return (struct SliceHeader *) (sSlices + 8 + index * sSliceBytes);
+}
+
+// Capture to captureFile (the host), or play sliceFile's slices in playlist order ("3,10,17").
+void tas_slice_setup(const char *captureFile, const char *sliceFile, const char *playlist) {
+    if (captureFile != NULL) {
+        sCapture = fopen(captureFile, "wb");
+        if (sCapture != NULL) {
+            u32 head[2] = { 0x31534C53, slice_bytes() };   // "SLS1"
+            fwrite(head, sizeof(head), 1, sCapture);
+        }
+        return;
+    }
+    FILE *f = sliceFile != NULL ? fopen(sliceFile, "rb") : NULL;
+    if (f == NULL) {
+        return;
+    }
+    fseek(f, 0, SEEK_END);
+    long size = ftell(f);
+    fseek(f, 0, SEEK_SET);
+    sSlices = malloc((size_t) size);
+    // In 32 KB reads: one read of the whole file over dcload's /pc stalled the console.
+    long got = 0;
+    while (sSlices != NULL && got < size) {
+        size_t n = fread(sSlices + got, 1, size - got < 32768 ? (size_t) (size - got) : 32768, f);
+        if (n == 0) {
+            break;
+        }
+        got += (long) n;
+    }
+    if (sSlices == NULL || size < 8 || got != size
+        || ((u32 *) sSlices)[0] != 0x31534C53
+        || ((u32 *) sSlices)[1] != slice_bytes()) {
+        printf("TAS: %s is not a slices file of this build\n", sliceFile);
+        free(sSlices);
+        sSlices = NULL;
+        fclose(f);
+        return;
+    }
+    fclose(f);
+    sSliceBytes = ((u32 *) sSlices)[1];
+    sSliceCount = (u32) (size - 8) / sSliceBytes;
+    for (const char *p = playlist; p != NULL && *p && sPlayCount < ARRAY_COUNT(sPlaylist);) {
+        char *end;
+        long v = strtol(p, &end, 10);
+        if (end == p) {
+            break;
+        }
+        if (v >= 0 && (u32) v < sSliceCount) {
+            sPlaylist[sPlayCount++] = (s32) v;
+        }
+        p = *end == ',' ? end + 1 : end;
+    }
+    printf("TAS: %u slices, playing %u\n", (unsigned) sSliceCount, (unsigned) sPlayCount);
+}
+
+// One item's bytes in a slice.
+static const u8 *slice_item(const struct SliceHeader *s, const void *addr) {
+    const u8 *p = (const u8 *) (s + 1);
+    for (u32 i = 0; i < ARRAY_COUNT(sItems) && sItems[i].addr != addr; i++) {
+        p += sItems[i].size;
+    }
+    return p;
+}
+
+static struct SliceHeader *next_slice(void) {
+    if (sSlices == NULL || sPlayNext >= sPlayCount) {
+        return NULL;
+    }
+    sPlaying = sPlaylist[sPlayNext++];
+    struct SliceHeader *s = slice_at((u32) sPlaying);
+    // The act now: the level script places the act's objects while it loads the level, before
+    // init_level restores the rest.
+    memcpy(&gCurrActNum, slice_item(s, &gCurrActNum), sizeof(gCurrActNum));
+    printf("TAS: slice level %d area %d from sample %u\n", s->warp.levelNum, s->warp.areaIdx,
+           (unsigned) s->sample);
+    return s;
+}
+
+// lvl_init_from_save_file: the game's first level, or the first slice's.
+s32 tas_slice_first_level(s32 levelNum) {
+    if (sSlices != NULL && sPlayNext == 0 && (sPending = next_slice()) != NULL) {
+        D_8032C9E0 = 1;   // no act selector: the slice has the act
+        return sPending->warp.levelNum;
+    }
+    return levelNum;
+}
+
+// The playlist is done: a profiling build reports and exits, the host stops.
+int gTasSlicesDone;
+
+// initiate_warp: once a slice's level is left, the next level change goes to the next slice.
+void tas_slice_warp(s16 *destLevel, s16 *destArea, s16 *destWarpNode, s32 *arg) {
+    if (sSlices == NULL || sPlayNext == 0 || *destLevel == gCurrLevelNum) {
+        return;
+    }
+    if (sPlayNext >= sPlayCount && !gTasSlicesDone) {
+        gTasSlicesDone = 1;
+        printf("TAS: slices done\n");
+#if defined(DC_PROF) && !defined(TARGET_PC_ENDJINN)
+        dc_prof_request_exit();
+#endif
+    }
+    sEnded = sPlaying;
+    sEndedWarp.levelNum = (u8) *destLevel;
+    sEndedWarp.areaIdx = (u8) *destArea;
+    sEndedWarp.nodeId = (u8) *destWarpNode;
+    sEndedWarp.arg = (u32) *arg;
+    sEndedAct = gCurrActNum;
+    s32 course = gLevelToCourseNumTable[*destLevel - 1];   // as lvl_set_current_level decides
+    sEndedActSelect = course != COURSE_NONE && course <= COURSE_STAGES_MAX && D_8032C9E0 == 0;
+    if ((sPending = next_slice()) != NULL) {
+        // A warp within the level never reaches init_level, so the slice's state isn't restored.
+        if (sPending->warp.levelNum == gCurrLevelNum) {
+            printf("TAS: slice %d is in the level before it: it cannot play\n", (int) sPlaying);
+        }
+        *destLevel = sPending->warp.levelNum;
+        *destArea = sPending->warp.areaIdx;
+        *destWarpNode = sPending->warp.nodeId;
+        *arg = (s32) sPending->warp.arg;
+        D_8032C9E0 = 1;   // no act selector: the slice has the act
+    }
+}
+
+// A slice that ended exactly as in the full movie arrives where the movie's next slice starts, at
+// its sample, with its seed and state. Reports the first differences, so a replay that drifted (a
+// death the movie doesn't have, say) shows in the log rather than being hidden by the next slice.
+static void slice_check_end(void) {
+    if (sEnded < 0 || (u32) sEnded + 1 >= sSliceCount) {
+        return;
+    }
+    const struct SliceHeader *e = slice_at((u32) sEnded + 1);
+    u32 bad = 0;
+    // The act selector's frames are skipped, and with them the time and the pad that passed there,
+    // its menu's key repeat and the act chosen.
+    static const void *const selector[] = {
+        &gGlobalTimer, &gAreaUpdateCounter, &gControllerPads[0], &gCurrActNum, &gMenuHoldKeyIndex,
+        &gMenuHoldKeyTimer, &gControllers[0].rawStickX, &gControllers[0].rawStickY,
+        &gControllers[0].stickX, &gControllers[0].stickY, &gControllers[0].stickMag,
+        &gControllers[0].buttonDown, &gControllers[0].buttonPressed,
+    };
+    if ((dc_tas_frame() != e->sample && !sEndedActSelect) || sEndedWarp.levelNum != e->warp.levelNum
+        || sEndedWarp.areaIdx != e->warp.areaIdx || sEndedWarp.nodeId != e->warp.nodeId) {
+        printf("TAS: slice %d ended at sample %u level %d area %d node %d, the movie at %u level %d area %d node %d\n",
+               (int) sEnded, (unsigned) dc_tas_frame(), sEndedWarp.levelNum, sEndedWarp.areaIdx,
+               sEndedWarp.nodeId, (unsigned) e->sample, e->warp.levelNum, e->warp.areaIdx, e->warp.nodeId);
+        bad++;
+    }
+    if (tas_random_seed16() != e->seed) {
+        printf("TAS: slice %d ended with seed %04x, the movie %04x\n", (int) sEnded,
+               (unsigned) tas_random_seed16(), (unsigned) e->seed);
+        bad++;
+    }
+    // Loading the playlist's next level, not the movie's, has already set these.
+    static const void *const loaded[] = {
+        &gCurrCourseNum, &gSavedCourseNum, &gCurrCourseStarFlags, &gHudDisplay,
+        &gPaintingUpdateCounter, &gLastPaintingUpdateCounter, &gMarioStates[0].numCoins,
+        &gWarpCheckpoint,
+    };
+    const u8 *p = (const u8 *) (e + 1);
+    for (u32 i = 0; i < ARRAY_COUNT(sItems); i++) {
+        u32 k = 0;
+        while (k < ARRAY_COUNT(loaded) && loaded[k] != sItems[i].addr) {
+            k++;
+        }
+        u32 j = 0;
+        while (sEndedActSelect && j < ARRAY_COUNT(selector) && selector[j] != sItems[i].addr) {
+            j++;
+        }
+        if (k < ARRAY_COUNT(loaded) || (sEndedActSelect && j < ARRAY_COUNT(selector))) {
+            p += sItems[i].size;
+            continue;
+        }
+        const u8 *now = sItems[i].addr == &gCurrActNum ? (const u8 *) &sEndedAct : sItems[i].addr;
+        if (memcmp(now, p, sItems[i].size) != 0 && bad++ < 8) {
+            u32 at = 0;
+            while (now[at] == p[at]) {
+                at++;
+            }
+            printf("TAS: slice %d ended with %s differing from byte %u\n", (int) sEnded, sItems[i].name,
+                   (unsigned) at);
+        }
+        p += sItems[i].size;
+    }
+    if (bad == 0) {
+        sSlicesExact++;
+    }
+    printf("TAS: slice %d ended %s%s (%u of the checked exact)\n", (int) sEnded,
+           bad ? "DIFFERENT from the movie" : "as in the movie",
+           sEndedActSelect ? ", up to its act selector" : "", (unsigned) sSlicesExact);
+    sEnded = -1;
+}
+
+// init_level, before the level's warp is carried out.
+void tas_slice_init_level(void) {
+    if (sCapture != NULL && sWarpDest.type == WARP_TYPE_CHANGE_LEVEL) {
+        struct SliceHeader h = { dc_tas_frame(), sWarpDest, tas_random_seed16(), (u16) item_bytes() };
+        fwrite(&h, sizeof(h), 1, sCapture);
+        for (u32 i = 0; i < ARRAY_COUNT(sItems); i++) {
+            fwrite(sItems[i].addr, sItems[i].size, 1, sCapture);
+        }
+        static const u8 pad[4];
+        fwrite(pad, slice_bytes() - sizeof(h) - item_bytes(), 1, sCapture);
+        fflush(sCapture);
+    }
+    if (sPending != NULL) {
+        slice_check_end();
+        const u8 *p = (const u8 *) (sPending + 1);
+        for (u32 i = 0; i < ARRAY_COUNT(sItems); i++) {
+            memcpy(sItems[i].addr, p, sItems[i].size);
+            p += sItems[i].size;
+        }
+        sWarpDest = sPending->warp;
+        tas_random_seed16_set(sPending->seed);
+        dc_tas_seek(sPending->sample);
+        sPending = NULL;
+    }
+}
+
+#endif

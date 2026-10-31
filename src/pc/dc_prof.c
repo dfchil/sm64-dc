@@ -595,6 +595,13 @@ static void *hang_watchdog(void *arg) {
     return NULL;
 }
 
+// The run's work is done (a TAS slice playlist, src/game/tas_slice.c): report and exit at the end
+// of this frame, as when DC_AUTO_EXIT_SECONDS is up.
+static int sExitRequested;
+void dc_prof_request_exit(void) {
+    sExitRequested = 1;
+}
+
 void dc_prof_init(void) {
     sMainThread = thd_get_current();
     // Above the main and audio threads, so it still runs if the main thread spins.
@@ -755,7 +762,7 @@ void dc_prof_frame_end(void) {
     sProgress++;
     sStage = 0;
 
-    if (end - sRunStart >= (uint64_t) DC_AUTO_EXIT_SECONDS * 1000000) {
+    if (end - sRunStart >= (uint64_t) DC_AUTO_EXIT_SECONDS * 1000000 || sExitRequested) {
         dc_prof_stop_audio();
         sampler_finish();
         print_report();

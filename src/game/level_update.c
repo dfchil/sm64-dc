@@ -4,6 +4,7 @@
 #include "seq_ids.h"
 #include "dialog_ids.h"
 #include "audio/external.h"
+#include "tas_slice.h"
 #include "level_update.h"
 #include "game_init.h"
 #include "level_update.h"
@@ -618,6 +619,9 @@ s16 music_changed_through_warp(s16 arg) {
  * Set the current warp type and destination level/area/node.
  */
 void initiate_warp(s16 destLevel, s16 destArea, s16 destWarpNode, s32 arg3) {
+#ifdef DC_TAS
+    tas_slice_warp(&destLevel, &destArea, &destWarpNode, &arg3);
+#endif
     if (destWarpNode >= WARP_NODE_CREDITS_MIN) {
         sWarpDest.type = WARP_TYPE_CHANGE_LEVEL;
     } else if (destLevel != gCurrLevelNum) {
@@ -1147,6 +1151,10 @@ extern void nuke_everything(void);
 s32 init_level(void) {
     s32 val4 = 0;
 
+#ifdef DC_TAS
+    tas_slice_init_level();
+#endif
+
 nuke_everything();
 
     set_play_mode(PLAY_MODE_NORMAL);
@@ -1254,6 +1262,9 @@ s32 lvl_init_from_save_file(UNUSED s16 arg0, s32 levelNum) {
                                     _translation_de_mio0SegmentRomEnd);
             break;
     }
+#endif
+#ifdef DC_TAS
+    levelNum = tas_slice_first_level(levelNum);
 #endif
     sWarpDest.type = WARP_TYPE_NOT_WARPING;
     sDelayedWarpOp = WARP_OP_NONE;

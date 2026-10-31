@@ -14,7 +14,7 @@
 #include "seq_ids.h"
 #include "sm64.h"
 
-#if defined(DC_PROF) && !defined(DC_PROF_TITLE)
+#if defined(DC_PROF) && !defined(DC_PROF_TITLE) && !defined(DC_TAS)
 // Profile runs cycle the attract demos as the workload: start each one after ~3 s, not ~27 s.
 // (DC_PROF_TITLE keeps the normal wait, to profile the title screen's Mario head.)
 #define PRESS_START_DEMO_TIMER 90

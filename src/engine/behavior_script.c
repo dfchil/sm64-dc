@@ -29,6 +29,17 @@
 #define BHV_CMD_GET_ADDR_OF_CMD(index) (uintptr_t)(&gCurBhvCommand[index])
 
 static u16 gRandomSeed16;
+#ifdef DC_TAS
+// The seed, for the TAS trace (src/game/tas_trace.c).
+u16 tas_random_seed16(void) {
+    return gRandomSeed16;
+}
+
+void tas_random_seed16_set(u16 seed) {
+    gRandomSeed16 = seed;
+}
+#endif
+
 
 // Generate a pseudorandom integer from 0 to 65535 from the random seed, and update the seed.
 u16 random_u16(void) {

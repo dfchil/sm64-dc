@@ -45,6 +45,7 @@ extern unsigned int gDcProfCount[DCC_COUNT];
 #define DC_PROF_COUNT(c, n) (gDcProfCount[c] += (n))
 void dc_prof_mark(int mark);
 void dc_prof_frame_end(void);
+void dc_prof_request_exit(void);
 void dc_prof_audio_add(unsigned int us);
 // An asset read on the main thread (an AICAflow song or sound from /pc, ok = 0 if it is missing):
 // logged per frame as DCPROF ASSET, and a late frame that read one is a "load" frame.
