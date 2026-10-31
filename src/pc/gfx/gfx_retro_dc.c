@@ -100,7 +100,11 @@ struct __attribute__((aligned(32))) LoadedVertex {
 // The Makefile's ordering file places the section in .sub3, 0x2c0 bytes in (DC_HOT_DATA_RESIDUE),
 // and KOS caps each .subN at 8 KB: everything marked SM_HOT_DATA must stay under 0x1d40 (7488)
 // bytes together (0x14e0 now), or the link fails with "Sub-section .sub3 is bigger than icache size".
+#ifdef TARGET_PC_ENDJINN   // the host: no SH4 cache layout to keep
+#define SM_HOT_DATA
+#else
 #define SM_HOT_DATA __attribute__((section(".data.sm64_hot")))
+#endif
 SM_HOT_DATA uint8_t __attribute__((aligned(32))) clip_rej[MAX_VERTICES];
 
 // Triangle state epoch and baked-vertex cache: see tri_state_setup / tri_baked.
@@ -154,7 +158,11 @@ static uint8_t color_combiner_pool_size;
 // each other (measured: ~20% of display-list cycles were I-cache stalls). KOS's linker script
 // places .sub0 at an I-cache-aligned address and fails the link if it outgrows the cache, so
 // they sit side by side in it. Their cold paths are split out to keep it that small.
+#ifdef TARGET_PC_ENDJINN   // the host: no SH4 cache layout to keep
+#define SM_HOT
+#else
 #define SM_HOT __attribute__((section(".sub0.sm64_hot")))
+#endif
 // Hot code that does not fit in .sub0 (cc_eval_float: ~20% of title-screen display-list
 // samples, goddard's combiners). Left in .text it lands wherever LTO puts it; one renderer edit
 // moved it onto gfx_sp_tri1 and title I-cache stalls went 8.7% -> 22.3% of display-list cycles.
@@ -163,11 +171,19 @@ static uint8_t color_combiner_pool_size;
 // (the middle of gfx_run_dl, from title samples) and checks after the link that it did. Re-pick
 // the set from samples when .sub0 changes much. cc_eval_float keeps `cold` for its size-optimised code
 // (without it, it doubles to ~1.4 KB); the section attribute overrides where `cold` would put it.
+#ifdef TARGET_PC_ENDJINN   // the host: no SH4 cache layout to keep
+#define SM_WARM
+#else
 #define SM_WARM __attribute__((section(".sub1.sm64_warm")))
+#endif
 // tri_state_setup (4 KB, every state change) gets a fixed slot of its own the same way, in .sub2:
 // left in .text, a 0.7 ms title regression followed it when unrelated code growth moved it onto
 // gfx_sp_vertex_light. Its sets (DC_SM_WARM2_SET..) are the ones it had in the fastest build.
+#ifdef TARGET_PC_ENDJINN   // the host: no SH4 cache layout to keep
+#define SM_WARM2
+#else
 #define SM_WARM2 __attribute__((section(".sub2.sm64_warm")))
+#endif
 #define MEM_BARRIER() ((void) 0)
 
 static struct RSP {
@@ -1027,10 +1043,14 @@ static void SM_HOT __attribute__((noinline)) gfx_sp_vertex_light(size_t n_vertic
             float dotx;
             float doty;
             {
+#ifdef TARGET_PC_ENDJINN   // the pc-endjinn host (no SH4 registers)
+                float fr8 = vn->n[0], fr9 = vn->n[1], fr10 = vn->n[2], fr11 = 0;
+#else
                 register float fr8 asm("fr8") = vn->n[0];
                 register float fr9 asm("fr9") = vn->n[1];
                 register float fr10 asm("fr10") = vn->n[2];
                 register float fr11 asm("fr11") = 0;
+#endif
 
                 dotx = recip127 * shz_dot8f(fr8, fr9, fr10, fr11, rsp.current_lookat_coeffs[0][0], rsp.current_lookat_coeffs[0][1], rsp.current_lookat_coeffs[0][2], 0);
 

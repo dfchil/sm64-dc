@@ -40,6 +40,37 @@ void tas_random_seed16_set(u16 seed) {
 }
 #endif
 
+#ifdef TARGET_PC_ENDJINN
+
+// SM64_RNG_LOG=from,to: who draws each random number in movie samples from..to (stderr).
+#include <dlfcn.h>
+#include <execinfo.h>
+#include <stdio.h>
+#include <stdlib.h>
+static void pc_rng_log(void) {
+    static int from = -2, to;
+    extern unsigned int dc_tas_frame(void);
+    if (from == -2) {
+        const char *e = getenv("SM64_RNG_LOG");
+        from = -1;
+        if (e != NULL) {
+            sscanf(e, "%d,%d", &from, &to);
+        }
+    }
+    int sample = (int) dc_tas_frame();
+    if (from < 0 || sample < from || sample > to) {
+        return;
+    }
+    void *bt[5];
+    int n = backtrace(bt, 5);
+    fprintf(stderr, "RNG %d %04x", sample, gRandomSeed16);
+    for (int i = 2; i < n; i++) {
+        Dl_info info;
+        fprintf(stderr, " %lx", dladdr(bt[i], &info) ? (unsigned long) ((char *) bt[i] - (char *) info.dli_fbase) : 0ul);
+    }
+    fprintf(stderr, "\n");
+}
+#endif
 
 // Generate a pseudorandom integer from 0 to 65535 from the random seed, and update the seed.
 u16 random_u16(void) {
@@ -67,6 +98,9 @@ u16 random_u16(void) {
         gRandomSeed16 = temp2 ^ 0x8180;
     }
 
+#ifdef TARGET_PC_ENDJINN
+    pc_rng_log();
+#endif
     return gRandomSeed16;
 }
 

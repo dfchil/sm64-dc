@@ -104,7 +104,9 @@ OSTime osGetTime(void) {
 /* Real wall-clock microseconds, independent of framerate. Used to sync the
    credits->cake transition to the (frame-independent) music: a frame counter
    drifts when we run faster than the N64's credits framerate. Stubbed off-DC. */
-#ifdef TARGET_DC
+#if defined(TARGET_PC_ENDJINN)
+// pc-endjinn host build: a game-frame clock in src/pc/pc_endjinn/pc_endjinn_main.c.
+#elif defined(TARGET_DC)
 #include <arch/timer.h>
 u64 pc_realtime_us(void) { return timer_us_gettime64(); }
 #else

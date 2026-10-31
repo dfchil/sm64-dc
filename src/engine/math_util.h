@@ -28,6 +28,14 @@ extern f32 gCosineTable[];
 
 f32 sins(u16 arg0);
 f32 coss(u16 arg0);
+#ifdef TARGET_PC_ENDJINN
+// pc-endjinn host build (arm64): a float argument converts to the u16 parameter saturating (a
+// negative one becomes 0, inf leaves the register out of range). The N64 and the SH4 convert
+// through a signed int and keep the low 16 bits; game code passes such floats (e.g. the piranha
+// plant's bubble), so do the same here.
+#define sins(x) sins((u16) (s32) (x))
+#define coss(x) coss((u16) (s32) (x))
+#endif
 
 //#define sins(x) gSineTable[(u16) (x) >> 4]
 //#define coss(x) gCosineTable[(u16) (x) >> 4]
