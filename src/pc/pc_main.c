@@ -96,7 +96,14 @@ static int first_frame_late(unsigned int late_before) {
 }
 #endif
 
+#if DC_ENJ_LOOP
+static int sFrameQueued;   // send_display_list ran in this frame (the enDjinn loop below)
+#endif
+
 void send_display_list(struct SPTask *spTask) {
+#if DC_ENJ_LOOP
+    sFrameQueued = 1;
+#endif
 #ifdef DC_60FPS
     if (gDcFrameMode == DC_FRAME_MODE_30) {   // the exact matrices now; the second draw then finds
         extern s32 mtx_patch_interpolated(void);   // nothing to change and holds this frame
@@ -113,6 +120,11 @@ void send_display_list(struct SPTask *spTask) {
 }
 
 #include <kos.h>
+#if DC_ENJ_LOOP
+#include <enDjinn/enj_mode.h>
+#include <enDjinn/enj_render.h>
+#include <enDjinn/enj_state.h>
+#endif
 #undef bool
 #undef true
 #undef false
@@ -226,6 +238,100 @@ static const char *rec_sounds(void) { return DC_AUDIO_RECORD_SOUNDS; }
 
 static u8 pool[0x165000+0x70800] __attribute__((aligned(16384)));
 
+#if DC_ENJ_LOOP
+// enDjinn's enj_state_run is the frame loop. Each of its frames is one scene of the game's: a logic
+// step, whose display list send_display_list queues as the opaque list's renderer (gfx_pvr.c), or at
+// 60 fps the step's second, exact draw of that list, or the last scene shown again. enDjinn then
+// submits the scene, and its post-render callback ends the frame as the plain loop in main_func does
+// after each draw: the scene's end, the pacing to its vblank, the profiler's frame.
+extern void gfx_dc_hold_frame(void);
+static int sFrameHeld;    // this frame shows the last scene again
+static int sStepped;      // a logic step has run
+#ifdef DC_60FPS
+static int sExactNext;    // the next frame is the step's exact draw,
+static int sDropExact;    // unless the interpolated one was late (DC_FRAME_MODE_60_DROP)
+static unsigned int sLate0;
+#endif
+
+static void enj_frame_step(void) {
+    if (sStepped) {
+        thd_pass();   // between steps, as the plain loop
+    }
+    sStepped = 1;
+#ifdef DC_60FPS
+    sLate0 = gfx_dc_vbl_late;
+    sExactNext = 1;
+#endif
+    sFrameQueued = 0;
+    gfx_start_frame();
+    game_loop_one_iteration();
+    sFrameHeld = !sFrameQueued;   // nothing drawn (the reset bars): the screen stays
+    if (sFrameHeld) {
+        enj_render_hold_frame();
+    }
+}
+
+static void enj_frame(UNUSED void *data) {
+#ifdef DC_60FPS
+    if (sExactNext) {
+        extern s32 mtx_patch_interpolated(void);
+        sExactNext = 0;
+        if (sDropExact) {
+            mtx_patch_interpolated();   // still empties its table (it points into this display list)
+            DC_PROF_COUNT(DCC_DROPPED, 1);
+#if DC_OVERLAY
+            dc_overlay_count_skip();
+#endif
+        } else if (!gResetTimer) {
+            // When the exact matrices equal the interpolated ones the second draw would repeat the
+            // first: show that frame again.
+            sFrameHeld = !(mtx_patch_interpolated() || !DC_HOLD_IDENTICAL);
+            if (sFrameHeld) {
+                enj_render_hold_frame();
+                DC_PROF_COUNT(DCC_HELD, 1);
+            } else {
+                gfx_start_frame();
+                send_display_list(gGfxSPTask);
+            }
+            return;
+        }
+    }
+#endif
+    enj_frame_step();
+}
+
+static void enj_frame_shown(UNUSED void *data) {
+    if (sFrameHeld) {
+        gfx_dc_hold_frame();
+    } else {
+        DC_PROF_MARK(DCP_DL);
+        gfx_end_frame();
+#if DC_OVERLAY
+        dc_overlay_count_draw();
+#endif
+    }
+#ifdef DC_60FPS
+    if (sExactNext) {   // the step's own frame: decide its exact draw now, as the plain loop does
+        sDropExact = gDcFrameMode == DC_FRAME_MODE_60_DROP && first_frame_late(sLate0);
+    }
+#endif
+#ifdef DC_PROF
+    dc_prof_frame_end();
+#endif
+    gSysFrameCount++;
+}
+
+static void enj_loop_run(void) {
+    static enj_mode_t sGameMode;
+    sGameMode.mode_updater = enj_frame;
+    sGameMode.no_soft_reset = 1;
+    strncpy(sGameMode.name, "sm64", sizeof(sGameMode.name) - 1);
+    enj_render_post_callback_set(enj_frame_shown, NULL);
+    enj_mode_push(&sGameMode);
+    enj_state_run();
+}
+#endif
+
 void main_func(void) {
 #ifdef DC_PROF
     dc_prof_init();
@@ -287,6 +393,9 @@ void main_func(void) {
 
     inited = 1;
 
+#if DC_ENJ_LOOP
+    enj_loop_run();
+#else
     while (1) {
 #ifdef DC_60FPS
         const unsigned int late0 = gfx_dc_vbl_late;
@@ -340,6 +449,7 @@ void main_func(void) {
 #endif
         thd_pass();
     }
+#endif
 }
 
 

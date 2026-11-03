@@ -26,6 +26,9 @@
 #include "gl_fast_vert.h"   // dc_fast_t (the front-end's per-vertex emit struct)
 #include "pc/dc_prof.h"
 #include "sh4zam_port.h"
+#if DC_ENJ_LOOP
+#include <enDjinn/enj_state.h>
+#endif
 
 extern int cur_frame_persp;
 extern int prev_frame_had_persp;
@@ -538,7 +541,8 @@ static void hash_frame_end(void) {
            (unsigned) sHash[2], (unsigned) sHashVerts);   // each list's, to find which differs
 #endif
     sHashFrame++;
-    if (sHashFrame % DC_PVR_HASH_EVERY == 0) {
+    // Every frame's PVRF line says it all already: half the dcload output, which can hang a run.
+    if (DC_PVR_HASH_EVERY > 1 && sHashFrame % DC_PVR_HASH_EVERY == 0) {
         printf("PVRH %u %08x %u\n", (unsigned) sHashFrame, (unsigned) sHashBlock, (unsigned) sHashBlockVerts);
         sHashBlock = 0;
         sHashBlockVerts = 0;
@@ -1197,6 +1201,29 @@ static void gfx_pvr_init(void) {
 #if DC_LAYOUT_PAD
     __asm__ volatile("" : : "r"(dc_layout_pad));   // a use of its address: the linker keeps it
 #endif
+#if DC_ENJ_LOOP
+    // enDjinn sets the video mode and starts the PVR, with this port's mode and parameters. AICAflow
+    // or audio_dc keeps the AICA, the port reads the controllers itself, and there is no soft reset.
+    enj_state_init_defaults();
+    enj_state_t *state = enj_state_get();
+    // The same specific modes as below, not a generic one (which takes PAL's 50 Hz on a PAL
+    // console): enDjinn's field has the generic type, but vid_set_mode takes either.
+#if LOWRES
+    state->video.display_mode =
+        (vid_display_mode_generic_t) (vid_check_cable() != CT_VGA ? DM_320x240_NTSC : DM_320x240_VGA);
+#else
+    state->video.display_mode =
+        (vid_display_mode_generic_t) (vid_check_cable() != CT_VGA ? DM_640x480_NTSC_IL : DM_640x480_VGA);
+#endif
+    state->video.pixel_mode = PM_RGB888;
+    state->video.pvr_params = sPvrParams;
+    state->flags.soft_reset_enabled = 0;
+    state->flags.no_snd_init = 1;
+    state->flags.no_input_init = 1;
+    if (enj_state_startup() != 0) {
+        printf("gfx_pvr: enDjinn could not start the video\n");
+    }
+#else
 #ifdef __DREAMCAST__
 #if LOWRES
     // Native 240p (progressive). NTSC 320x240 is non-interlaced; VGA has a 320x240 mode too.
@@ -1209,6 +1236,7 @@ static void gfx_pvr_init(void) {
 #endif
 #endif
     pvr_init(&sPvrParams);
+#endif
     pvr_post_init();
 }
 
@@ -1272,6 +1300,9 @@ static void gfx_pvr_switch_fsaa(void) {
     pvr_shutdown();
     sPvrParams.fsaa_enabled = sFsaaWant;
     pvr_init(&sPvrParams);
+#if DC_ENJ_LOOP
+    enj_state_get()->video.pvr_params.fsaa_enabled = sFsaaWant;   // enDjinn's copy of the parameters
+#endif
     pvr_post_init();
 #if DC_OVERLAY
     dc_overlay_pvr_reset();
@@ -1307,7 +1338,7 @@ static inline void sm_rgba5551_to_rgbf(uint16_t c, float *r, float *g, float *b)
 
 static void gfx_pvr_start_frame(void) {
     float cr, cg, cb;
-#if !DC_NATIVE
+#if !DC_ENJ_RENDER
 #if DC_FSAA
     if (sFsaaWant != sPvrParams.fsaa_enabled) {
         gfx_pvr_switch_fsaa();
@@ -1323,8 +1354,8 @@ static void gfx_pvr_start_frame(void) {
     pvr_set_bg_color(cr, cg, cb);
     // OP list open + live for the whole frame (guaranteed-opaque geometry only).
     // Anything with alpha (blend or alpha-test cutout) is deferred to the TR bucket.
-    // DC_NATIVE: enj_render_scene has opened it already (gfx_pvr_render_frame).
-#if !DC_NATIVE
+    // DC_ENJ_RENDER: enj_render_scene has opened it already (gfx_pvr_render_frame).
+#if !DC_ENJ_RENDER
     pvr_list_begin(PVR_LIST_OP_POLY);
 #endif
     pvr_dr_init(&sDrState);
@@ -1363,7 +1394,7 @@ static void gfx_pvr_start_frame(void) {
     has_done_3d = 0;   // reset: no 3D drawn yet this frame (title bg -> far until flag)
 }
 
-#if DC_NATIVE
+#if DC_ENJ_RENDER
 // enDjinn's deferred rendering (enj_render.c): the frame is queued as list renderers, and
 // enj_render_scene waits for the PVR, begins the scene, opens each list that has renderers queued,
 // calls them in order and finishes the scene. The display list runs in the OP list's renderer, so
@@ -1373,13 +1404,16 @@ static void gfx_pvr_start_frame(void) {
 extern void enj_render_list_add(pvr_list_t renderlist, void (*renderer)(void *data), void *data);
 extern void enj_render_scene(void);
 
+#if !DC_ENJ_LOOP
 // enj_render.c asks enDjinn's state (enj_state_t) whether enj_startup set up the PVR, to skip the
-// lists it gave no bins. SM64 sets up the PVR itself and links no enj_state.c: a state that never
-// started makes every list count as enabled, and only lists with bins get renderers queued here.
+// lists it gave no bins. Without DC_ENJ_LOOP SM64 sets up the PVR itself and links no enj_state.c:
+// a state that never started makes every list count as enabled, and only lists with bins get
+// renderers queued here.
 void *enj_state_get(void) {
     static uint32_t __attribute__((aligned(32))) state[64];   // zero: flags.started = 0
     return state;
 }
+#endif
 
 static void pvr_render_pt(UNUSED void *data) {
     pvr_dr_init(&sDrState);
@@ -1409,19 +1443,21 @@ void gfx_pvr_render_frame(void (*op_renderer)(void *data), void *data) {
     sOpRenderer = op_renderer;
     enj_render_list_add(PVR_LIST_OP_POLY, pvr_render_op, data);
     DC_PROF_MARK(DCP_WAIT_BEGIN);
-    enj_render_scene();
+#if !DC_ENJ_LOOP
+    enj_render_scene();   // DC_ENJ_LOOP: enDjinn's loop submits the scene when the game's frame returns
+#endif
 }
 #endif
 
 static void gfx_pvr_end_frame(void) {
-#if !DC_NATIVE
+#if !DC_ENJ_RENDER
     pvr_list_finish();   // close the OP list (opened once this frame)
 #endif
 #ifdef DC_PROF_LISTS
     prof_count_bucket(&sPunch, PVR_KIND_PT);
     prof_count_bucket(&sTR, PVR_KIND_TR);
 #endif
-#if DC_NATIVE
+#if DC_ENJ_RENDER
     if (sPunch.nbatch > 0 && !PROF_SKIP(SKIP_PT)) {
         enj_render_list_add(PVR_LIST_PT_POLY, pvr_render_pt, NULL);
     }
@@ -1458,8 +1494,8 @@ int gfx_pvr_fsaa_x(void) {
 }
 
 static void gfx_pvr_finish_render(void) {
-    // Submits the scene to the GPU and flips (DC_NATIVE: enj_render_scene did).
-#if !DC_NATIVE
+    // Submits the scene to the GPU and flips (DC_ENJ_RENDER: enj_render_scene did).
+#if !DC_ENJ_RENDER
     pvr_scene_finish();
 #endif
 #ifdef DC_PVR_HASH

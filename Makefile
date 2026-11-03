@@ -605,6 +605,20 @@ PLATFORM_CFLAGS += -DDC_HOLD_IDENTICAL=$(DC_HOLD_IDENTICAL)
 # PVR-ready meshes, the frame rendered through enDjinn's deferred render lists (enj_render.c).
 DC_NATIVE ?= 0
 PLATFORM_CFLAGS += -DDC_NATIVE=$(DC_NATIVE)
+# DC_ENJ_RENDER=1: the frame goes to the PVR through enDjinn's deferred render lists (enj_render.c),
+# one renderer per list, with the display list run in the opaque list's (gfx_pvr.c). DC_NATIVE needs it.
+# DC_ENJ_LOOP=1 (default): enDjinn runs the frame loop as well (enj_state_run, pc_main.c) and starts
+# the video and the PVR; each of its frames is one scene of the game's. 0: SM64's own loop (main_func).
+DC_ENJ_LOOP ?= 1
+DC_ENJ_RENDER ?= 0
+ifeq ($(DC_ENJ_LOOP),1)
+  override DC_ENJ_RENDER := 1
+  PLATFORM_CFLAGS += -I$(ENDJINN_DIR)/include -DENJ_CBASEPATH=\"/cd/\" -DENJ_FSAA=$(DC_FSAA)
+endif
+ifeq ($(DC_NATIVE),1)
+  override DC_ENJ_RENDER := 1
+endif
+PLATFORM_CFLAGS += -DDC_ENJ_RENDER=$(DC_ENJ_RENDER) -DDC_ENJ_LOOP=$(DC_ENJ_LOOP)
 # DC_PVR_HASH=1 (a test build): a hash of every vertex the PVR is sent and the header it draws with,
 # printed for every DC_PVR_HASH_EVERY frames (gfx_pvr.c), to compare two renderers frame by frame
 # (tools/dc_pvr_hash_compare.py). Use DC_FRAME_MODE=1, which draws the same frames however late.
@@ -1095,21 +1109,27 @@ else
 SOUND_OBJ_FILES += $(SOUND_BIN_DIR)/aica_pool.o $(SOUND_BIN_DIR)/aica_sample_table.o
 endif
 
-# The few enDjinn sources the overlay's quick font and the native renderer's render lists need,
-# built with its own C dialect.
+# The enDjinn sources the overlay's quick font, the render lists and the frame loop need, built
+# with its own C dialect.
 ENDJINN_SRCS :=
 ifeq ($(DC_OVERLAY),1)
 ENDJINN_SRCS += enj_qfont.c enj_font.c enj_draw.c enj_bitmap.c
 endif
-ifeq ($(DC_NATIVE),1)
+ifeq ($(DC_ENJ_RENDER),1)
 ENDJINN_SRCS += enj_render.c
+endif
+ifeq ($(DC_ENJ_LOOP),1)
+ENDJINN_SRCS += enj_state.c enj_mode.c enj_ctrl.c enj_rumble.c
 endif
 ifneq ($(ENDJINN_SRCS),)
 ENDJINN_O_FILES := $(addprefix $(BUILD_DIR)/endjinn/,$(ENDJINN_SRCS:.c=.o))
 SOUND_OBJ_FILES += $(ENDJINN_O_FILES)
+# The overlay loads the quick font itself (dc_overlay.c), so enDjinn's startup must not load it too.
+ENJ_QFONT_DEFINE := -DENJ_INJECT_QFONT=1
+$(BUILD_DIR)/endjinn/enj_state.o: ENJ_QFONT_DEFINE :=
 $(BUILD_DIR)/endjinn/%.o: $(ENDJINN_DIR)/code/%.c
 	@mkdir -p $(dir $@)
-	$(CC) -std=gnu23 -O2 -c -I$(ENDJINN_DIR)/include -I$(KOS_BASE)/utils -DENJ_CBASEPATH=\"/cd/\" -DENJ_FSAA=$(DC_FSAA) -DENJ_INJECT_QFONT=1 -o $@ $<
+	$(CC) -std=gnu23 -O2 -c -I$(ENDJINN_DIR)/include -I$(KOS_BASE)/utils -DENJ_CBASEPATH=\"/cd/\" -DENJ_FSAA=$(DC_FSAA) $(ENJ_QFONT_DEFINE) -o $@ $<
 endif
 
 $(SOUND_BIN_DIR)/aica_pool.c: $(SOUND_BIN_DIR)/sound_data.tbl $(SOUND_BIN_DIR)/sound_data.ctl $(AICA_TOOLS)

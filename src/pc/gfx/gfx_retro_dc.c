@@ -3380,7 +3380,7 @@ void gfx_start_frame(void) {
     gfx_wapi->handle_events();
 }
 
-#if DC_NATIVE && !defined(TARGET_PC_ENDJINN)
+#if DC_ENJ_RENDER && !defined(TARGET_PC_ENDJINN)
 extern void gfx_pvr_render_frame(void (*op_renderer)(void *data), void *data);
 
 // The OP list's renderer (gfx_pvr_render_frame): the frame's display list.
@@ -3407,14 +3407,16 @@ void gfx_run(Gfx *commands) {
 #if DC_NATIVE && defined(TARGET_PC_ENDJINN)
     sNatFrame++;   // SM64_NAT_DBG
 #endif
-#if DC_NATIVE && !defined(TARGET_PC_ENDJINN)
+#if DC_ENJ_RENDER && !defined(TARGET_PC_ENDJINN)
     gfx_pvr_render_frame(gfx_run_op, commands);
 #else
     gfx_rapi->start_frame();
     gfx_run_dl(commands);
     gfx_rapi->end_frame();
 #endif
-    DC_PROF_MARK(DCP_DL);
+#if !DC_ENJ_LOOP
+    DC_PROF_MARK(DCP_DL);   // DC_ENJ_LOOP: the display list runs later, in the scene (pc_main.c marks it)
+#endif
     gfx_wapi->swap_buffers_begin();
 }
 
