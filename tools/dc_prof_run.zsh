@@ -27,7 +27,7 @@ for elf in "$@"; do
   out=$PWD/build/hw/$variant-$(date +%Y%m%d-%H%M%S)
   mkdir -p $out
   # AFX_STAGE=<dir>: a DC_AICAFLOW build reads its assets from /pc/afx, so copy <dir>/afx into the run.
-  [[ -n $AFX_STAGE ]] && cp -R "$AFX_STAGE/afx" $out/
+  [[ -n $AFX_STAGE ]] && cp -Rc "$AFX_STAGE/afx" $out/
   DCTOOL_LOCK_WAIT=3600 dctool_lock || exit $?
   for i in {1..10}; do dctool_loader_ready "$DCTOOL_HOST" && break; sleep 2; done
   if ! dctool_loader_ready "$DCTOOL_HOST"; then
@@ -57,17 +57,22 @@ for elf in "$@"; do
     vcap=$!
   fi
   if [[ -n $CAPTURE_AUDIO ]]; then
-    # CAPTURE_AUDIO=1: the console's sound from the HDMI capture for the whole run, to audio.wav.
-    # The device drops buffers now and then, so the file is shorter than the run: fine for levels
-    # over seconds, not for timing.
+    # CAPTURE_AUDIO=1: the console's sound from the HDMI capture for the whole run, to audio.wav,
+    # sample for sample (tools/dc_hdmi_audio.swift). The device has four channels, two of them copies.
+    [[ build/dc_hdmi_audio -nt tools/dc_hdmi_audio.swift ]] || swiftc -O tools/dc_hdmi_audio.swift -o build/dc_hdmi_audio
     until grep -q "AICAFLOW: init\|AicaSynth_Init" $out/console.log 2>/dev/null || ! kill -0 $run 2>/dev/null; do sleep 0.2; done
-    ffmpeg -hide_banner -loglevel error -f avfoundation -i ":Live Gamer Ultra 2.1-Audio" \
-      -t ${CAPTURE_AUDIO_SECONDS:-130} -ac 2 -ar 48000 $out/audio.wav < /dev/null &
+    build/dc_hdmi_audio $out/audio4.wav &
     acap=$!
   fi
   wait $run || true
-  # The capture stops with the program (CAPTURE_AUDIO_SECONDS only caps it), so it never holds the lock.
-  [[ -n $acap ]] && { sleep 2; kill -INT $acap 2>/dev/null; wait $acap 2>/dev/null || true; unset acap; }
+  # The capture stops with the program, so it never holds the lock.
+  if [[ -n $acap ]]; then
+    sleep 2
+    kill -TERM $acap 2>/dev/null
+    wait $acap 2>/dev/null || true
+    unset acap
+    ffmpeg -hide_banner -loglevel error -y -i $out/audio4.wav -af "pan=stereo|c0=c0|c1=c1" $out/audio.wav < /dev/null && rm $out/audio4.wav
+  fi
   [[ -n $cap ]] && { kill -INT $cap 2>/dev/null; wait $cap 2>/dev/null || true; unset cap; }
   [[ -n $vcap ]] && { kill -INT $vcap 2>/dev/null; wait $vcap 2>/dev/null || true; unset vcap; }
   dctool_unlock
