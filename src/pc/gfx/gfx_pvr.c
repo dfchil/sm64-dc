@@ -152,6 +152,8 @@ struct PvrTex {
     float     u_scale, v_scale; // real/padded, consumed by gfx_pvr_get_*_scale
 #ifdef DC_PROF_LISTS
     uint8_t   opaque;      // every texel's alpha is 1
+#endif
+#if defined(DC_PROF_LISTS) || defined(DC_PVR_HASH)
     uint32_t  src;         // the N64 texture address it was imported from (gfx_pvr_prof_tex_src)
 #endif
 };
@@ -346,6 +348,11 @@ void gfx_pvr_prof_tex_src(uint32_t addr) {
 }
 #else
 #define PROF_BATCH_ALPHA(bt, kind) ((void) 0)
+#ifdef DC_PVR_HASH
+void gfx_pvr_prof_tex_src(uint32_t addr) {
+    sTextures[sCurBound].src = addr;
+}
+#endif
 #endif
 
 // Append n vertices (n/3 tris) of already-screen-baked dc_fast_t to a bucket,
@@ -410,6 +417,142 @@ dc_fast_t *pvr_reserve(int kind, size_t n) {
     return out;
 }
 
+#ifdef DC_PVR_HASH
+// DC_PVR_HASH=1 (a test build): a hash of every vertex sent to the PVR and of the header it draws
+// with (not of where the headers fall: the native renderer places them differently), folded per
+// frame and printed for every DC_PVR_HASH_EVERY frames, to compare two renderers' output frame by
+// frame (tools/dc_pvr_hash_compare.py). Each list's header is hashed when it is sent.
+// Per list (OP, PT, TR): the native renderer sends PT and TR in another order, and the PVR draws each
+// list in a pass of its own, so the order of the lists does not reach the picture.
+static uint32_t sHash[3], sHashOpHdr, sHashVerts, sHashFrame, sHashBlock, sHashBlockVerts;
+// Each list's header is textured: an untextured polygon's u, v are whatever the bake left there.
+// And has vertex fog: without it a vertex's fog amount (the offset colour's alpha) does nothing, and
+// with it an amount of 0 does nothing either, so the hash takes the fog each vertex gets instead of
+// the header's fog bit (the front-end's 2D quads keep the bit of the last 3D state set up, which
+// the native renderer, setting up less, leaves at another value: same picture).
+static uint8_t sHashTex[3], sHashFog[3];
+
+static inline uint32_t hash_words(uint32_t h, const void *p, int n) {
+    const uint32_t *w = (const uint32_t *) p;
+    for (int i = 0; i < n; i++) {
+        h = (h ^ w[i]) * 0x9E3779B1u;
+        h ^= h >> 15;
+    }
+    return h;
+}
+
+// DC_PVR_DUMP_EVERY=n: every n-th frame's headers and vertices also go to /pc/pvr_<frame>.bin, as
+// 36-byte records (a word 0x48445230 + list for a header, 0x56545830 for a vertex, then its 8 words),
+// to see what two renderers' frames differ by (tools/dc_pvr_hash_compare.py --dumps).
+#if DC_PVR_DUMP_EVERY
+#define DUMP_RECORDS 12288
+static uint32_t (*sDump)[9];
+static uint32_t sDumpN, sDumpOn;
+
+static void __attribute__((noinline, cold)) dump_record(uint32_t tag, const void *p, uint32_t flags, int vertex) {
+    if (!sDumpOn || sDumpN >= DUMP_RECORDS) return;
+    uint32_t *r = sDump[sDumpN++];
+    r[0] = tag;
+    shz_memcpy4(&r[1], p, 32);
+    if (vertex) r[1] = flags;
+}
+#define DUMP_RECORD(tag, p, flags, vertex) dump_record((tag), (p), (flags), (vertex))
+#else
+#define DUMP_RECORD(tag, p, flags, vertex) ((void) 0)
+#endif
+
+// What of a header reaches the picture: its first four words (the last four hold no colour for
+// these polygons, and pvr_emit_op_header leaves whatever was on the stack in them), with the
+// texture named by the N64 address it came from instead of where in VRAM it went (the native
+// renderer binds textures in another order, so they land elsewhere).
+static uint32_t __attribute__((noinline, cold)) hash_header(int kind, const pvr_poly_hdr_t *h) {
+    uint32_t w[8];
+    shz_memcpy4(w, h, 32);
+    sHashTex[kind] = (w[0] & (1u << 3)) != 0;   // the parameter word's texture bit
+    sHashFog[kind] = ((w[2] >> 22) & 3) == PVR_FOG_VERTEX;
+    w[2] &= ~(3u << 22);
+    // The texture by the N64 address it came from (0: none, or not found).
+    uint32_t src = 0;
+    const uint32_t at = w[3] & 0x1FFFFF;
+    if (at != 0 && sHashTex[kind]) {
+        for (uint32_t i = 1; i <= sTexCount && i < PVR_TEX_MAX; i++) {
+            if (sTextures[i].addr != NULL && ((((uintptr_t) sTextures[i].addr) & 0xFFFFFF) >> 3) == at) {
+                src = sTextures[i].src;
+                break;
+            }
+        }
+    }
+    w[3] &= ~0x1FFFFFu;
+#if DC_PVR_HASH_TEX
+    w[3] ^= src;
+#endif
+    // The dump keeps the header as sent, with the texture's source in its last word (no colour
+    // there for these polygons) for tools/dc_pvr_hash_compare.py to check.
+    uint32_t d[8];
+    shz_memcpy4(d, h, 32);
+    d[7] = src;
+    DUMP_RECORD(0x48445230u + (uint32_t) kind, d, 0, 0);
+    return hash_words(0x811C9DC5u ^ (uint32_t) kind, w, 4);
+}
+
+// v with the flags it is sent with (read from where it was built: the store queues read back nothing).
+// Out of line and cold: the hot triangle paths in .sub0 only call it.
+static void __attribute__((noinline, cold)) hash_vertex(int kind, uint32_t hdr, const void *v, uint32_t flags) {
+    DUMP_RECORD(0x56545830u, v, flags, 1);
+    uint32_t w[8];
+    shz_memcpy4(w, v, 32);
+    w[0] = flags;
+    if (!sHashTex[kind]) w[4] = w[5] = 0;
+    if (!sHashFog[kind]) w[7] &= 0x00FFFFFFu;
+    sHash[kind] = hash_words(sHash[kind] ^ hdr, w, 8);
+    sHashVerts++;
+}
+
+static void hash_frame_end(void) {
+#if DC_PVR_DUMP_EVERY
+    if (sDumpOn) {
+        char name[48];
+        snprintf(name, sizeof(name), "/pc/pvr_%u.bin", (unsigned) sHashFrame);
+        FILE *f = fopen(name, "wb");
+        if (f != NULL) {
+            fwrite(sDump, 36, sDumpN, f);
+            fclose(f);
+        }
+        sDumpOn = 0;
+    }
+#if DC_PVR_DUMP_TO
+    // DC_PVR_DUMP_FROM..DC_PVR_DUMP_TO: every frame in that range instead.
+    if (sHashFrame + 1 >= DC_PVR_DUMP_FROM && sHashFrame + 1 <= DC_PVR_DUMP_TO) {
+#else
+    if ((sHashFrame + 1) % DC_PVR_DUMP_EVERY == DC_PVR_DUMP_EVERY / 2) {
+#endif
+        if (sDump == NULL) sDump = memalign(32, DUMP_RECORDS * sizeof(*sDump));
+        sDumpOn = sDump != NULL;
+        sDumpN = 0;
+    }
+#endif
+    sHashBlock = hash_words(sHashBlock, sHash, 3);
+    sHashBlockVerts += sHashVerts;
+#if DC_PVR_HASH_EVERY == 1
+    printf("PVRF %u %08x %08x %08x %u\n", (unsigned) sHashFrame + 1, (unsigned) sHash[0], (unsigned) sHash[1],
+           (unsigned) sHash[2], (unsigned) sHashVerts);   // each list's, to find which differs
+#endif
+    sHashFrame++;
+    if (sHashFrame % DC_PVR_HASH_EVERY == 0) {
+        printf("PVRH %u %08x %u\n", (unsigned) sHashFrame, (unsigned) sHashBlock, (unsigned) sHashBlockVerts);
+        sHashBlock = 0;
+        sHashBlockVerts = 0;
+    }
+    sHash[0] = sHash[1] = sHash[2] = 0x811C9DC5u;
+    sHashVerts = 0;
+}
+#define HASH_OP_HEADER(h) (sHashOpHdr = hash_header(PVR_KIND_OP, (h)))
+#define HASH_VERTEX(kind, hdr, v, flags) hash_vertex((kind), (hdr), (v), (flags))
+#else
+#define HASH_OP_HEADER(h) ((void) 0)
+#define HASH_VERTEX(kind, hdr, v, flags) ((void) 0)
+#endif
+
 // Send one store queue's 32 bytes to the TA. Unlike pvr_dr_commit (sq_flush) this has no "memory"
 // clobber: the asm only reads this vertex, so GCC keeps everything else in registers around it.
 static inline void sq_send(pvr_vertex_t *v) {
@@ -437,6 +580,9 @@ static void pvr_flush_bucket(PvrBucket *b) {
         pvr_poly_hdr_t *hp = (pvr_poly_hdr_t *) sq_next(&addr);
         *hp = bt->hdr;
         sq_send((pvr_vertex_t *) hp);
+#ifdef DC_PVR_HASH
+        const uint32_t hh = hash_header(b == &sTR ? PVR_KIND_TR : PVR_KIND_PT, &bt->hdr);
+#endif
         const pvr_vertex_t *src = &b->verts[bt->start];
         for (uint32_t v = 0; v < bt->count; v++) {
             pvr_vertex_t *vp = sq_next(&addr);
@@ -444,6 +590,7 @@ static void pvr_flush_bucket(PvrBucket *b) {
             // Flags are already set in the bucket: 3-vert tris by pvr_reserve, 4-vert quads by
             // gfx_pvr_draw_quad_2d. Do NOT re-stamp here — a blanket (v%3) would corrupt the 2D quads.
             sq_send(vp);
+            HASH_VERTEX(b == &sTR ? PVR_KIND_TR : PVR_KIND_PT, hh, &src[v], src[v].flags);
         }
     }
     pvr_dr_addr = addr;
@@ -877,6 +1024,7 @@ static inline void pvr_emit_op_header(void) {
     if (!sOpDirty) return;
     pvr_poly_hdr_t __attribute__((aligned(32))) hdr;
     pvr_compile_header(&hdr, PVR_KIND_OP);
+    HASH_OP_HEADER(&hdr);
     pvr_poly_hdr_t *hp = (pvr_poly_hdr_t *) pvr_dr_target(sDrState);
     *hp = hdr;
     pvr_dr_commit(hp);
@@ -894,6 +1042,7 @@ void pvr_submit_op(const dc_fast_t *tris, size_t n) {
         pvr_vertex_t *v = (pvr_vertex_t *) pvr_dr_target(sDrState);
         *v = *(const pvr_vertex_t *) &tris[i];
         v->flags = ((i % 3) == 2) ? PVR_CMD_VERTEX_EOL : PVR_CMD_VERTEX;
+        HASH_VERTEX(PVR_KIND_OP, sHashOpHdr, &tris[i], ((i % 3) == 2) ? PVR_CMD_VERTEX_EOL : PVR_CMD_VERTEX);
         pvr_dr_commit(v);
     }
 #ifdef DC_PROF_LISTS
@@ -913,14 +1062,17 @@ __attribute__((section(".sub0.sm64_hot"))) void pvr_submit_op_tri(const dc_fast_
     v = sq_next(&addr);
     *v = *(const pvr_vertex_t *) a;
     v->flags = PVR_CMD_VERTEX;
+    HASH_VERTEX(PVR_KIND_OP, sHashOpHdr, a, PVR_CMD_VERTEX);
     sq_send(v);
     v = sq_next(&addr);
     *v = *(const pvr_vertex_t *) b;
     v->flags = PVR_CMD_VERTEX;
+    HASH_VERTEX(PVR_KIND_OP, sHashOpHdr, b, PVR_CMD_VERTEX);
     sq_send(v);
     v = sq_next(&addr);
     *v = *(const pvr_vertex_t *) c;
     v->flags = PVR_CMD_VERTEX_EOL;
+    HASH_VERTEX(PVR_KIND_OP, sHashOpHdr, c, PVR_CMD_VERTEX_EOL);
     sq_send(v);
     pvr_dr_addr = addr;
     PROF_COUNT_OP((const pvr_vertex_t *) a, (const pvr_vertex_t *) b, (const pvr_vertex_t *) c);
@@ -995,6 +1147,7 @@ static void gfx_pvr_draw_quad_2d(void *quad, UNUSED size_t buf_vbo_len, UNUSED s
             pvr_vertex_t *o = (pvr_vertex_t *) pvr_dr_target(sDrState);
             *o = *(const pvr_vertex_t *) &q[i];
             o->flags = (i == 3) ? PVR_CMD_VERTEX_EOL : PVR_CMD_VERTEX;
+            HASH_VERTEX(PVR_KIND_OP, sHashOpHdr, &q[i], (i == 3) ? PVR_CMD_VERTEX_EOL : PVR_CMD_VERTEX);
             pvr_dr_commit(o);
         }
         PROF_COUNT_OP((const pvr_vertex_t *) &q[0], (const pvr_vertex_t *) &q[1], (const pvr_vertex_t *) &q[2]);
@@ -1029,7 +1182,20 @@ static void gfx_pvr_draw_quad_2d(void *quad, UNUSED size_t buf_vbo_len, UNUSED s
     b->batch[b->cur].count += 4;
 }
 
+#if DC_LAYOUT_PAD
+// DC_LAYOUT_PAD=n: n bytes first in .text (the Makefile's ordering file puts this section there).
+// Never run; gfx_pvr_init uses its address so the linker keeps it.
+#define DC_LAYOUT_PAD_STR2(n) #n
+#define DC_LAYOUT_PAD_STR(n) DC_LAYOUT_PAD_STR2(n)
+__attribute__((section(".text.dc_layout_pad"), noinline, used)) void dc_layout_pad(void) {
+    __asm__ volatile(".space " DC_LAYOUT_PAD_STR(DC_LAYOUT_PAD));
+}
+#endif
+
 static void gfx_pvr_init(void) {
+#if DC_LAYOUT_PAD
+    __asm__ volatile("" : : "r"(dc_layout_pad));   // a use of its address: the linker keeps it
+#endif
 #ifdef __DREAMCAST__
 #if LOWRES
     // Native 240p (progressive). NTSC 320x240 is non-interlaced; VGA has a 320x240 mode too.
@@ -1294,6 +1460,9 @@ static void gfx_pvr_finish_render(void) {
     // Submits the scene to the GPU and flips (DC_NATIVE: enj_render_scene did).
 #if !DC_NATIVE
     pvr_scene_finish();
+#endif
+#ifdef DC_PVR_HASH
+    hash_frame_end();
 #endif
 }
 

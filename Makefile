@@ -605,6 +605,27 @@ PLATFORM_CFLAGS += -DDC_HOLD_IDENTICAL=$(DC_HOLD_IDENTICAL)
 # PVR-ready meshes, the frame rendered through enDjinn's deferred render lists (enj_render.c).
 DC_NATIVE ?= 0
 PLATFORM_CFLAGS += -DDC_NATIVE=$(DC_NATIVE)
+# DC_PVR_HASH=1 (a test build): a hash of every vertex the PVR is sent and the header it draws with,
+# printed for every DC_PVR_HASH_EVERY frames (gfx_pvr.c), to compare two renderers frame by frame
+# (tools/dc_pvr_hash_compare.py). Use DC_FRAME_MODE=1, which draws the same frames however late.
+DC_PVR_HASH_EVERY ?= 64
+# DC_PVR_DUMP_EVERY=n (with DC_PVR_HASH): every n-th frame's vertices to /pc/pvr_<frame>.bin as well.
+DC_PVR_DUMP_EVERY ?= 0
+# DC_PVR_HASH_TEX=0: a header's texture leaves the hash out (1: named by the N64 address it came from).
+DC_PVR_HASH_TEX ?= 1
+# DC_PVR_DUMP_FROM=a DC_PVR_DUMP_TO=b (with DC_PVR_DUMP_EVERY): dump every frame from a to b instead.
+DC_PVR_DUMP_FROM ?= 0
+DC_PVR_DUMP_TO ?= 0
+ifeq ($(DC_PVR_HASH),1)
+  PLATFORM_CFLAGS += -DDC_PVR_HASH -DDC_PVR_HASH_EVERY=$(DC_PVR_HASH_EVERY) -DDC_PVR_DUMP_EVERY=$(DC_PVR_DUMP_EVERY) -DDC_PVR_HASH_TEX=$(DC_PVR_HASH_TEX) -DDC_PVR_DUMP_FROM=$(DC_PVR_DUMP_FROM) -DDC_PVR_DUMP_TO=$(DC_PVR_DUMP_TO)
+endif
+# DC_LAYOUT_PAD=n (A/B runs): .text starts with n bytes of padding (gfx_pvr.c), so the code and data
+# after it land on other cache sets against .sub0 and the hot data. A change that moves a benchmark
+# less than a few such shifts do is layout luck, not the change (DKR measured it so).
+DC_LAYOUT_PAD ?= 0
+ifneq ($(DC_LAYOUT_PAD),0)
+  PLATFORM_CFLAGS += -DDC_LAYOUT_PAD=$(DC_LAYOUT_PAD)
+endif
 # DC_NATIVE_DL_COLD=1: the display-list decode loop out of the I-cache-pinned .sub0 (A/B of layouts).
 ifeq ($(DC_NATIVE_DL_COLD),1)
   PLATFORM_CFLAGS += -DDC_NATIVE_DL_COLD
@@ -1299,6 +1320,7 @@ $(BUILD_DIR)/sm_warm.ld: Makefile
 	@printf '/* SM_WARM code (gfx_retro_dc.c) on I-cache sets $(DC_SM_WARM_SET).. */\n.sub1 : {\n  . = MAX(., %d); *(.sub1.sm64_warm)\n}\n' $$(( $(DC_SM_WARM_SET) * 32 )) > $@
 	@printf '/* SM_WARM2 code on I-cache sets $(DC_SM_WARM2_SET).. */\n.sub2 : {\n  . = MAX(., %d); *(.sub2.sm64_warm)\n}\n' $$(( $(DC_SM_WARM2_SET) * 32 )) >> $@
 	@printf '/* The hot data at .sub0 + $(DC_HOT_DATA_RESIDUE) mod 16 KB, .bss from a 16 KB boundary (O-cache sets). */\n.sub3 : {\n  . = MAX(., %d); *(.data.sm64_hot)\n}\n.bss : {\n  . = ALIGN(0x4000);\n}\n' $$(( ($(DC_HOT_DATA_RESIDUE) + 0x2000) & 0x3fff )) >> $@
+	$(if $(filter-out 0,$(DC_LAYOUT_PAD)),@printf '/* DC_LAYOUT_PAD: padding first in .text */\n.text : {\n  *(.text.dc_layout_pad)\n}\n' >> $@)
 
 elf: $(EXE)
 	sh-elf-objcopy -R .stack -O binary $< $<.bin

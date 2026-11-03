@@ -161,6 +161,7 @@ static FILE *sHashFile;
 static int sHashInit, sHashDumpFrame = -1;
 static FILE *sHashDump;
 static uint64_t sHash, sHashHdr;
+static int sHashTex;   // the header is textured: an untextured one's vertices carry stale u, v
 static uint32_t sHashVerts, sHashFrame;
 
 static uint64_t fnv(uint64_t h, const void *p, size_t n) {
@@ -184,6 +185,7 @@ static void hash_header(int list, const pvr_poly_hdr_t *h) {
     }
     h = &c;
     sHashHdr = fnv(0xcbf29ce484222325ull ^ (uint64_t) list, h, sizeof(*h));
+    sHashTex = (((const uint32_t *) h)[0] & (1u << 3)) != 0;   // the parameter word's texture bit
     if (sHashDump != NULL) {
         const uint32_t *w = (const uint32_t *) h;
         fprintf(sHashDump, "H%d %016llx %08x %08x %08x %08x %08x %08x %08x %08x\n", list, (unsigned long long) sHashHdr,
@@ -196,8 +198,11 @@ static void submit(const pvr_vertex_t *v) {
     *t = *v;
     pvr_dr_commit(t);
     if (sHashFile != NULL) {
+        // An untextured polygon's u, v are whatever the bake left there (it does not write them).
+        pvr_vertex_t hv = *v;
+        if (!sHashTex) hv.u = hv.v = 0.0f;
         sHash = fnv(sHash, &sHashHdr, sizeof(sHashHdr));
-        sHash = fnv(sHash, v, sizeof(*v));
+        sHash = fnv(sHash, &hv, sizeof(hv));
         sHashVerts++;
         if (sHashDump != NULL) {
             fprintf(sHashDump, "%016llx %08x %f %f %f %08x %08x %f %f\n", (unsigned long long) sHashHdr,

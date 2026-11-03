@@ -301,7 +301,7 @@ extern void gfx_pvr_cover_begin(float world_z_max);
 #ifdef DC_PROF_SKIP
 extern void gfx_pvr_prof_shadow(int on);
 #endif
-#ifdef DC_PROF_LISTS
+#if defined(DC_PROF_LISTS) || defined(DC_PVR_HASH)
 extern void gfx_pvr_prof_tex_src(uint32_t addr);
 #endif
 // Decal z-fight bias: a decal vert's z (=1/w) is scaled by this (>1 == nearer) so it wins the
@@ -792,7 +792,7 @@ static void  __attribute__((noinline)) import_texture(void) {
     if (gfx_texture_cache_lookup(&rendering_state.texture, rdp.loaded_texture.addr)) {
         return;
     }
-#ifdef DC_PROF_LISTS
+#if defined(DC_PROF_LISTS) || defined(DC_PVR_HASH)
     gfx_pvr_prof_tex_src((uint32_t) (uintptr_t) rdp.loaded_texture.addr);
 #endif
     
