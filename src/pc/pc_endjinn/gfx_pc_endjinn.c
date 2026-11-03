@@ -98,6 +98,9 @@ static void mark_dirty(void) {
 
 #if DC_NATIVE
 static const pvr_poly_hdr_t *sForcedHdr[3];   // gfx_pvr_native_header
+// Its depth test: this file's headers keep the test on in PT and TR (compile_header), so a forced
+// header cannot tell gfx_pvr_cover_begin that it was compiled with the test off.
+static uint8_t sForcedTestOff[3];
 #endif
 
 static void compile_header(pvr_poly_hdr_t *out, int kind) {
@@ -132,8 +135,9 @@ void gfx_pvr_header_for(int kind, pvr_poly_hdr_t *out) {
     compile_header(out, kind);
 }
 
-void gfx_pvr_native_header(int kind, const pvr_poly_hdr_t *hdr) {
+void gfx_pvr_native_header(int kind, const pvr_poly_hdr_t *hdr, int depth_test) {
     sForcedHdr[kind] = hdr;
+    sForcedTestOff[kind] = !depth_test;
     if (kind == KIND_OP) sOpDirty = 1;
     else if (kind == KIND_PT) sPT.dirty = 1;
     else sTR.dirty = 1;
@@ -228,7 +232,11 @@ static int bucket_open(Bucket *b, int kind, size_t n) {
         }
         b->cur = b->nbatch++;
         compile_header(&b->batch[b->cur].hdr, kind);
+#if DC_NATIVE
+        b->batch[b->cur].test_off = sForcedHdr[kind] != NULL ? sForcedTestOff[kind] : !sDepthTest;
+#else
         b->batch[b->cur].test_off = !sDepthTest;
+#endif
         b->batch[b->cur].start = b->nverts;
         b->batch[b->cur].count = 0;
         b->dirty = 0;

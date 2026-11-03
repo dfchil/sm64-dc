@@ -765,7 +765,9 @@ endif
   PLATFORM_LDFLAGS := -Wl,--gc-sections  -Wl,-Map=output.map -lsh4zam
   # SM_WARM (gfx_retro_dc.c): hot code that does not fit in .sub0, placed on I-cache sets
   # DC_SM_WARM_SET.. by an ld ordering file. .sub1 starts one I-cache size after .sub0, so the offset
-  # into .sub1 is the I-cache index. Pick the set from samples: lines .sub0 leaves cold.
+  # into .sub1 is the I-cache index. Pick the set from samples: lines .sub0 leaves cold
+  # (tools/dc_icache_sets.py). (DC_NATIVE=1 measured best at 174 too: 69, its coldest stretch
+  # by samples, was 3% slower on 2026-11-03.)
   DC_SM_WARM_SET ?= 174
   # tri_state_setup in .sub2 at I-cache set DC_SM_WARM2_SET (gfx_retro_dc.c SM_WARM2). It is ~4.1 KB
   # and must end within .sub2's 8 KB: set 126 left 24 bytes, too few once it grew to 0x1048.

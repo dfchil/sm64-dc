@@ -111,6 +111,20 @@ SM_HOT_DATA uint8_t __attribute__((aligned(32))) clip_rej[MAX_VERTICES];
 static SM_HOT_DATA uint32_t sTriStateEpoch = 1;
 static SM_HOT_DATA uint32_t __attribute__((aligned(8))) sVtxBakeEpoch[MAX_VERTICES + 4];   // shz_memset8
 static SM_HOT_DATA dc_fast_t __attribute__((aligned(32))) sVtxBaked[MAX_VERTICES + 4];
+#if DC_NATIVE
+// DC_NATIVE: a loaded vertex's screen position (x, y, 1/w), taken when a triangle first needs it for
+// its back-face test (tri_proj), apart from its bake, which only a triangle that is drawn needs: most
+// triangles that reach the test are back faces, and their corners are then never baked or lit.
+static SM_HOT_DATA float __attribute__((aligned(32))) sVtxProj[MAX_VERTICES + 4][4];
+static SM_HOT_DATA uint32_t sVtxProjGen[MAX_VERTICES + 4];   // sProjGen when taken, 0 when loaded
+static uint32_t sProjGen = 1;                                 // one per screen map
+// A lit vertex is lit when it is first baked (nat_vertex_resolve, native/gfx_native.inc.c), with the
+// lights of its load: sVtxLit is that light snapshot + 1, 0 once lit (or unlit). sLightGen counts
+// the light states gfx_vertex_lights_prep makes, so a snapshot knows when it is out of date.
+static SM_HOT_DATA uint8_t sVtxLit[MAX_VERTICES + 4];
+static uint32_t sLightGen = 1;
+static void nat_vertex_resolve(uint8_t idx);
+#endif
 
 static inline void tri_state_bump(void) {
     DC_PROF_COUNT(DCC_EPOCHS, 1);
@@ -356,6 +370,9 @@ static void gfx_recompute_screen_map(void) {
     sm_xbias  = (vpf_x + vw * 0.5f) * DC_FSAA_X;
     sm_yscale = -(vh * 0.5f);
     sm_ybias  = fb_h - vpf_y - vh * 0.5f;
+#if DC_NATIVE
+    sProjGen++;   // the screen positions taken (tri_proj) are out of date
+#endif
 }
 
 // 3-way OP/PT/TR classifier + N64-blender->PVR factor derivation. The backend exposes the
@@ -509,11 +526,14 @@ void gfx_clear_texidx(unsigned int texidx);
 
 #if DC_NATIVE
 static uint32_t sNatGen;   // native/gfx_native.inc.c
+static uint32_t sNatFrameNo;   // frames run (gfx_run), for its compile budget
+static void nat_arena_release(void);   // native/gfx_native.inc.c
 #endif
 
 void reset_texcache(void) {
 #if DC_NATIVE
     sNatGen++;   // the compiled display lists' headers point at the old textures
+    nat_arena_release();   // and their memory goes back now, before the next level's loads
 #endif
     gfx_texture_cache.pool_pos = 0;
     memset(&gfx_texture_cache, 0, sizeof(gfx_texture_cache));
@@ -968,6 +988,9 @@ static inline void gfx_vertex_lights_prep(void) {
         calculate_normal_dir(&rsp.current_lookat[0], rsp.current_lookat_coeffs[0]);
         calculate_normal_dir(&rsp.current_lookat[1], rsp.current_lookat_coeffs[1]);
         rsp.lights_changed = false;
+#if DC_NATIVE
+        sLightGen++;
+#endif
     }
     if (rsp.light_cols_changed) {
         int i;
@@ -980,6 +1003,9 @@ static inline void gfx_vertex_lights_prep(void) {
             rsp.current_lights_colf[i][2] = rsp.current_lights[i].col[2] * scale;
         }
         rsp.light_cols_changed = false;
+#if DC_NATIVE
+        sLightGen++;
+#endif
     }
 }
 
@@ -1002,6 +1028,10 @@ static void SM_HOT_VTX __attribute__((noinline)) gfx_sp_vertex(size_t n_vertices
     DC_PROF_COUNT(DCC_VERTS, n_vertices);
     for (size_t i = 0; i < n_vertices; i++) {
         sVtxBakeEpoch[dest_index + i] = 0;
+#if DC_NATIVE
+        sVtxProjGen[dest_index + i] = 0;
+        sVtxLit[dest_index + i] = 0;   // lit as it loaded
+#endif
     }
 }
 
@@ -1923,11 +1953,52 @@ static inline void tri_bake_vertex(dc_fast_t *bv, const struct LoadedVertex *v) 
 }
 
 #if DC_NATIVE
+// The screen position tri_bake_vertex gives a vertex (the same operations), taken once per load:
+// out of line, once, so that .sub0 keeps a single copy.
+static void SM_HOT __attribute__((noinline)) tri_proj_take(uint8_t idx) {
+    float *q = sVtxProj[idx];
+    const struct LoadedVertex *v = &rsp.loaded_vertices[idx];
+    const float invw = shz_invf(v->_w);
+    q[0] = sm_xscale * (v->_x * invw) + sm_xbias;
+    q[1] = sm_yscale * (v->_y * invw) + sm_ybias;
+    q[2] = invw;
+    sVtxProjGen[idx] = sProjGen;
+}
+
+static inline const float *tri_proj(uint8_t idx) {
+    if (sVtxProjGen[idx] != sProjGen) tri_proj_take(idx);
+    return sVtxProj[idx];
+}
+
 // DC_NATIVE: baked out of line, once, not inlined at each of gfx_sp_tri1's three corners, so that
-// .sub0 holds the decode loop and the native loops too.
+// .sub0 holds the decode loop and the native loops too. Its position is tri_proj's, and a lit vertex
+// is lit first.
 static void SM_HOT __attribute__((noinline)) tri_bake_slot(uint8_t idx) {
     DC_PROF_COUNT(DCC_BAKES, 1);
-    tri_bake_vertex(&sVtxBaked[idx], &rsp.loaded_vertices[idx]);
+    if (sVtxLit[idx]) nat_vertex_resolve(idx);
+    const float *q = tri_proj(idx);
+    const struct LoadedVertex *v = &rsp.loaded_vertices[idx];
+    dc_fast_t *bv = &sVtxBaked[idx];
+    const float invw = q[2];
+    bv->vert.x = q[0];
+    bv->vert.y = q[1];
+    if (sTri.ortho_3d)        bv->vert.z = 1.0f - (v->_z * invw);
+    else if (sTri.depth_test) bv->vert.z = sTri.zmode_decal ? invw * PVR_DECAL_ZBIAS : invw;
+    else                      bv->vert.z = 0.00001f;
+    if (sTri.usetex) {
+        float u = (v->u - sTri.uls) * 0.03125f;
+        float vv = (v->v - sTri.ult) * 0.03125f;
+        if (sTri.linear_filter) {
+            u += 0.5f;
+            vv += 0.5f;
+        }
+        bv->texture.u = u * sTri.recip_tw * sTri.pvr_us;
+        bv->texture.v = vv * sTri.recip_th * sTri.pvr_vs;
+    }
+    uint32_t argb, oargb;
+    cc_eval(&sTri.cc, &v->color, &argb, &oargb);
+    bv->color.packed = argb;
+    bv->pad0.vertindex = oargb | ((uint32_t) v->fog << 24);
     sVtxBakeEpoch[idx] = sTriStateEpoch;
 }
 #endif
@@ -2137,6 +2208,17 @@ static void SM_HOT __attribute__((noinline)) gfx_sp_tri1(uint8_t vtx1_idx, uint8
     // three corners are cached baked vertices and back-face culling works in screen space.
     if (sTri.fast && !((c0 | c1 | c2) & (64 | 16))) {
         DC_PROF_COUNT(DCC_FAST, 1);
+#if DC_NATIVE
+        // The back-face test from the corners' screen positions: a culled triangle bakes nothing.
+        const float *q1 = tri_proj(vtx3_idx);
+        const float *q2 = tri_proj(vtx2_idx);
+        const float *q3 = tri_proj(vtx1_idx);
+        if ((rsp.geometry_mode & G_CULL_BOTH) != 0) {
+            float dx1 = q1[0] - q2[0];
+            float dy1 = q1[1] - q2[1];
+            float dx2 = q3[0] - q2[0];
+            float dy2 = q3[1] - q2[1];
+#else
         const dc_fast_t *b1 = tri_baked(vtx3_idx);
         const dc_fast_t *b2 = tri_baked(vtx2_idx);
         const dc_fast_t *b3 = tri_baked(vtx1_idx);
@@ -2145,6 +2227,7 @@ static void SM_HOT __attribute__((noinline)) gfx_sp_tri1(uint8_t vtx1_idx, uint8
             float dy1 = b1->vert.y - b2->vert.y;
             float dx2 = b3->vert.x - b2->vert.x;
             float dy2 = b3->vert.y - b2->vert.y;
+#endif
             float cross = dx1 * dy2 - dy1 * dx2;
             if (sTri.cull_flip) {
                 cross = -cross;
@@ -2164,6 +2247,11 @@ static void SM_HOT __attribute__((noinline)) gfx_sp_tri1(uint8_t vtx1_idx, uint8
                     break;
             }
         }
+#if DC_NATIVE
+        const dc_fast_t *b1 = tri_baked(vtx3_idx);
+        const dc_fast_t *b2 = tri_baked(vtx2_idx);
+        const dc_fast_t *b3 = tri_baked(vtx1_idx);
+#endif
         if (pvr_cur_kind == 0) {
             pvr_submit_op_tri(b1, b2, b3);
         } else {
@@ -2180,6 +2268,12 @@ static void SM_HOT __attribute__((noinline)) gfx_sp_tri1(uint8_t vtx1_idx, uint8
         return;
     }
 
+#if DC_NATIVE
+    // The slow path reads the corners' colours: light them first.
+    if (sVtxLit[vtx1_idx]) nat_vertex_resolve(vtx1_idx);
+    if (sVtxLit[vtx2_idx]) nat_vertex_resolve(vtx2_idx);
+    if (sVtxLit[vtx3_idx]) nat_vertex_resolve(vtx3_idx);
+#endif
     gfx_sp_tri1_slow(v1, v2, v3, c0, c1, c2);
 }
 
@@ -3307,6 +3401,9 @@ void gfx_run(Gfx *commands) {
     gfx_pvr_prof_shadow(0);   // nor does a shadow tag
 #endif
     
+#if DC_NATIVE
+    sNatFrameNo++;   // the compile budget's frame
+#endif
 #if DC_NATIVE && defined(TARGET_PC_ENDJINN)
     sNatFrame++;   // SM64_NAT_DBG
 #endif

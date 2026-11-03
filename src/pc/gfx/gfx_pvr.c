@@ -1006,7 +1006,8 @@ void gfx_pvr_header_for(int kind, pvr_poly_hdr_t *out) {
     pvr_compile_header(out, kind);
 }
 
-void gfx_pvr_native_header(int kind, const pvr_poly_hdr_t *hdr) {
+// (depth_test: the header has it as its depth compare here; the host's needs it apart.)
+void gfx_pvr_native_header(int kind, const pvr_poly_hdr_t *hdr, UNUSED int depth_test) {
     sForcedHdr[kind] = hdr;
     if (kind == PVR_KIND_OP) sOpDirty = 1;
     else if (kind == PVR_KIND_PT) sPunch.dirty = 1;

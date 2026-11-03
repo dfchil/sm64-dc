@@ -18,19 +18,35 @@
 //
 // The vertex loads are grouped into chunks (a run of loads and the triangles drawn from them), each
 // with a bounding sphere: a chunk wholly outside one clip plane is skipped, loads and triangles,
-// since every triangle in it would have been rejected anyway. The image is the interpreter's.
+// since every triangle in it would have been rejected anyway. A list may also draw from vertices its
+// caller loaded (moving textures, shadows): those triangles' chunk is never skipped.
+//
+// Every vertex load in a native build, compiled or interpreted, goes through this file's loops. A lit
+// vertex is lit only when a drawn triangle first bakes it (nat_vertex_resolve), with the lights of
+// its load, and gfx_sp_tri1 tests back faces before it bakes (tri_proj): most triangles that reach
+// the test are back faces, so most loaded vertices are never lit or baked. The image is the
+// interpreter's, bit for bit (tools/dc_pvr_hash_compare.py, the host's SM64_PVR_HASH).
 //
 // The compiled forms hold PVR texture addresses: a texture cache reset (a level change, an FSAA
-// switch) starts the cache over (sNatGen).
+// switch) starts the cache over (sNatGen) and gives their memory back (nat_arena_release). They are
+// compiled NAT_COMPILES_PER_FRAME at most per frame, the rest interpreted until a later one.
 
 #define NAT_MAX_VARIANTS 4
-#define NAT_HASH 4096                // display lists (power of two)
-#define NAT_ARENA_BYTES (1024 * 1024)
+#define NAT_HASH 2048                // display lists (power of two)
+#define NAT_HASH_PROBES 64           // a list not found within these slots is interpreted
+// The compiled forms live in blocks taken from the heap as compiles need them, up to NAT_ARENA_MAX,
+// and given back when the texture cache resets (a level change): the rest of the heap is the
+// game's, and AICAflow needs 1.15 MB in one piece for its core bank when the first level loads.
+#define NAT_BLOCK_BYTES (64 * 1024)
+#define NAT_ARENA_MAX (512 * 1024)
 #define NAT_REC_WORDS 16384          // one list's operation stream while it is recorded
-#define NAT_REC_SEGS 256
+#define NAT_REC_SEGS 128
 #define NAT_REC_LOADS 1024
 #define NAT_REC_LIGHTS 128
 #define NAT_REC_CHUNKS 1024
+// Lists compiled in one frame at most: the rest are interpreted until a later frame, so a scene's
+// first frame does not compile all of them (a compile costs a few times an interpreted draw).
+#define NAT_COMPILES_PER_FRAME 12
 
 // State groups a list can read from the state it is called in, or leave changed.
 enum {
@@ -156,10 +172,16 @@ typedef struct {
 //   NOP_FOGCOL, rgba
 
 static NatEntry *sNatHash;
-static uint8_t *sNatArena;
-static uint32_t sNatArenaUsed, sNatArenaHigh;
+typedef struct NatBlock {
+    struct NatBlock *next;
+    uint32_t size, used;
+} NatBlock;
+static NatBlock *sNatBlocks;                 // the newest first
+static uint32_t sNatArenaUsed, sNatArenaHigh;   // bytes in blocks
+static uint8_t sNatFull;                     // NAT_ARENA_MAX reached: compile nothing more
 static uint32_t sNatCacheGen;   // sNatGen + 1 when the cache was started (0: never)
 static uint8_t sNatOff;                      // allocation failed: interpret everything
+static uint32_t sNatCompileFrame, sNatCompiles;   // this frame's compiles (NAT_COMPILES_PER_FRAME)
 
 // Recording one list.
 static struct {
@@ -188,11 +210,13 @@ static struct {
     // Chunks: where each starts in ops, and which chunk a slot was last loaded in.
     uint32_t chunk_op[NAT_REC_CHUNKS];
     int16_t chunk_merge[NAT_REC_CHUNKS];   // the first chunk this one's triangles reach back to
+    uint8_t chunk_ext[NAT_REC_CHUNKS];     // draws from vertices the caller loaded: never culled
     uint32_t nchunks;
     uint8_t chunk_has_tri;
     int16_t slot_chunk[MAX_VERTICES + 4];
     int16_t slot_load[MAX_VERTICES + 4];
     uint8_t dyn_vtx;          // a load from outside the program's data: no culling
+    uint8_t ext_vtx;          // a triangle from the caller's vertices (moving textures, shadows)
 } sRec;
 
 #ifdef TARGET_PC_ENDJINN
@@ -231,7 +255,7 @@ static Gfx __attribute__((aligned(8))) sNatOne[4];   // one command (up to three
 #endif
 
 void gfx_pvr_header_for(int kind, pvr_poly_hdr_t *out);
-void gfx_pvr_native_header(int kind, const pvr_poly_hdr_t *hdr);
+void gfx_pvr_native_header(int kind, const pvr_poly_hdr_t *hdr, int depth_test);
 void gfx_pvr_native_end(void);
 
 // ---- Where display lists live ----------------------------------------------------------------
@@ -447,6 +471,7 @@ static void nat_rec_chunk(void) {
         }
         sRec.chunk_op[sRec.nchunks] = sRec.nops;
         sRec.chunk_merge[sRec.nchunks] = (int16_t) sRec.nchunks;
+        sRec.chunk_ext[sRec.nchunks] = 0;
         sRec.nchunks++;
         sRec.chunk_has_tri = 0;
     }
@@ -551,12 +576,21 @@ static void nat_rec_tri(uint8_t a, uint8_t b, uint8_t c) {
     const uint8_t idx[3] = { a, b, c };
     const int seg = nat_rec_seg();
     if (sRec.fail) return;
+    if (sRec.nchunks == 0) nat_rec_chunk();   // triangles before any load of the list's own
+    if (sRec.fail) return;
     const int cur = (int) sRec.nchunks - 1;
     for (int i = 0; i < 3; i++) {
-        int16_t ch = idx[i] < MAX_VERTICES ? sRec.slot_chunk[idx[i]] : -1;
-        if (ch < 0) {   // a vertex loaded before the list was called
+        if (idx[i] >= MAX_VERTICES) {
             sRec.fail = 1;
             return;
+        }
+        int16_t ch = sRec.slot_chunk[idx[i]];
+        if (ch < 0) {
+            // A vertex the caller loaded (a moving texture's or a shadow's, built each frame): drawn
+            // as it is loaded when the list is drawn, in a chunk that is never culled.
+            sRec.chunk_ext[cur] = 1;
+            sRec.ext_vtx = 1;
+            continue;
         }
         if (ch < sRec.chunk_merge[cur]) sRec.chunk_merge[cur] = ch;
         const NatLoad *ld = &sRec.loads[sRec.slot_load[idx[i]]];
@@ -673,7 +707,18 @@ static void nat_rec_cmd(const Gfx *cmd) {
             }
             break;
         case (uint8_t) G_NOOP:
-            if (cmd->words.w1) sRec.fail = 1;   // a Dreamcast tag (gfx_dc_tags.h)
+#if DC_RAIL_TR
+            if (cmd->words.w1 == DC_GFX_RAIL_TR_BEGIN || cmd->words.w1 == DC_GFX_RAIL_TR_END) {
+                // BBH's fence (gfx_dc_tag): the render mode's low word is set blended and then
+                // put back as the caller had it, so the variant reads all of it from the caller.
+                sRec.om_read_l |= ~sRec.om_w_l;
+                sRec.om_w_l = ~0u;
+                sRec.written |= NG_OTHERMODE;
+                sRec.tri_op = ~0u;
+                break;
+            }
+#endif
+            if (cmd->words.w1) sRec.fail = 1;   // another Dreamcast tag (gfx_dc_tags.h)
             break;
         case G_MTX:
         case (uint8_t) G_POPMTX:
@@ -692,11 +737,40 @@ static void nat_rec_cmd(const Gfx *cmd) {
 
 static void *nat_alloc(uint32_t bytes) {
     bytes = (bytes + 31) & ~31u;
-    if (sNatArenaUsed + bytes > NAT_ARENA_BYTES) return NULL;
-    void *p = sNatArena + sNatArenaUsed;
-    sNatArenaUsed += bytes;
-    if (sNatArenaUsed > sNatArenaHigh) sNatArenaHigh = sNatArenaUsed;
+    NatBlock *b = sNatBlocks;
+    if (b == NULL || b->used + bytes > b->size) {
+        // A block of its own for what does not fit in one (its header takes the first 32 bytes).
+        const uint32_t size = bytes + 32 > NAT_BLOCK_BYTES ? bytes + 32 : NAT_BLOCK_BYTES;
+        if (sNatArenaUsed + size > NAT_ARENA_MAX || (b = nat_memalign(32, size)) == NULL) {
+            sNatFull = 1;
+            return NULL;
+        }
+        b->next = sNatBlocks;
+        b->size = size;
+        b->used = 32;
+        sNatBlocks = b;
+        sNatArenaUsed += size;
+        if (sNatArenaUsed > sNatArenaHigh) {
+            sNatArenaHigh = sNatArenaUsed;
+#if defined(DC_PROF) && !defined(TARGET_PC_ENDJINN)
+            printf("NATIVE: compiled lists use %u KB\n", (unsigned) (sNatArenaHigh >> 10));
+#endif
+        }
+    }
+    void *p = (uint8_t *) b + b->used;
+    b->used += bytes;
     return p;
+}
+
+// Every compiled form goes (the texture cache reset: their headers point at the old textures).
+static void nat_arena_release(void) {
+    while (sNatBlocks != NULL) {
+        NatBlock *next = sNatBlocks->next;
+        free(sNatBlocks);
+        sNatBlocks = next;
+    }
+    sNatArenaUsed = 0;
+    sNatFull = 0;
 }
 
 // Bounds of the vertices of loads [first, last) of the stream.
@@ -800,7 +874,9 @@ static NatVariant *nat_finalize(void) {
         ops[o] = NOP_CHUNK | (uintptr_t) (last - first) << 8;
         ops[o + 1] = nsph;
         nat_sphere(sRec.ops, first, last, spheres[nsph]);
-        if (!cull) spheres[nsph][3] = -1.0f;
+        int ext = 0;
+        for (uint32_t j = k; j < end; j++) ext |= sRec.chunk_ext[j];
+        if (!cull || ext) spheres[nsph][3] = -1.0f;
         nsph++;
         o += 2;
         memcpy(&ops[o], &sRec.ops[first], (last - first) * sizeof(uintptr_t));
@@ -864,7 +940,7 @@ static NatVariant *nat_finalize(void) {
     v->lc_out = sRec.lc_touched ? (int8_t) sRec.lc : -1;
     nat_state_get(&v->exit);
     nat_sphere(sRec.ops, 0, sRec.nops, v->sphere);
-    if (!cull) v->sphere[3] = -1.0f;
+    if (!cull || sRec.ext_vtx) v->sphere[3] = -1.0f;
     v->segs = segs;
     v->loads = loads;
     v->lights = lights;
@@ -884,6 +960,7 @@ static NatVariant *nat_record(Gfx *dl) {
     sRec.lc = rsp.lights_changed;
     sRec.nops = sRec.nsegs = sRec.nloads = sRec.nlights = sRec.nfogcols = sRec.nchunks = 0;
     sRec.chunk_has_tri = 0;
+    sRec.dyn_vtx = sRec.ext_vtx = 0;   // after ops: not cleared above
     for (int i = 0; i < MAX_VERTICES + 4; i++) sRec.slot_chunk[i] = -1;
     nat_state_get(&sRec.entry);
     sRec.active = 1;
@@ -935,6 +1012,9 @@ static NatVariant *nat_record(Gfx *dl) {
     sRec.active = 0;
     // Recording set up triangles the interpreter rejects unset, binding their textures.
     rdp.texture_changed = true;
+    // A list that only sets state (a texture for its caller's rectangles, as the HUD's and the
+    // text's do, each time with another): compiled, it would gain nothing and use up its variants.
+    if (sRec.nsegs == 0 && sRec.nloads == 0) sRec.fail = 1;
     if (sRec.fail) return NULL;
     DC_PROF_COUNT(DCC_NAT_COMPILES, 1);
     NAT_STAT(1);
@@ -1009,84 +1089,77 @@ static void __attribute__((noinline)) nat_seg_begin(const NatSeg *s) {
         gfx_pvr_set_blend(s->kind);
         pvr_cur_kind = s->kind;
     }
-    gfx_pvr_native_header(s->kind, &s->hdr);
+    gfx_pvr_native_header(s->kind, &s->hdr, s->tri.depth_test);
 }
 
 static NatLights sNatLightsIn;   // the caller's lights while a draw lights with the list's
 
-// gfx_sp_vertex_light and gfx_sp_vertex_no over converted vertices: the same results, without
-// the conversions.
-// The usual light set, one directional light and the ambient: the constants stay in registers.
-// (The same arithmetic as nat_vertex_light, in the same order.)
-static void SM_HOT __attribute__((noinline)) nat_vertex_light1(size_t n, size_t dest, const NatVtx *src) {
-    const float amb_r = rsp.current_lights_colf[1][0];
-    const float amb_g = rsp.current_lights_colf[1][1];
-    const float amb_b = rsp.current_lights_colf[1][2];
-    const float c0 = rsp.current_lights_coeffs[0][0], c1 = rsp.current_lights_coeffs[0][1];
-    const float c2 = rsp.current_lights_coeffs[0][2];
-    const float lr = rsp.current_lights_colf[0][0], lg = rsp.current_lights_colf[0][1];
-    const float lb = rsp.current_lights_colf[0][2];
-    const uint8_t fog = (rsp.geometry_mode & G_FOG) != 0;
-    for (size_t i = 0; i < n; i++, dest++) {
-        const NatVtx *v = &src[i];
-        struct LoadedVertex *d = &rsp.loaded_vertices[dest];
-        shz_vec4_t out = shz_xmtrx_transform_vec4(shz_vec4_init(v->x, v->y, v->z, 1.0f));
-        __builtin_prefetch(v + 3);
-        const float x = out.x, y = out.y, z = out.z, w = out.w;
-        float r = amb_r, g = amb_g, b = amb_b;
-        float intensity = shz_dot6f((float) v->ln.n[0], (float) v->ln.n[1], (float) v->ln.n[2], c0, c1, c2);
+// Lit vertices are lit when a drawn triangle first bakes them (nat_vertex_resolve), not when they
+// load: most loaded vertices end up only in back faces or off screen. A load keeps the lights it
+// would have been lit with as a snapshot (the colours and the model-space directions
+// gfx_vertex_lights_prep made), and each vertex the snapshot's number.
+#define NAT_LIT_SNAPS 32   // a power of two
+typedef struct {
+    float coef[MAX_LIGHTS][3];       // the directional lights' directions (current_lights_coeffs)
+    float col[MAX_LIGHTS + 1][3];    // their colours, then the ambient (current_lights_colf)
+    int nl;                          // directional lights
+    uint32_t gen;                    // sLightGen it was taken at
+} NatLitSnap;
+static NatLitSnap sNatLit[NAT_LIT_SNAPS];
+static uint32_t sNatLitCur;
+
+// gfx_sp_vertex_light's arithmetic, in the same order, from the vertex's snapshot (its normal is
+// where its colour goes until then). In .sub1 after cc_eval_float (SM_WARM): .sub0 is full.
+static void SM_WARM __attribute__((noinline)) nat_vertex_resolve(uint8_t idx) {
+    const NatLitSnap *sn = &sNatLit[sVtxLit[idx] - 1];
+    struct LoadedVertex *d = &rsp.loaded_vertices[idx];
+    const float nx = (float) (int8_t) d->color.r, ny = (float) (int8_t) d->color.g, nz = (float) (int8_t) d->color.b;
+    const int nl = sn->nl;
+    float r = sn->col[nl][0];
+    float g = sn->col[nl][1];
+    float b = sn->col[nl][2];
+    for (int l = 0; l < nl; l++) {
+        float intensity = shz_dot6f(nx, ny, nz, sn->coef[l][0], sn->coef[l][1], sn->coef[l][2]);
         if (intensity > 0.0f) {
-            r += intensity * lr;
-            g += intensity * lg;
-            b += intensity * lb;
+            r += intensity * sn->col[l][0];
+            g += intensity * sn->col[l][1];
+            b += intensity * sn->col[l][2];
         }
-        d->color.r = r >= 255.0f ? 255 : (uint8_t) r;
-        d->color.g = g >= 255.0f ? 255 : (uint8_t) g;
-        d->color.b = b >= 255.0f ? 255 : (uint8_t) b;
-        d->color.a = v->ln.a;
-        d->u = v->u;
-        d->v = v->v;
-        clip_rej[dest] = 128 | ((w < 0) ? 64 : 0x00) | trivial_reject(x, y, z, w);
-        d->_x = x;
-        d->_y = y;
-        d->_z = z;
-        d->_w = w;
-        d->fog = fog ? gfx_calc_fog(z, w) : 0;
     }
+    d->color.r = r >= 255.0f ? 255 : (uint8_t) r;
+    d->color.g = g >= 255.0f ? 255 : (uint8_t) g;
+    d->color.b = b >= 255.0f ? 255 : (uint8_t) b;
+    sVtxLit[idx] = 0;
 }
 
-static void __attribute__((noinline)) nat_vertex_light(size_t n, size_t dest, const NatVtx *src) {
-    const int nl = rsp.current_num_lights - 1;
-    float lcoef[MAX_LIGHTS][3], lcol[MAX_LIGHTS][3];
-    const float amb_r = rsp.current_lights_colf[nl][0];
-    const float amb_g = rsp.current_lights_colf[nl][1];
-    const float amb_b = rsp.current_lights_colf[nl][2];
-    for (int l = 0; l < nl; l++) {
-        for (int c = 0; c < 3; c++) {
-            lcoef[l][c] = rsp.current_lights_coeffs[l][c];
-            lcol[l][c] = rsp.current_lights_colf[l][c];
-        }
+// The snapshot of the current lights (after gfx_vertex_lights_prep), + 1. Before one is reused, the
+// vertices still waiting on it are lit.
+static uint8_t nat_lit_snapshot(void) {
+    if (sNatLit[sNatLitCur].gen == sLightGen) return (uint8_t) (sNatLitCur + 1);
+    sNatLitCur = (sNatLitCur + 1) & (NAT_LIT_SNAPS - 1);
+    const uint8_t id = (uint8_t) (sNatLitCur + 1);
+    for (int i = 0; i < MAX_VERTICES; i++) {
+        if (sVtxLit[i] == id) nat_vertex_resolve((uint8_t) i);
     }
+    NatLitSnap *sn = &sNatLit[sNatLitCur];
+    const int nl = rsp.current_num_lights - 1;
+    sn->nl = nl < 0 ? 0 : nl > MAX_LIGHTS ? MAX_LIGHTS : nl;
+    memcpy(sn->coef, rsp.current_lights_coeffs, sizeof(sn->coef));
+    memcpy(sn->col, rsp.current_lights_colf, sizeof(sn->col));
+    sn->gen = sLightGen;
+    return id;
+}
+
+// A lit load over converted vertices: gfx_sp_vertex_light's position, texture coordinates and fog;
+// the normal and alpha go where the colour goes (NatVtx keeps them where an unlit one's colour is).
+static void SM_HOT __attribute__((noinline)) nat_vertex_lit(size_t n, size_t dest, const NatVtx *src) {
     for (size_t i = 0; i < n; i++, dest++) {
         const NatVtx *v = &src[i];
         struct LoadedVertex *d = &rsp.loaded_vertices[dest];
         shz_vec4_t out = shz_xmtrx_transform_vec4(shz_vec4_init(v->x, v->y, v->z, 1.0f));
         __builtin_prefetch(v + 3);
-        d->color.a = v->ln.a;
         const float x = out.x, y = out.y, z = out.z, w = out.w;
-        float r = amb_r, g = amb_g, b = amb_b;
-        const float nx = (float) v->ln.n[0], ny = (float) v->ln.n[1], nz = (float) v->ln.n[2];
-        for (int l = 0; l < nl; l++) {
-            float intensity = shz_dot6f(nx, ny, nz, lcoef[l][0], lcoef[l][1], lcoef[l][2]);
-            if (intensity > 0.0f) {
-                r += intensity * lcol[l][0];
-                g += intensity * lcol[l][1];
-                b += intensity * lcol[l][2];
-            }
-        }
-        d->color.r = r >= 255.0f ? 255 : (uint8_t) r;
-        d->color.g = g >= 255.0f ? 255 : (uint8_t) g;
-        d->color.b = b >= 255.0f ? 255 : (uint8_t) b;
+        d->color = v->c;
         d->u = v->u;
         d->v = v->v;
         clip_rej[dest] = 128 | ((w < 0) ? 64 : 0x00) | trivial_reject(x, y, z, w);
@@ -1119,19 +1192,19 @@ static void SM_HOT __attribute__((noinline)) nat_vertex_no(size_t n, size_t dest
 
 static void nat_vertex(size_t n, size_t dest, const NatVtx *src) {
     shz_xmtrx_load_4x4((const shz_mat4x4_t *) &rsp.MP_matrix);
+    uint8_t lit = 0;
     if (rsp.geometry_mode & G_LIGHTING) {
         gfx_vertex_lights_prep();
-        if (rsp.current_num_lights == 2) {
-            nat_vertex_light1(n, dest, src);
-        } else {
-            nat_vertex_light(n, dest, src);
-        }
+        lit = nat_lit_snapshot();
+        nat_vertex_lit(n, dest, src);
     } else {
         nat_vertex_no(n, dest, src);
     }
     DC_PROF_COUNT(DCC_VERTS, n);
     for (size_t i = 0; i < n; i++) {
         sVtxBakeEpoch[dest + i] = 0;
+        sVtxProjGen[dest + i] = 0;
+        sVtxLit[dest + i] = lit;
     }
 }
 
@@ -1338,14 +1411,13 @@ static void __attribute__((noinline)) nat_draw(const NatVariant *v) {
 
 static int nat_init(void) {
     if (sNatOff) return 0;
-    if (sNatArena == NULL) {
+    if (sNatHash == NULL) {
         nat_static_init();
 #ifdef TARGET_PC_ENDJINN
         atexit(nat_stat_print);
 #endif
-        sNatArena = nat_memalign(32, NAT_ARENA_BYTES);
         sNatHash = nat_memalign(32, NAT_HASH * sizeof(NatEntry));
-        if (sNatArena == NULL || sNatHash == NULL) {
+        if (sNatHash == NULL) {
             printf("NATIVE: no memory for the compiled display lists\n");
             sNatOff = 1;
             return 0;
@@ -1353,7 +1425,7 @@ static int nat_init(void) {
     }
     if (sNatCacheGen != sNatGen + 1) {
         memset(sNatHash, 0, NAT_HASH * sizeof(NatEntry));
-        sNatArenaUsed = 0;
+        nat_arena_release();   // reset_texcache gave the blocks back already
         sNatCacheGen = sNatGen + 1;
     }
     return 1;
@@ -1365,17 +1437,22 @@ static int __attribute__((noinline)) nat_try(Gfx *dl) {
         !(nat_is_static(dl) || nat_is_stable(dl))) {
         return 0;
     }
-    uint32_t h = (((uint32_t) (uintptr_t) dl >> 3) * 0x9E3779B1u) >> 20;
-    NatEntry *e;
-    for (;; h = (h + 1) & (NAT_HASH - 1)) {
-        e = &sNatHash[h & (NAT_HASH - 1)];
-        if (e->dl == dl) break;
-        if (e->dl == NULL) {
-            e->dl = dl;
+    uint32_t h = (((uint32_t) (uintptr_t) dl >> 3) * 0x9E3779B1u) >> 21;
+    NatEntry *e = NULL;
+    for (int probe = 0; probe < NAT_HASH_PROBES; probe++, h = (h + 1) & (NAT_HASH - 1)) {
+        NatEntry *t = &sNatHash[h & (NAT_HASH - 1)];
+        if (t->dl == dl) {
+            e = t;
+            break;
+        }
+        if (t->dl == NULL) {
+            if (sNatFull) return 0;   // nothing more compiles until the next reset
+            t->dl = dl;
+            e = t;
             break;
         }
     }
-    if (e->bad) return 0;
+    if (e == NULL || e->bad) return 0;
 #ifdef TARGET_PC_ENDJINN
     {   // SM64_NAT_SKIP=name,name: interpret these lists (host debugging)
         static const char *skip;
@@ -1411,6 +1488,13 @@ static int __attribute__((noinline)) nat_try(Gfx *dl) {
 #endif
         return 0;
     }
+    if (sNatFull) return 0;
+    if (sNatCompileFrame != sNatFrameNo) {
+        sNatCompileFrame = sNatFrameNo;
+        sNatCompiles = 0;
+    }
+    if (sNatCompiles >= NAT_COMPILES_PER_FRAME) return 0;
+    sNatCompiles++;
     NatVariant *v = nat_record(dl);
     if (v == NULL) {
         if (sRec.fail && !sRec.soft) {
