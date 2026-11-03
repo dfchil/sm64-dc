@@ -134,6 +134,12 @@ def closure(start, bhv_table, func_file, file_info):
     return seen, files
 
 
+# Sounds played as name + (n << 16), and how many members each family has.
+SOUND_FAMILIES = {
+    "SOUND_MENU_COLLECT_RED_COIN": 8, "SOUND_MENU_COLLECT_SECRET": 5, "SOUND_MARIO_YAH_WAH_HOO": 3,
+    "SOUND_MARIO_YAHOO_WAHA_YIPPEE": 5, "SOUND_MARIO_PANTING": 3,
+}
+
 # Songs the general game code plays, by where they can play. "*" is every level; "caps:wing" etc.
 # are the levels with that cap in an exclamation box.
 SONG_RULES = {
@@ -216,6 +222,8 @@ def main():
         out = {f"sfx_{keys[s]:08X}" for s in sounds if s in keys}
         # Mario's terrain sounds are played with m->terrainSoundAddend added: SOUND_TERRAIN_* << 16.
         out |= {f"sfx_{keys[s] + (t << 16):08X}" for s in sounds if s in keys and "_TERRAIN_" in s for t in range(8)}
+        # Others are picked as name + (n << 16): the next red coin's or secret's note, Mario's random voices.
+        out |= {f"sfx_{keys[s] + (t << 16):08X}" for s in sounds if s in keys for t in range(SOUND_FAMILIES.get(s, 0))}
         out |= {f"seq{seqs[q]:02X}" for q in songs if q in seqs and seqs[q] != 0}
         return out
 
@@ -248,6 +256,9 @@ def main():
         music = set(re.findall(r"\b(SEQ_[A-Z_]+)\b", script.read_text())) if script.exists() else set()
         if lvl in ("intro", "menu"):
             music |= menu_seqs | {q for q, where in SONG_RULES.items() if lvl in where.split()}
+        # The race fanfare plays as the race's song loads, so it must not sit in the room that takes.
+        if "SEQ_EVENT_RACE" in SONG_RULES and lvl in SONG_RULES["SEQ_EVENT_RACE"].split():
+            music.add("SEQ_EVENT_RACE")
         result["music"][lvl] = sorted(stems(set(), music))
         flows, samples = asset_cost(own, stage)
         total = dict(g_samples, **samples)

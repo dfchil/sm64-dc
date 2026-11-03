@@ -1,8 +1,9 @@
 /* The game's audio through AICAflow (make DC_AICAFLOW=1).
  *
- * src/audio/external.c keeps its music queue and request logic; where it would
- * start, fade or stop a sequence player, or queue a sound, it calls in here.
- * Nothing is sequenced on the SH4: a song or sound is one AFB (its samples)
+ * src/audio/external.c keeps the game's logic: the music queue, the volumes in the sequence
+ * players, and the sound banks with their priorities and one channel each. Where it would start
+ * a sequence or run a sound script, it calls in here. Nothing is sequenced on the SH4: a song or
+ * sound is one AFB (its samples)
  * and one AFX (its control flow), built offline from a console recording of
  * the original driver (tools/aica/sm64_afx.py). A song loops by itself
  * (AFX LOOP); a sound ends by itself.
@@ -11,9 +12,6 @@
  * sequence XX (hex), sfx_XXXXXXXX.afb/.afx for a sound's bank and id bits
  * (soundBits & 0xF0FF0000). Missing ones are remembered and stay silent.
  * Loading is synchronous; a planned per-area residency comes later.
- *
- * Fade timers are the sequencer's units: audio sub-updates, 240 per second,
- * so 8 per 30 Hz game tick (sm64_afx_tick).
  *
  * Reverb is the N64 mixer's: one feedback delay line, its length and feedback from the audio
  * session preset (sound_reset), as the scene's DSP program (AICAflow's delay prefab). Songs carry
@@ -27,6 +25,7 @@
 #include <kos.h>
 #include <aicaflow/host.h>
 #include <aicaflow/bank.h>
+#include <aicaflow/codec.h>
 
 #include "sm64_aicaflow.h"
 #include "sm64_sfx_reverb.h"
@@ -36,11 +35,12 @@ extern s16 gCurrLevelNum;
 #ifndef DC_AICAFLOW_ROOT
 #define DC_AICAFLOW_ROOT "/pc/afx"
 #endif
-#define SUB_UPDATES_PER_TICK 8
-#define MUSIC_PLAYERS 3
+#define MUSIC_PLAYERS 2
 #define SFX_ASSETS 320
 #define SONG_CACHE 16
-#define SFX_VOICES 32
+#define SFX_CHANNELS 10   /* SOUND_BANK_COUNT, one channel each (sMaxChannelsForSoundBank) */
+#define MENU_BANK 7
+#define SEQ_CREDITS 0x1A
 #define RETIRING 16
 
 extern const unsigned char gAicaflowFirmware[];
@@ -52,6 +52,7 @@ typedef struct {
     u32 id;
     u8 resident;   /* loaded from a scene pack: kept until its scene ends, not retired */
     u8 core;       /* from scene_core: kept for the whole run */
+    u8 lanes;      /* the flow's lane count: afx_instance_lanes_set drops a mask beyond it */
     afx_bank_t *shared;   /* a version 2 pack's scene bank, which it does not own; else bank */
 } Asset;
 
@@ -70,10 +71,12 @@ static void level_bank_release(void) {
 typedef struct {
     Asset asset;             /* the loaded song; id = sequence + 1, 0 = none */
     afx_instance_t inst;
-    f32 gain, target, step;  /* fade state, 0..1 */
-    f32 scale;               /* lowered volume (func_8031FFB4), 0..1 */
+    f32 gain;                /* from external.c, over the volume the song was recorded at */
     u8 sentGain;
-    u8 stopAtZero;
+    u8 sentLane[16];
+    u8 seq;
+    u8 paused;               /* AFX_CMD_PAUSE sent: the song waits for the pause menu to close */
+    u32 pausedAt;            /* AICA timer tick then */
 } Music;
 
 static Music sMusic[MUSIC_PLAYERS];
@@ -84,22 +87,19 @@ static Asset sSongs[SONG_CACHE];
 static s16 sSceneLevel = -1;
 static u8 sCorePackTried;
 static u8 sPackAbsent[128];   /* per level: it has no pack (not looked for again) */
-/* A playing sound: which asset, from which source (the game's position pointer), and for a
- * continuous sound (no 0x80 flag) the tick it was last requested: the game requests those every
- * frame and they stop two ticks after the requests do. */
+/* A sound channel: what update_game_sound last started on it. */
 typedef struct {
     afx_instance_t inst;
-    u32 key, bits;
-    f32 *pos;
-    u32 last;
-    u8 continuous;
+    u32 key;
     u8 gain;     /* last sent */
     s8 pan;      /* last sent lane pan offset */
+    s8 pitch;    /* last sent lane pitch offset */
     u8 script;   /* the sound script's reverb (sSfxScriptReverb) */
     u8 send;     /* last sent lane DSP send */
-} SfxVoice;
-static SfxVoice sSfxVoice[SFX_VOICES];
-static u32 sSfxNext, sTick;
+    f32 fade, fadeStep;   /* func_803210D4's fade at a level's end, 1 down to 0 */
+} SfxChannel;
+static SfxChannel sChannel[SFX_CHANNELS];
+static u8 sMuted;
 static struct { Asset asset; afx_instance_t inst; } sRetiring[RETIRING];
 /* Stops the firmware has not taken yet: a lifecycle command returns AFX_BUSY while an earlier one
  * is unacknowledged (or AFX_IPC_FULL with the queue full), and a stop lost that way leaves its
@@ -136,6 +136,19 @@ static int read_file(const char *path, void **out, u32 *bytes) {
     return 0;
 }
 
+static int flow_upload(Asset *a, afx_bank_t *bank, const void *data, u32 bytes) {
+    afx_file_header_t h;
+    int result = afx_bank_flow_upload(bank, data, bytes, &a->flow);
+    a->lanes = 0;
+    if (!result && afx_file_validate(data, bytes, &h) == AFX_OK && (h.flags & AFX_FLAG_LANES)) {
+        const u8 *map = (const u8 *) data + h.image_offset + h.setup_count * AFX_SETUP_BYTES;
+        for (u32 i = 0; i < h.required_channels; i++) {
+            if (map[i] >= a->lanes) a->lanes = map[i] + 1;
+        }
+    }
+    return result;
+}
+
 static int asset_load_files(Asset *a, const char *stem, u32 id, u32 *bytes) {
     char path[128];
     void *flow = NULL;
@@ -144,7 +157,7 @@ static int asset_load_files(Asset *a, const char *stem, u32 id, u32 *bytes) {
     int result = afx_bank_load_file(&a->bank, path);
     if (result) return result;
     snprintf(path, sizeof(path), "%s/%s.afx", DC_AICAFLOW_ROOT, stem);
-    result = read_file(path, &flow, bytes) ? -1 : afx_bank_flow_upload(&a->bank, flow, *bytes, &a->flow);
+    result = read_file(path, &flow, bytes) ? -1 : flow_upload(a, &a->bank, flow, *bytes);
     free(flow);
     if (result) {
         afx_bank_release(&a->bank);
@@ -225,7 +238,8 @@ static int gone(afx_instance_t inst) {
 static void free_retired(void) {
     for (int i = 0; i < RETIRING; i++) {
         if (sRetiring[i].asset.id && gone(sRetiring[i].inst)) {
-            afx_asset_free(sRetiring[i].asset.flow);
+            /* A stop the firmware has yet to take holds the flow: its turn comes on a later pass. */
+            if (afx_asset_free(sRetiring[i].asset.flow) == -AFX_ASSET_REFERENCED) continue;
             if (!sRetiring[i].asset.shared) afx_bank_release(&sRetiring[i].asset.bank);
             memset(&sRetiring[i], 0, sizeof(sRetiring[i]));
         }
@@ -251,7 +265,7 @@ typedef struct {
 
 static int pack_entry_load2(Asset *a, const u8 *base, const PackEntry2 *e, afx_bank_t *bank, u32 id, u8 core) {
     memset(a, 0, sizeof(*a));
-    int result = afx_bank_flow_upload(bank, base + e->afx_off, e->afx_size, &a->flow);
+    int result = flow_upload(a, bank, base + e->afx_off, e->afx_size);
     if (result) {
         printf("AICAFLOW: %.24s: flow not loaded (%d)\n", e->stem, result);
         memset(a, 0, sizeof(*a));
@@ -268,7 +282,7 @@ static int pack_entry_load(Asset *a, const u8 *base, const PackEntry *e, u32 id,
     memset(a, 0, sizeof(*a));
     int result = afx_bank_load_memory(&a->bank, base + e->afb_off, e->afb_size);
     if (result) return result;
-    result = afx_bank_flow_upload(&a->bank, base + e->afx_off, e->afx_size, &a->flow);
+    result = flow_upload(a, &a->bank, base + e->afx_off, e->afx_size);
     if (result) {
         afx_bank_release(&a->bank);
         memset(a, 0, sizeof(*a));
@@ -431,6 +445,15 @@ static void asset_free(Asset *a) {
  * they play again. */
 static u8 sEvictedSeq[128];
 
+/* Sounds read from their files can be read again: those not playing let go. */
+static void sfx_release_idle(void) {
+    for (int i = 0; i < SFX_ASSETS; i++) {
+        int playing = 0;
+        for (int c = 0; c < SFX_CHANNELS; c++) playing |= sChannel[c].key + 1 == sSfx[i].id && !gone(sChannel[c].inst);
+        if (sSfx[i].id && !sSfx[i].resident && !playing) asset_free(&sSfx[i]);
+    }
+}
+
 /* Room in AICA RAM for a song that is not loaded (an event song the pack left out, which then
  * replaces the level's music): once `stopping` (the song it replaces) and the other retired
  * assets are gone, the pack's songs that are not playing let go of their flows; their samples
@@ -443,6 +466,16 @@ static void song_make_room(afx_instance_t stopping) {
             m->inst = 0;
         }
     }
+    /* A song outranks a sound read from its file, which sits in the free end of AICA RAM. */
+    for (int c = 0; c < SFX_CHANNELS; c++) {
+        for (int i = 0; i < SFX_ASSETS && sChannel[c].inst; i++) {
+            if (sSfx[i].id == sChannel[c].key + 1 && !sSfx[i].resident) {
+                retire(&sSfx[i], sChannel[c].inst);   /* stops it; freed once it is gone */
+                sChannel[c].inst = 0;
+            }
+        }
+    }
+    sfx_release_idle();
     for (int wait = 0; wait < 50; wait++) {
         retry_stops();
         free_retired();
@@ -496,12 +529,42 @@ static int pack_reload(const char *stem) {
     return result;
 }
 
+/* The credits' song does not fit beside the core pack, and the game has most sound banks disabled
+ * through the credits (level_update.c): the pack goes for it, flows bound to its bank too, and
+ * what still plays comes from its own files. */
+static void core_drop(void) {
+    for (int i = 0; i < SFX_CHANNELS; i++) {
+        stop_inst(sChannel[i].inst);
+        sChannel[i].inst = 0;
+    }
+    for (int p = 0; p < MUSIC_PLAYERS; p++) {
+        retire(&sMusic[p].asset, sMusic[p].inst);
+        sMusic[p].inst = 0;
+    }
+    for (int i = 0; i < SONG_CACHE; i++)
+        if (sSongs[i].id && (sSongs[i].core || sSongs[i].shared == &sCoreBank)) asset_free(&sSongs[i]);
+    for (int i = 0; i < SFX_ASSETS; i++)
+        if (sSfx[i].id && (sSfx[i].core || sSfx[i].shared == &sCoreBank)) asset_free(&sSfx[i]);
+    /* The bank goes once the last flow bound to it has: that waits for the stops above. */
+    for (int wait = 0; wait < 50 && sCoreBankUp; wait++) {
+        retry_stops();
+        free_retired();
+        if (afx_bank_release(&sCoreBank) == 0) sCoreBankUp = 0;
+        else thd_sleep(1);
+    }
+    if (sCoreBankUp) printf("AICAFLOW: core bank still referenced\n");
+}
+
 /* A song that is not loaded, into a: from the pack if song_make_room let it go, else from its own
  * files; when AICA RAM runs short, song_make_room and one more try. */
 static int song_fetch(Asset *a, const char *stem, u8 seq, afx_instance_t stopping) {
     int result = -1;
-    for (int attempt = 0; attempt < 2; attempt++) {
-        if (attempt) song_make_room(stopping);
+    for (int attempt = 0; attempt < 3; attempt++) {
+        if (attempt == 1) song_make_room(stopping);
+        if (attempt == 2) {
+            if (seq != SEQ_CREDITS) break;
+            core_drop();
+        }
         if (sEvictedSeq[seq] && (result = pack_reload(stem)) == 0) {
             sEvictedSeq[seq] = 0;
             for (int i = 0; i < SONG_CACHE; i++)
@@ -518,17 +581,18 @@ static int song_fetch(Asset *a, const char *stem, u8 seq, afx_instance_t stoppin
  * RAM, so the new scene starts with the room it needs. The stops are waited for (a level load
  * has time to spare) before the assets are freed. */
 static void scene_end(void) {
-    afx_instance_t stopped[MUSIC_PLAYERS + SFX_VOICES];
+    afx_instance_t stopped[MUSIC_PLAYERS + SFX_CHANNELS];
     int count = 0;
     for (int p = 0; p < MUSIC_PLAYERS; p++) {
         if (sMusic[p].inst) stopped[count++] = sMusic[p].inst;
         stop_inst(sMusic[p].inst);
         sMusic[p].inst = 0;
-        sMusic[p].stopAtZero = 0;
+        sMusic[p].paused = 0;
     }
-    for (int i = 0; i < SFX_VOICES; i++) {
-        if (sSfxVoice[i].inst) stopped[count++] = sSfxVoice[i].inst;
-        stop_inst(sSfxVoice[i].inst);
+    for (int i = 0; i < SFX_CHANNELS; i++) {
+        if (sChannel[i].inst) stopped[count++] = sChannel[i].inst;
+        stop_inst(sChannel[i].inst);
+        sChannel[i].inst = 0;
     }
     for (int wait = 0; wait < 200; wait++) {
         int busy = 0;
@@ -537,7 +601,10 @@ static void scene_end(void) {
         if (!busy) break;
         thd_sleep(1);
     }
-    for (int i = 0; i < SFX_VOICES; i++) sSfxVoice[i].inst = 0;
+    for (int i = 0; i < SFX_CHANNELS; i++) {
+        sChannel[i].fade = 1.0f;
+        sChannel[i].fadeStep = 0.0f;
+    }
     for (int p = 0; p < MUSIC_PLAYERS; p++) {
         if (sMusic[p].asset.id && !sMusic[p].asset.resident) asset_free(&sMusic[p].asset);
         memset(&sMusic[p].asset, 0, sizeof(sMusic[p].asset));
@@ -569,9 +636,27 @@ static s16 scene_level(void) {
     return sMenuOver >= 0 ? 1 : gCurrLevelNum;
 }
 
+#ifdef DC_PROF
+/* The ARM7 main stack's deepest use so far: crt0.s fills it with AFX_STACK_PATTERN. */
+static void arm7_stack_report(void) {
+    u32 at = AFX_STACK_BASE;
+    while (at < AFX_SVC_STACK_TOP && g2_read_32(0xa0800000u + at) == AFX_STACK_PATTERN) at += 4;
+    printf("AICAFLOW: ARM7 main stack used %lu of %u bytes\n", (unsigned long) (AFX_SVC_STACK_TOP - at),
+           AFX_MAIN_STACK_BYTES);
+}
+#endif
+
 void sm64_afx_scene_prepare(s16 level) {
     if (level != 1) sMenuOver = -1;
     if (!sReady || level == sSceneLevel) return;
+    /* The credits' song plays on through their levels, whose packs stay out. */
+    if (sMusic[0].seq == SEQ_CREDITS && sm64_afx_music_playing(0)) {
+        sSceneLevel = level;
+        return;
+    }
+#ifdef DC_PROF
+    arm7_stack_report();
+#endif
     if (sSceneLevel >= 0) scene_end();
     sSceneLevel = level;
     if (!sCorePackTried) {
@@ -588,10 +673,8 @@ int sm64_afx_init(void) {
     int result = afx_init(gAicaflowFirmware, gAicaflowFirmwareSize);
     printf("AICAFLOW: init %d (firmware %u bytes, assets from %s)\n", result, gAicaflowFirmwareSize,
            DC_AICAFLOW_ROOT);
-    for (int p = 0; p < MUSIC_PLAYERS; p++) {
-        sMusic[p].scale = 1.0f;
-    }
     sReady = result == 0;
+    for (int i = 0; i < SFX_CHANNELS; i++) sChannel[i].fade = 1.0f;
     /* The ring goes in before any asset, at the arena's start; sound_reset replaces the program
      * in the same place when a preset changes it. */
     sm64_sound_reverb_preset(0);
@@ -636,7 +719,9 @@ void sm64_afx_reverb(u16 windowSize, u16 gain) {
 }
 
 static void music_apply_gain(Music *m) {
-    f32 g = m->gain * m->scale;
+    /* The castle's and the endless stairs' songs soften under the pause menu (their seq_setmutebhv
+     * 0x20, seq_setmutescale 40); the others stop until it closes. */
+    f32 g = sMuted && (m->seq == 0x04 || m->seq == 0x18) ? m->gain * 40.0f / 127.0f : m->gain;
     u8 v = g <= 0.0f ? 0 : g >= 1.0f ? 255 : (u8) (g * 255.0f + 0.5f);
     if (m->inst && v != m->sentGain) {
         afx_instance_gain(m->inst, v);
@@ -644,16 +729,43 @@ static void music_apply_gain(Music *m) {
     }
 }
 
-void sm64_afx_play_sequence(u8 player, u8 seqId, u16 fadeTimer) {
-    if (!sReady || player >= MUSIC_PLAYERS || player == 2) return;   /* player 2 runs the SFX scripts */
+/* Under the pause menu: AFX_CMD_PAUSE releases the song's voices and holds its place, and a rebuild
+ * with no channel states starts it there again. Retried each tick while a command is in flight. */
+static void music_mute_step(Music *m) {
+    if (!m->inst || gone(m->inst)) {
+        m->paused = 0;
+    } else if (sMuted && !m->paused && m->seq != 0x04 && m->seq != 0x18) {
+        if (afx_instance_pause(m->inst) == 0) {
+            m->paused = 1;
+            m->pausedAt = afx_status_timer_ticks();
+        }
+    } else if (!sMuted && m->paused) {
+        afx_instance_status_t st;
+        if (afx_instance_status(m->inst, &st) == 0 && st.state == AFX_PAUSED) {
+            s32 wait = (s32) (st.next_deadline - m->pausedAt);
+            if (afx_instance_rebuild(m->inst, NULL, 0, st.position, 0,
+                                     afx_status_timer_ticks() + (wait > 0 ? (u32) wait : 1u), true) == 0) {
+                m->paused = 0;
+            }
+        }
+    }
+}
+
+int sm64_afx_play_sequence(u8 player, u8 seqId) {
+    if (!sReady || player >= MUSIC_PLAYERS) return 0;
     u8 seq = seqId & 0x7f;
+    if (seq == 0) {   /* SEQ_SOUND_PLAYER in a music player: a level without music */
+        sm64_afx_music_stop(player);
+        return 0;
+    }
     if ((seq == 0x02 || seq == 0x21) && gCurrLevelNum != 1) sMenuOver = gCurrLevelNum;   /* title, file select */
     sm64_afx_scene_prepare(scene_level());
     Music *m = &sMusic[player];
-    DBG("AFXDBG t=%lu play player=%u seq=%02X fade=%u loaded=%lx\n", (unsigned long) sTicks, player, seqId, fadeTimer,
+    DBG("AFXDBG t=%lu play player=%u seq=%02X loaded=%lx\n", (unsigned long) sTicks, player, seqId,
         (unsigned long) m->asset.id);
     afx_instance_t old = m->inst, stopping = 0;
     m->inst = 0;
+    m->paused = 0;
     if (m->asset.id != (u32) seq + 1) {
         retire(&m->asset, old);   /* stops it; freed once it is gone */
         stopping = old;
@@ -663,90 +775,87 @@ void sm64_afx_play_sequence(u8 player, u8 seqId, u16 fadeTimer) {
     for (int i = 0; i < SONG_CACHE && m->asset.id != (u32) seq + 1; i++)
         if (sSongs[i].id == (u32) seq + 1) m->asset = sSongs[i];
     if (m->asset.id != (u32) seq + 1) {
-        if (sMissingSeq[seq]) return;
+        if (sMissingSeq[seq]) return 0;
         char stem[16];
         snprintf(stem, sizeof(stem), "seq%02X", seq);
         if (song_fetch(&m->asset, stem, seq, stopping)) {
             sMissingSeq[seq] = 1;
             printf("AICAFLOW: no asset for sequence %02X; silent\n", seq);
-            return;
+            return 0;
         }
     }
     int result = afx_instance_activate(m->asset.flow, &m->inst);
     if (result) {
         printf("AICAFLOW: sequence %02X not started (%d)\n", seq, result);
         m->inst = 0;
-        return;
+        return 0;
     }
-    m->stopAtZero = 0;
-    m->target = 1.0f;
-    if (fadeTimer) {
-        m->gain = 0.0f;
-        m->step = (f32) SUB_UPDATES_PER_TICK / (f32) fadeTimer;
-    } else {
-        m->gain = 1.0f;
-        m->step = 1.0f;
-    }
+    m->seq = seq;
     m->sentGain = 255;
-    music_apply_gain(m);
+    memset(m->sentLane, 255, sizeof(m->sentLane));
+    return 1;
 }
 
-void sm64_afx_fade_out(u8 player, u16 fadeTimer) {
-    DBG("AFXDBG t=%lu fade_out player=%u fade=%u\n", (unsigned long) sTicks, player, fadeTimer);
-    if (!sReady || player >= MUSIC_PLAYERS) return;
-    Music *m = &sMusic[player];
-    if (!m->inst) return;
-    if (!fadeTimer) {
-        stop_inst(m->inst);
-        m->inst = 0;
-        return;
-    }
-    m->target = 0.0f;
-    m->step = (f32) SUB_UPDATES_PER_TICK / (f32) fadeTimer;
-    m->stopAtZero = 1;
+int sm64_afx_music_playing(u8 player) {
+    return sMusic[player].inst && !gone(sMusic[player].inst);
 }
 
-void sm64_afx_set_volume(u8 player, f32 scale, u16 fadeTimer) {
-    /* The lowered volume is applied at once; the fade timer is the original's
-     * ramp, short enough not to matter for now. */
-    (void) fadeTimer;
-    DBG("AFXDBG t=%lu volume player=%u scale=%d%%\n", (unsigned long) sTicks, player, (int) (scale * 100));
-    if (player >= MUSIC_PLAYERS) return;
-    sMusic[player].scale = scale;
+void sm64_afx_music_gain(u8 player, f32 gain) {
+    sMusic[player].gain = gain;
     music_apply_gain(&sMusic[player]);
 }
 
-/* Volume by the source's distance and pan by its direction, as the game computes them, sent
- * when they change: the instance's gain, and the pan offset of lane 0 (sounds are built with a
- * lane map holding every channel in lane 0; AICA pan steps are about 3 dB, 15 per side). The
- * reverb send follows the volume: the lane scales the flows' full send (IMXL 15) to code c with
- * c * 17 (the firmware's rounded product / 255). */
-static void sfx_place(SfxVoice *v) {
-    f32 volume, pan;
-    sm64_sound_dynamics(v->bits, v->pos, &volume, &pan);
-    u8 gain = volume <= 0.0f ? 0 : volume >= 1.0f ? 255 : (u8) (volume * 255.0f + 0.5f);
-    s8 offset = (s8) (pan <= 0.0f ? -15 : pan >= 1.0f ? 15 : (s32) ((pan - 0.5f) * 30.0f + (pan >= 0.5f ? 0.5f : -0.5f)));
-    if (gain != v->gain) {
-        afx_instance_gain(v->inst, gain);
-        v->gain = gain;
+/* The songs whose channels fade or start apart: lane n + 1 of the flow holds the sequence channels
+ * of mask n, lane 0 the rest (tools/aica/sm64_afx_batch.py has the same table). */
+static const struct { u8 seq; u16 masks[3]; } sSongLanes[] = {
+    { 0x05, { 0x0003, 0x0e40, 0xc000 } },
+    { 0x0A, { 0x0070, 0, 0 } },
+    { 0x0C, { 0x0100, 0x0008, 0 } },
+};
+
+void sm64_afx_music_channels(u8 player, u16 enabled, const f32 *scale) {
+    Music *m = &sMusic[player];
+    u8 values[32] = { 0 };
+    u32 mask = 0;
+    if (!m->inst || !m->asset.lanes) return;
+    for (u32 s = 0; s < sizeof(sSongLanes) / sizeof(sSongLanes[0]); s++) {
+        if (sSongLanes[s].seq != m->seq) continue;
+        for (int lane = 0; lane < 4 && lane < m->asset.lanes; lane++) {
+            u16 channels = lane ? sSongLanes[s].masks[lane - 1] : 0;
+            if (lane == 0) {
+                channels = 0xffff;
+                for (int n = 0; n < 3; n++) channels &= (u16) ~sSongLanes[s].masks[n];
+            }
+            int first = 0;
+            while (first < 16 && !(channels >> first & 1)) first++;
+            f32 g = first < 16 && enabled >> first & 1 ? scale[first] : 0.0f;
+            values[lane] = g <= 0.0f ? 0 : g >= 1.0f ? 255 : (u8) (g * 255.0f + 0.5f);
+            if (values[lane] != m->sentLane[lane]) mask |= 1u << lane;
+        }
     }
-    if (offset != v->pan) {
-        u8 values[32] = { (u8) offset };
-        afx_instance_lanes_set(v->inst, AFX_LANE_PAN, 0, 1u, values);
-        v->pan = offset;
-    }
-    u8 send = (u8) (send_code(sm64_sound_reverb(v->bits, volume, v->script)) * 17);
-    if (send != v->send) {
-        u8 values[32] = { send };
-        afx_instance_lanes_set(v->inst, AFX_LANE_DSP_SEND, 0, 1u, values);
-        v->send = send;
+    /* A full command queue leaves them to the next tick. */
+    if (mask && afx_instance_lanes_set(m->inst, AFX_LANE_GAIN, 0, mask, values) == 0) {
+        memcpy(m->sentLane, values, sizeof(m->sentLane));
     }
 }
 
-void sm64_afx_play_sound(s32 soundBits, f32 *pos) {
+void sm64_afx_music_stop(u8 player) {
+    Music *m = &sMusic[player];
+    if (m->inst) {
+        DBG("AFXDBG t=%lu stop player=%u\n", (unsigned long) sTicks, player);
+        stop_inst(m->inst);
+        m->inst = 0;
+        m->paused = 0;
+    }
+}
+
+void sm64_afx_sfx_start(u8 channel, u32 soundBits) {
     if (!sReady) return;
     sm64_afx_scene_prepare(scene_level());
-    u32 key = (u32) soundBits & 0xF0FF0000u;
+    SfxChannel *c = &sChannel[channel];
+    if (c->inst && !gone(c->inst)) stop_inst(c->inst);   /* the channel's sound makes way */
+    c->inst = 0;
+    u32 key = soundBits & 0xF0FF0000u;
     Asset *a = NULL;
     for (int i = 0; i < SFX_ASSETS && !a; i++)
         if (sSfx[i].id == key + 1) a = &sSfx[i];
@@ -758,64 +867,115 @@ void sm64_afx_play_sound(s32 soundBits, f32 *pos) {
         if (a == NULL) return;
         char stem[24];
         snprintf(stem, sizeof(stem), "sfx_%08lX", (unsigned long) key);
-        if (asset_load(a, stem, key + 1)) {
-            if (sMissingSfxCount < sizeof(sMissingSfx) / sizeof(sMissingSfx[0])) sMissingSfx[sMissingSfxCount++] = key;
-            printf("AICAFLOW: no asset for sound %08lX; silent\n", (unsigned long) soundBits);
+        int result = asset_load(a, stem, key + 1);
+        if (result == -AFX_NO_AICA_RAM) {
+            sfx_release_idle();
+            result = asset_load(a, stem, key + 1);
+        }
+        if (result) {
+            /* One that found no room may next time. */
+            if (result != -AFX_NO_AICA_RAM && sMissingSfxCount < sizeof(sMissingSfx) / sizeof(sMissingSfx[0])) {
+                sMissingSfx[sMissingSfxCount++] = key;
+            }
+            printf("AICAFLOW: no asset for sound %08lX; silent (%d)\n", (unsigned long) soundBits, result);
             return;
         }
     }
-    u8 continuous = !(soundBits & 0x80);
-    /* The same sound from the same source: a continuous one keeps playing, a 0x80 one restarts
-     * (process_sound_request replaces it). A continuous one that ended by itself starts again. */
-    for (int i = 0; i < SFX_VOICES; i++) {
-        SfxVoice *v = &sSfxVoice[i];
-        if (v->inst && v->key == key && v->pos == pos) {
-            if (continuous && !gone(v->inst)) {
-                v->last = sTick;
-                return;
-            }
-            if (!gone(v->inst)) stop_inst(v->inst);
-            v->inst = 0;
-        }
-    }
-    SfxVoice *slot = NULL;
-    for (int i = 0; i < SFX_VOICES && !slot; i++)
-        if (!sSfxVoice[i].inst || gone(sSfxVoice[i].inst)) slot = &sSfxVoice[i];
-    if (!slot) {
-        slot = &sSfxVoice[sSfxNext++ % SFX_VOICES];   /* all busy: one makes way */
-        stop_inst(slot->inst);
-    }
-    slot->key = key;
-    slot->bits = (u32) soundBits;
-    slot->pos = pos;
-    slot->last = sTick;
-    slot->continuous = continuous;
-    if (afx_instance_activate(a->flow, &slot->inst)) {
-        slot->inst = 0;
+    if (afx_instance_activate(a->flow, &c->inst)) {
+        c->inst = 0;
         return;
     }
-    slot->gain = 255;
-    slot->pan = 0;
-    slot->send = 255;
-    slot->script = 0;
+    c->key = key;
+    c->gain = 255;
+    c->pan = 0;
+    c->pitch = 0;
+    c->send = 255;
+    c->script = 0;
     for (u32 i = 0; i < sizeof(sSfxScriptReverb) / sizeof(sSfxScriptReverb[0]); i++)
-        if (sSfxScriptReverb[i].key == key) slot->script = sSfxScriptReverb[i].reverb;
-    sfx_place(slot);
+        if (sSfxScriptReverb[i].key == key) c->script = sSfxScriptReverb[i].reverb;
+}
+
+int sm64_afx_sfx_active(u8 channel) {
+    return sChannel[channel].inst && !gone(sChannel[channel].inst);
+}
+
+void sm64_afx_sfx_stop(u8 channel) {
+    stop_inst(sChannel[channel].inst);
+    sChannel[channel].inst = 0;
+}
+
+/* The volume, pan and pitch update_game_sound gives the channel, sent when they change: the
+ * instance's gain, and the pan and pitch of lane 0 (sounds are built with a lane map holding every
+ * channel in lane 0; AICA pan steps are about 3 dB, 15 per side; a lane's pitch multiplies by
+ * 1 + value / 256). The reverb send follows the volume: the
+ * lane scales the flows' full send (IMXL 15) to code c with c * 17 (the firmware's rounded
+ * product / 255). The menu bank has the script's send alone, and plays on under the pause menu. */
+void sm64_afx_sfx_place(u8 channel, u32 soundBits, f32 volume, f32 pan, f32 pitch, int echo) {
+    SfxChannel *c = &sChannel[channel];
+    if (!c->inst) return;
+    f32 heard = sMuted && channel != MENU_BANK ? 0.0f : volume * c->fade;
+    u8 gain = heard <= 0.0f ? 0 : heard >= 1.0f ? 255 : (u8) (heard * 255.0f + 0.5f);
+    s8 offset = (s8) (pan <= 0.0f ? -15 : pan >= 1.0f ? 15 : (s32) ((pan - 0.5f) * 30.0f + (pan >= 0.5f ? 0.5f : -0.5f)));
+    if (gain != c->gain) {
+        afx_instance_gain(c->inst, gain);
+        c->gain = gain;
+    }
+    if (offset != c->pan) {
+        u8 values[32] = { (u8) offset };
+        afx_instance_lanes_set(c->inst, AFX_LANE_PAN, 0, 1u, values);
+        c->pan = offset;
+    }
+    s32 bend = (s32) ((pitch - 1.0f) * 256.0f + (pitch >= 1.0f ? 0.5f : -0.5f));
+    if (bend < -128) bend = -128;
+    if (bend > 127) bend = 127;
+    if (bend != c->pitch) {
+        u8 values[32] = { (u8) bend };
+        afx_instance_lanes_set(c->inst, AFX_LANE_PITCH, 0, 1u, values);
+        c->pitch = (s8) bend;
+    }
+    u8 send = (u8) (send_code(echo ? sm64_sound_reverb(soundBits, volume, c->script) : c->script) * 17);
+    if (send != c->send) {
+        u8 values[32] = { send };
+        afx_instance_lanes_set(c->inst, AFX_LANE_DSP_SEND, 0, 1u, values);
+        c->send = send;
+    }
+}
+
+void sm64_afx_sfx_fade(u8 channel, u16 ticks) {
+    sChannel[channel].fadeStep = ticks ? sChannel[channel].fade / (f32) ticks : sChannel[channel].fade;
+}
+
+void sm64_afx_mute(u8 muted) {
+    sMuted = muted;
+}
+
+/* sound_reset: as disable_all_sequence_players does to the sequencer. */
+void sm64_afx_stop_all(void) {
+    for (int p = 0; p < MUSIC_PLAYERS; p++) sm64_afx_music_stop((u8) p);
+    for (int i = 0; i < SFX_CHANNELS; i++) {
+        stop_inst(sChannel[i].inst);
+        sChannel[i].inst = 0;
+        sChannel[i].fade = 1.0f;
+        sChannel[i].fadeStep = 0.0f;
+    }
+    sMuted = 0;
+}
+
+/* AICA's MONO bit, in the register that holds the master volume too: that does not read back, so
+ * this writes the full volume the firmware sets at start. */
+void sm64_afx_mono(u8 mono) {
+    g2_write_32(0xa0702800, mono ? 0x800fu : 0x000fu);
 }
 
 void sm64_afx_tick(void) {
     if (!sReady) return;
-    sTick++;
-    for (int i = 0; i < SFX_VOICES; i++) {
-        SfxVoice *v = &sSfxVoice[i];
-        if (!v->inst) continue;
-        if (gone(v->inst) || (v->continuous && sTick - v->last > 2)) {
-            if (!gone(v->inst)) stop_inst(v->inst);
-            v->inst = 0;
-            continue;
+    for (int i = 0; i < SFX_CHANNELS; i++) {
+        SfxChannel *c = &sChannel[i];
+        if (c->fadeStep > 0.0f) {
+            c->fade = c->fade > c->fadeStep ? c->fade - c->fadeStep : 0.0f;
         }
-        sfx_place(v);   /* the source moves */
     }
+    for (int p = 0; p < MUSIC_PLAYERS; p++) music_mute_step(&sMusic[p]);
 #ifdef DC_AICAFLOW_DEBUG
     if (++sTicks % 60 == 0) {
         for (int p = 0; p < MUSIC_PLAYERS; p++) {
@@ -828,20 +988,8 @@ void sm64_afx_tick(void) {
         }
     }
 #endif
-    for (int p = 0; p < MUSIC_PLAYERS; p++) {
-        Music *m = &sMusic[p];
-        if (!m->inst) continue;
-        if (m->gain < m->target) m->gain = m->gain + m->step > m->target ? m->target : m->gain + m->step;
-        else if (m->gain > m->target) m->gain = m->gain - m->step < m->target ? m->target : m->gain - m->step;
-        music_apply_gain(m);
-        if (m->stopAtZero && m->gain <= 0.0f) {
-            stop_inst(m->inst);
-            m->inst = 0;
-            m->stopAtZero = 0;
-        }
-    }
     retry_stops();
     free_retired();
 }
 
-#endif
+#endif /* DC_AICAFLOW */

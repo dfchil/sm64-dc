@@ -198,53 +198,9 @@ void *main_pc_pool = NULL;
 void *main_pc_pool_gd = NULL;
 
 #ifdef DC_AUDIO_RECORD
-// Recording session (make DC_AUDIO_RECORD=1): instead of the game, play each sequence of
-// DC_AUDIO_RECORD_SEQS and each sound of DC_AUDIO_RECORD_SOUNDS (comma-separated, hex) in turn
-// while the AICA driver's command log drains to /pc/rec_seqXX.bin or /pc/rec_sfx_XXXXXXXX.bin,
-// then exit to dcload. The game loop's 30 Hz tick is what lets the audio thread process requests,
-// so it is signalled here every other vblank. An item ends by itself: a sequence one second after
-// its second jump back (two passes, what tools/aica/sm64_afx.py needs to loop it), or when nothing
-// has sounded for two seconds; a sound when nothing has sounded for one second; or at
-// DC_AUDIO_RECORD_SECONDS.
-#include "audio/aica_record.h"
-#include "audio/data.h"
-#include "audio/external.h"
-#include "audio/load.h"
-#include "seq_ids.h"
-#ifndef DC_AUDIO_RECORD_SEQS
-#define DC_AUDIO_RECORD_SEQS ""
-#endif
-#ifndef DC_AUDIO_RECORD_SOUNDS
-#define DC_AUDIO_RECORD_SOUNDS ""
-#endif
-typedef struct {
-    int voices, started, jumps;
-    uint64_t quiet_since, second_jump;
-    u32 targets[16];   /* jump targets seen: the loop is the second jump to one of them */
-} RecWatch;
-static u32 rec_drain(FILE *f, RecWatch *w, uint64_t now) {
-    u32 n = 0;
-    while (gAicaRecTail != gAicaRecHead) {
-        const AicaRecord *r = aica_record_at(gAicaRecTail);
-        if (f != NULL) fwrite(r, sizeof(AicaRecord), 1, f);
-        if (r->cmd == AICA_REC_START) { w->voices++; w->started = 1; }
-        if (r->cmd == AICA_REC_STOP && w->voices > 0) w->voices--;
-        if (r->cmd == AICA_REC_SEQ_JUMP && r->ch == SEQ_PLAYER_LEVEL) {
-            int seen = 0;
-            for (int i = 0; i < w->jumps && i < 16; i++) seen |= w->targets[i] == r->key;
-            if (w->jumps < 16) w->targets[w->jumps] = r->key;
-            w->jumps++;
-            if (seen && !w->second_jump) w->second_jump = now;
-        }
-        gAicaRecTail++;
-        n++;
-    }
-    if (w->voices) w->quiet_since = 0;
-    else if (!w->quiet_since) w->quiet_since = now;
-    return n;
-}
 static uint64_t sRecLastVbl;
-static void rec_tick(void) {
+static void rec_wait_tick(void) {
+    if (sRecLastVbl == 0) sRecLastVbl = vblticker;
     while (vblticker < sRecLastVbl + 2) {
 #ifdef KOS_GENWAIT_3ARG
         genwait_wait((void *) &vblticker, NULL, 0);
@@ -253,96 +209,19 @@ static void rec_tick(void) {
 #endif
     }
     sRecLastVbl = vblticker;
-    audio_signal_game_loop_tick();
 }
-static void rec_item(int seq, u32 sound) {
-    static f32 sPos[3];
-    static int sSfxPlayer;
-    char path[64];
-    if (seq >= 0) snprintf(path, sizeof(path), "/pc/rec_seq%02X.bin", seq);
-    else snprintf(path, sizeof(path), "/pc/rec_sfx_%08lX.bin", (unsigned long) sound);
-    FILE *f = fopen(path, "wb");
-    if (f == NULL) {
-        printf("AUDIOREC cannot write %s\n", path);
-        return;
-    }
-    AicaRecordHeader h;
-    memset(&h, 0, sizeof(h));
-    h.magic = AICA_RECORD_MAGIC;
-    h.updates_per_frame = (u32) gAudioUpdatesPerFrame;
-    h.wave_count = 4;
-    h.band_count = 1;
-    h.wave_samples = 64;
-    h.record_bytes = sizeof(AicaRecord);
-    fwrite(&h, sizeof(h), 1, f);
-    for (int w = 0; w < 4; w++) {
-        fwrite(gWaveSamples[w], sizeof(s16), 64, f);
-    }
-    if (seq < 0 && !sSfxPlayer) {
-        // Sounds play through the SFX sequence player, which the game starts in its own init.
-        play_music(SEQ_PLAYER_SFX, SEQUENCE_ARGS(0, SEQ_SOUND_PLAYER), 0);
-        for (int i = 0; i < 15; i++) rec_tick();
-        sSfxPlayer = 1;
-    }
-    RecWatch w;
-    memset(&w, 0, sizeof(w));
-    rec_drain(NULL, &w, 0);   // whatever came before this item does not belong to it
-    memset(&w, 0, sizeof(w));
-    u32 sub0 = gAicaRecTick;
-    uint64_t us0 = timer_us_gettime64(), start = timer_ms_gettime64();
-    if (seq >= 0) play_music(SEQ_PLAYER_LEVEL, SEQUENCE_ARGS(4, seq), 0);
-    else play_sound((s32) sound, sPos);
-    // A sound without the 0x80 flag is continuous: the game keeps it alive by requesting it every
-    // frame and stops it when the requests stop. Hold it for four seconds, then let it go.
-    int hold = (seq < 0 && !(sound & 0x80)) ? 120 : 0;
-    u32 records = 0;
-    for (;;) {
-        rec_tick();
-        if (hold && --hold) play_sound((s32) sound, sPos);
-        uint64_t now = timer_ms_gettime64();
-        records += rec_drain(f, &w, now);
-        if (now - start >= (uint64_t) DC_AUDIO_RECORD_SECONDS * 1000) break;
-        if (w.second_jump && now - w.second_jump >= 1000) break;
-        if (w.started && w.quiet_since && now - w.quiet_since >= (seq >= 0 ? 2000u : 1000u)) break;
-        if (!w.started && now - start >= 5000) break;
-    }
-    u32 subs = gAicaRecTick - sub0;
-    u32 us = (u32) (timer_us_gettime64() - us0);
-    AicaRecord end = { gAicaRecTick, AICA_REC_END, 0, 0, 0, us, subs, 0, { 0 } };
-    fwrite(&end, sizeof(end), 1, f);
-    fclose(f);
-    printf("AUDIOREC %s: %u records, %d jumps, %u sub-updates in %u us\n", path, (unsigned) records, w.jumps,
-           (unsigned) subs, (unsigned) us);
-    // Silence before the next item: stop the music and let every voice end.
-    if (seq >= 0) stop_background_music(SEQUENCE_ARGS(4, seq));
-    uint64_t t0 = timer_ms_gettime64();
-    do {
-        rec_tick();
-        rec_drain(NULL, &w, timer_ms_gettime64());
-    } while ((w.voices || timer_ms_gettime64() - t0 < 1000) && timer_ms_gettime64() - t0 < 8000);
-}
-static void audio_record_session(void) {
-    sRecLastVbl = vblticker;
-    printf("AUDIOREC updates_per_frame=%d seqs=%s sounds=%s\n", (int) gAudioUpdatesPerFrame, DC_AUDIO_RECORD_SEQS,
-           DC_AUDIO_RECORD_SOUNDS);
-    for (const char *p = DC_AUDIO_RECORD_SEQS; *p;) {
-        char *e;
-        unsigned long v = strtoul(p, &e, 16);
-        if (e == p) break;
-        rec_item((int) v, 0);
-        p = *e == ',' ? e + 1 : e;
-    }
-    for (const char *p = DC_AUDIO_RECORD_SOUNDS; *p;) {
-        char *e;
-        unsigned long v = strtoul(p, &e, 16);
-        if (e == p) break;
-        rec_item(-1, (u32) v);
-        p = *e == ',' ? e + 1 : e;
-    }
-    printf("AUDIOREC done, %u dropped\n", (unsigned) gAicaRecDropped);
-    dc_prof_stop_audio_if_any();
-    arch_exit();
-}
+static uint64_t rec_now_us(void) { return timer_us_gettime64(); }
+static const char *rec_dir(void) { return "/pc/"; }
+static int rec_seconds(int seq) { (void) seq; return DC_AUDIO_RECORD_SECONDS; }
+#ifndef DC_AUDIO_RECORD_SEQS
+#define DC_AUDIO_RECORD_SEQS ""
+#endif
+#ifndef DC_AUDIO_RECORD_SOUNDS
+#define DC_AUDIO_RECORD_SOUNDS ""
+#endif
+static const char *rec_sequences(void) { return DC_AUDIO_RECORD_SEQS; }
+static const char *rec_sounds(void) { return DC_AUDIO_RECORD_SOUNDS; }
+#include "pc/record/audio_record.inc.c"
 #endif
 
 static u8 pool[0x165000+0x70800] __attribute__((aligned(16384)));
@@ -401,6 +280,8 @@ void main_func(void) {
 //    (void)audio_attr;
 #ifdef DC_AUDIO_RECORD
     audio_record_session();
+    dc_prof_stop_audio_if_any();
+    arch_exit();
 #endif
     thread5_game_loop(NULL);
 

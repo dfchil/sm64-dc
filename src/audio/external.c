@@ -536,6 +536,13 @@ void func_8031E0E4(u8 bankIndex, u8 item);
 // Local functions that could be static but are defined in/called from GLOBAL_ASM blocks,
 // or not part of the large block of static functions.
 void update_game_sound(void);
+#ifdef DC_AICAFLOW
+// Each music player's sequence channels, without a sequence: those its song starts, and their
+// volume scales, which the music dynamics fade (func_8031F96C).
+static u16 sAfxChannels[2];
+static f32 sAfxChannelScale[2][CHANNELS_MAX];
+#define AFX_CHANNEL_EXISTS(player, i) ((player) < 2 && (sAfxChannels[player] >> (i) & 1))
+#endif
 void play_sequence(u8 player, u8 seqId, u16 fadeTimer);
 void fade_channel_volume_scale(u8 player, u8 channelId, u8 targetScale, u16 fadeTimer);
 void func_8031F96C(u8 player);
@@ -895,10 +902,6 @@ void create_next_audio_buffer(s16 *samplesL, s16 *samplesR, u32 num_samples) {
 #include <stdio.h>
 #endif
 void play_sound(s32 soundBits, f32 *pos) {
-#ifdef DC_AICAFLOW
-    sm64_afx_play_sound(soundBits, pos);
-    return;
-#endif
     sSoundRequests[sSoundRequestCount].soundBits = soundBits;
     sSoundRequests[sSoundRequestCount].position = pos;
     sSoundRequestCount++;
@@ -1218,6 +1221,7 @@ f32 get_sound_dynamics(u8 bankIndex, u8 item, f32 arg2) {
         }
 #endif
 
+#ifndef DC_AICAFLOW   // a recording already holds its sound's vibrato
         if (gSoundBanks[bankIndex][item].soundBits & SOUND_VIBRATO) {
 #ifdef VERSION_JP
             if (intensity != 0.0)
@@ -1228,6 +1232,7 @@ f32 get_sound_dynamics(u8 bankIndex, u8 item, f32 arg2) {
                 intensity -= (f32)(gAudioRandom & 0xf)*0.00520833f;// / US_FLOAT(192.0);
             }
         }
+#endif
     } else {
         intensity = 1.0f;
     }
@@ -1290,7 +1295,7 @@ u8 get_sound_reverb(UNUSED u8 bankIndex, UNUSED u8 item, UNUSED u8 channelIndex)
 #ifdef DC_AICAFLOW
 // A sound's reverb send (0..127), as get_sound_reverb gives it to the SFX channels: the script's
 // IO slot 5 value, the area's echo level (none for SOUND_NO_ECHO sounds) and more the quieter the
-// sound is (volume from sm64_sound_dynamics).
+// sound is (its channel's volume).
 u8 sm64_sound_reverb(u32 soundBits, f32 volume, u8 scriptReverb) {
     u8 area;
     u8 level;
@@ -1322,9 +1327,49 @@ void sm64_sound_reverb_preset(u8 presetId) {
 static void noop_8031EEC8(void) {
 }
 
+#ifdef DC_AICAFLOW
+#include "effects.h"
+#define AFX_SUB_UPDATES_PER_TICK 8
+static f32 sAfxSongVolume[2] = { 1.0f, 1.0f };
+
+// The music players without a sequencer: the sequence players still hold their volumes, as fades
+// and lowering set them, and an instance plays at its player's volume over the volume its song
+// was recorded at (the song's seq_setvol, sBackgroundMusicDefaultVolume).
+static void afx_music_apply(u8 player) {
+    sm64_afx_music_gain(player, gSequencePlayers[player].fadeVolume / sAfxSongVolume[player]);
+    sm64_afx_music_channels(player, sAfxChannels[player], sAfxChannelScale[player]);
+}
+
+static void afx_music_tick(void) {
+    u8 player;
+    u8 i;
+
+    for (player = 0; player < 2; player++) {
+        struct SequencePlayer *seqPlayer = &gSequencePlayers[player];
+
+        if (seqPlayer->enabled && !sm64_afx_music_playing(player)) {
+            sequence_player_disable(seqPlayer);   // the song ended, as a jingle does
+        }
+        for (i = 0; i < AFX_SUB_UPDATES_PER_TICK && seqPlayer->enabled; i++) {
+            sequence_player_process_sound(seqPlayer);
+        }
+        if (seqPlayer->enabled) {
+            afx_music_apply(player);
+        } else {
+            sm64_afx_music_stop(player);
+        }
+    }
+}
+#endif
+
 void audio_signal_game_loop_tick(void) {
 #ifdef DC_AICAFLOW
+    // There is no audio thread: this is the game loop's tick and the audio frame in one.
+    gAudioFrameCount++;
+    update_game_sound();
+    afx_music_tick();
     sm64_afx_tick();
+    gAudioRandom = ((gAudioRandom + gAudioFrameCount) * gAudioFrameCount);
 #endif
     sGameLoopTicked = 1;
 #ifdef VERSION_EU
@@ -1342,32 +1387,56 @@ void audio_signal_game_loop_tick(void) {
 #endif
 
 #ifdef DC_AICAFLOW
-// A sound's volume (0..1) and pan (0 left .. 1 right) from its source position, as
-// update_game_sound gives them to the SFX channels: get_sound_dynamics with ARG2_VAL1 and
-// get_sound_pan, for the position the sound was requested with (relative to the camera).
-void sm64_sound_dynamics(u32 soundBits, f32 *pos, f32 *volume, f32 *pan) {
-    static f32 sOrigin[3];
-    f32 x, y, z, distance, intensity, f0;
-    s32 div = ((soundBits & SOUNDARGS_MASK_BANK) >> SOUNDARGS_SHIFT_BANK) < 3 ? 2 : 3;
-    if (pos == NULL) pos = sOrigin;
-    x = pos[0];
-    y = pos[1];
-    z = pos[2];
-    distance = shz_sqrtf(x * x + y * y + z * z);
-    if (soundBits & SOUND_NO_VOLUME_LOSS) {
-        intensity = 1.0f;
-    } else if (distance > AUDIO_MAX_DISTANCE) {
-        intensity = 0.0f;
-    } else {
-        f0 = shz_divf((f32) D_80332028[gCurrLevelNum], (f32) div);
-        if (f0 < distance) {
-            intensity = shz_divf(AUDIO_MAX_DISTANCE - distance, AUDIO_MAX_DISTANCE - f0) * (1.0f - ARG2_VAL1);
-        } else {
-            intensity = 1.0f - shz_divf(distance, f0) * ARG2_VAL1;
-        }
+// get_sound_freq_scale without its vibrato, which a recording already holds.
+static f32 afx_distance_pitch(u8 bankIndex, u8 item) {
+    if (gSoundBanks[bankIndex][item].soundBits & SOUND_NO_FREQUENCY_LOSS) {
+        return 1.0f;
     }
-    *volume = ARG2_VAL1 * intensity * intensity + 1.0f - ARG2_VAL1;
-    *pan = get_sound_pan(x, z);
+    return shz_divf(gSoundBanks[bankIndex][item].distance, AUDIO_MAX_DISTANCE) * 0.06666667f + 1.0f;
+}
+
+// A sound's volume, pan, reverb and pitch for its channel, as update_game_sound below sets them.
+// Sounds were recorded at distance 0, and bank 1's at moving speed 32 (process_sound_request's
+// default for D_80363808), so the pitch given is relative to that.
+static void afx_place_sound(u8 bankIndex, u8 item, u8 channelIndex) {
+    u32 bits = gSoundBanks[bankIndex][item].soundBits;
+    f32 volume = 1.0f;
+    f32 pan = 0.5f;
+    f32 pitch = 1.0f;
+    u8 echo = TRUE;
+
+    switch (bankIndex) {
+        case 1:
+            if (!(bits & SOUND_NO_FREQUENCY_LOSS)) {
+                volume = get_sound_dynamics(bankIndex, item, ARG2_VAL1);
+                if (D_80363808[bankIndex] <= 8) {
+                    volume *= (D_80363808[bankIndex] + 8.0f) * 0.0625f;
+                }
+                pan = get_sound_pan(*gSoundBanks[bankIndex][item].x, *gSoundBanks[bankIndex][item].z);
+                if ((bits & SOUNDARGS_MASK_SOUNDID) == (SOUND_MOVING_FLYING & SOUNDARGS_MASK_SOUNDID)) {
+                    pitch = (afx_distance_pitch(bankIndex, item) + (f32) D_80363808[bankIndex] * 0.0125f) / 1.4f;
+                } else {
+                    pitch = (afx_distance_pitch(bankIndex, item) + (f32) D_80363808[bankIndex] * 0.0025f) / 1.08f;
+                }
+                break;
+            }
+        // fallthrough
+        case 7:
+            echo = FALSE;
+            break;
+        case 0:
+        case 2:
+            volume = get_sound_dynamics(bankIndex, item, ARG2_VAL1);
+            pan = get_sound_pan(*gSoundBanks[bankIndex][item].x, *gSoundBanks[bankIndex][item].z);
+            pitch = afx_distance_pitch(bankIndex, item);
+            break;
+        default:
+            volume = get_sound_dynamics(bankIndex, item, ARG2_VAL2);
+            pan = get_sound_pan(*gSoundBanks[bankIndex][item].x, *gSoundBanks[bankIndex][item].z);
+            pitch = afx_distance_pitch(bankIndex, item);
+            break;
+    }
+    sm64_afx_sfx_place(channelIndex, bits, volume, pan, pitch, echo);
 }
 #endif
 
@@ -1384,6 +1453,41 @@ void update_game_sound(void) {
 
     process_all_sound_requests();
     process_level_music_dynamics();
+#ifdef DC_AICAFLOW
+    // The original's loop below, with a channel of sm64_aicaflow.c for each sequence channel.
+    for (bankIndex = 0; bankIndex < SOUND_BANK_COUNT; bankIndex++) {
+        func_8031E16C(bankIndex);
+        for (j = 0; j < MAX_CHANNELS_PER_SOUND; j++) {
+            index = sCurrentSound[bankIndex][j];
+            if (index < 0xff && gSoundBanks[bankIndex][index].soundStatus != SOUND_STATUS_STOPPED) {
+                soundStatus = gSoundBanks[bankIndex][index].soundBits & SOUNDARGS_MASK_STATUS;
+                gSoundBanks[bankIndex][index].soundStatus = soundStatus;
+                if (soundStatus == SOUND_STATUS_STARTING) {
+                    if (gSoundBanks[bankIndex][index].soundBits & SOUND_LO_BITFLAG_UNK1) {
+                        D_80332110 |= 1 << bankIndex;
+                        func_803200E4(50);
+                    }
+                    gSoundBanks[bankIndex][index].soundBits++;
+                    gSoundBanks[bankIndex][index].soundStatus = SOUND_STATUS_PLAYING;
+                    sm64_afx_sfx_start(channelIndex, gSoundBanks[bankIndex][index].soundBits);
+                    afx_place_sound(bankIndex, index, channelIndex);
+                } else if (!sm64_afx_sfx_active(channelIndex)) {
+                    func_8031E0E4(bankIndex, index);
+                    gSoundBanks[bankIndex][index].soundStatus = SOUND_STATUS_STOPPED;
+                    func_8031DFE8(bankIndex, index);
+                } else if (soundStatus == SOUND_STATUS_STOPPED) {
+                    func_8031E0E4(bankIndex, index);
+                    sm64_afx_sfx_stop(channelIndex);
+                    func_8031DFE8(bankIndex, index);
+                } else {
+                    afx_place_sound(bankIndex, index, channelIndex);
+                }
+            }
+            channelIndex++;
+        }
+    }
+    return;
+#endif
     if (gSequencePlayers[SEQ_PLAYER_SFX].channels[0] == &gSequenceChannelNone) {
         return;
     }
@@ -1720,8 +1824,34 @@ void play_sequence(u8 player, u8 seqId, u16 fadeTimer) {
     }
 
 #ifdef DC_AICAFLOW
-    (void) temp_ret;
-    sm64_afx_play_sequence(player, seqId, fadeTimer);
+    if (player != SEQ_PLAYER_SFX) {
+        // What load_sequence and the song's seq_setvol would leave the player with.
+        struct SequencePlayer *seqPlayer = &gSequencePlayers[player];
+        f32 volume = sBackgroundMusicDefaultVolume[seqId & 0x7f] * 0.00787402f; // / US_FLOAT(127.0);
+
+        seqPlayer->enabled = sm64_afx_play_sequence(player, seqId);
+        // SA's water song: the variation starts only its last two channels.
+        sAfxChannels[player] = seqId == (SEQ_LEVEL_WATER | SEQ_VARIATION) ? 0xc000 : 0xffff;
+        for (i = 0; i < CHANNELS_MAX; i++) {
+            sAfxChannelScale[player][i] = 1.0f;
+        }
+        seqPlayer->state = SEQUENCE_PLAYER_STATE_0;
+        seqPlayer->fadeTimer = 0;
+        seqPlayer->fadeVolume = volume;
+        seqPlayer->volume = volume;
+        sAfxSongVolume[player] = volume;
+        if (player == 0) {
+            temp_ret = func_803200E4(0);
+            if (temp_ret != 0xff) {
+                seqPlayer->state = SEQUENCE_PLAYER_STATE_4;
+                seqPlayer->fadeVolume = (f32) temp_ret * 0.00787402f; // / US_FLOAT(127.0);
+            }
+        } else if (fadeTimer != 0) {
+            func_8031D690(player, fadeTimer);
+            seqPlayer->fadeVelocity = volume / fadeTimer;
+        }
+        afx_music_apply(player);
+    }
     return;
 #endif
 #ifdef VERSION_EU
@@ -1760,10 +1890,6 @@ void sequence_player_fade_out(u8 player, u16 fadeTimer) {
     if (player == 0) {
         sPlayer0CurSeqId = SEQUENCE_NONE;
     }
-#ifdef DC_AICAFLOW
-    sm64_afx_fade_out(player, fadeTimer);
-    return;
-#endif
     sequence_player_fade_out_internal(player, fadeTimer);
 #endif
 }
@@ -1778,6 +1904,17 @@ void fade_volume_scale(u8 player, u8 targetScale, u16 fadeTimer) {
 void fade_channel_volume_scale(u8 player, u8 channelId, u8 targetScale, u16 fadeTimer) {
     struct ChannelVolumeScaleFade *temp;
 
+#ifdef DC_AICAFLOW
+    if (AFX_CHANNEL_EXISTS(player, channelId)) {
+        temp = &D_80360928[player][channelId];
+        temp->remDuration = fadeTimer;
+        temp->velocity = shz_divf((f32) targetScale * 0.00787402f - sAfxChannelScale[player][channelId],
+                                  (f32) fadeTimer);
+        temp->target = targetScale;
+        temp->current = sAfxChannelScale[player][channelId];
+    }
+    return;
+#endif
     if (gSequencePlayers[player].channels[channelId] != &gSequenceChannelNone) {
         temp = &D_80360928[player][channelId];
         temp->remDuration = fadeTimer;
@@ -1792,6 +1929,19 @@ void fade_channel_volume_scale(u8 player, u8 channelId, u8 targetScale, u16 fade
 void func_8031F96C(u8 player) {
     u8 i;
 
+#ifdef DC_AICAFLOW
+    for (i = 0; i < CHANNELS_MAX; i++) {
+        if (AFX_CHANNEL_EXISTS(player, i) && D_80360928[player][i].remDuration != 0) {
+            D_80360928[player][i].current += D_80360928[player][i].velocity;
+            sAfxChannelScale[player][i] = D_80360928[player][i].current;
+            D_80360928[player][i].remDuration--;
+            if (D_80360928[player][i].remDuration == 0) {
+                sAfxChannelScale[player][i] = D_80360928[player][i].target * 0.00787402f;
+            }
+        }
+    }
+    return;
+#endif
     // Loop over channels
     for (i = 0; i < CHANNELS_MAX; i++) {
         if (gSequencePlayers[player].channels[i] != &gSequenceChannelNone
@@ -1980,12 +2130,6 @@ void unused_8031FED0(u8 player, u32 bits, s8 arg2) {
 }
 
 void func_8031FFB4(u8 player, u16 fadeTimer, u8 arg2) {
-#ifdef DC_AICAFLOW
-    // Lower a player's volume: the level music to 40/127, another player to arg2/127.
-    if (player == 0) sCapVolumeTo40 = TRUE;
-    sm64_afx_set_volume(player, (player == 0 ? 40 : arg2) / 127.0f, fadeTimer);
-    return;
-#endif
     if (player == 0) {
         sCapVolumeTo40 = TRUE;
         func_803200E4(fadeTimer);
@@ -1996,10 +2140,6 @@ void func_8031FFB4(u8 player, u16 fadeTimer, u8 arg2) {
 
 void sequence_player_unlower(u8 player, u16 fadeTimer) {
     sCapVolumeTo40 = FALSE;
-#ifdef DC_AICAFLOW
-    sm64_afx_set_volume(player, 1.0f, fadeTimer);
-    return;
-#endif
     if (player == 0) {
         if (gSequencePlayers[player].state != SEQUENCE_PLAYER_STATE_FADE_OUT) {
             func_803200E4(fadeTimer);
@@ -2069,6 +2209,9 @@ void set_sound_disabled(u8 disabled) {
         gSequencePlayers[i].muted = disabled;
 #endif
     }
+#ifdef DC_AICAFLOW
+    sm64_afx_mute(disabled);
+#endif
 }
 
 void sound_init(void) {
@@ -2455,13 +2598,6 @@ void func_803210D4(u16 fadeOutTime) {
     if (sHasStartedFadeOut) {
         return;
     }
-#ifdef DC_AICAFLOW
-    // No sequence player is ever enabled here: fade the AICAflow music of both music players.
-    sm64_afx_fade_out(SEQ_PLAYER_LEVEL, fadeOutTime);
-    sm64_afx_fade_out(SEQ_PLAYER_ENV, fadeOutTime);
-    sHasStartedFadeOut = TRUE;
-    return;
-#endif
 
     if (gSequencePlayers[SEQ_PLAYER_LEVEL].enabled == TRUE) {
 #ifdef VERSION_EU
@@ -2480,7 +2616,11 @@ void func_803210D4(u16 fadeOutTime) {
 
     for (i = 0; i < SOUND_BANK_COUNT; i++) {
         if (i != 7) {
+#ifdef DC_AICAFLOW
+            sm64_afx_sfx_fade(i, fadeOutTime >> 4);
+#else
             fade_channel_volume_scale(SEQ_PLAYER_SFX, i, 0, fadeOutTime>>4 /* / 16 */);
+#endif
         }
     }
     sHasStartedFadeOut = TRUE;
@@ -2567,6 +2707,7 @@ void sound_reset(u8 presetId) {
     sGameLoopTicked = 0;
 #ifdef DC_AICAFLOW
     sm64_sound_reverb_preset(presetId);
+    sm64_afx_stop_all();
 #endif
     disable_all_sequence_players();
     sound_init();
@@ -2590,6 +2731,9 @@ void sound_reset(u8 presetId) {
 void audio_set_sound_mode(u8 soundMode) {
     D_80332108 = (D_80332108 & 0xf) + (soundMode << 4);
     gSoundMode = soundMode;
+#ifdef DC_AICAFLOW
+    sm64_afx_mono(soundMode == SOUND_MODE_MONO);
+#endif
 }
 
 #ifndef VERSION_EU

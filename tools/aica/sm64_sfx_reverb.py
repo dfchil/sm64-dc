@@ -61,7 +61,13 @@ def main():
         if table is None:
             continue
         index = 0
+        skipping = False
         for l in lines[labels[table] + 1:]:
+            if l.startswith((".ifdef", ".ifndef", ".else", ".endif")):   # the US table
+                skipping = l in (".ifdef VERSION_JP", ".ifdef VERSION_EU") or (l == ".else" and not skipping)
+                continue
+            if skipping:
+                continue
             m = re.fullmatch(r"sound_ref (\.\w+)", l)
             if not m:
                 if l:

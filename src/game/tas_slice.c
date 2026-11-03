@@ -131,6 +131,7 @@ static u8 *sSlices;       // the slices file
 static u32 sSliceCount, sSliceBytes;
 static s32 sPlaylist[256];
 static u32 sPlayCount, sPlayNext;
+static s32 sPlayOn;                   // the game goes on after the last slice
 static struct SliceHeader *sPending;   // set by a redirected warp, restored at init_level
 static s32 sPlaying = -1;             // the slice being played
 // The slice that just ended, and where its level change went before the redirect: the full movie
@@ -161,6 +162,7 @@ static struct SliceHeader *slice_at(u32 index) {
 }
 
 // Capture to captureFile (the host), or play sliceFile's slices in playlist order ("3,10,17").
+// "on" after the last number leaves the game running past the last slice: from "208,on", the credits.
 void tas_slice_setup(const char *captureFile, const char *sliceFile, const char *playlist) {
     if (captureFile != NULL) {
         sCapture = fopen(captureFile, "wb");
@@ -203,6 +205,7 @@ void tas_slice_setup(const char *captureFile, const char *sliceFile, const char 
         char *end;
         long v = strtol(p, &end, 10);
         if (end == p) {
+            sPlayOn = strncmp(p, "on", 2) == 0;
             break;
         }
         if (v >= 0 && (u32) v < sSliceCount) {
@@ -257,7 +260,9 @@ void tas_slice_warp(s16 *destLevel, s16 *destArea, s16 *destWarpNode, s32 *arg) 
         gTasSlicesDone = 1;
         printf("TAS: slices done\n");
 #if defined(DC_PROF) && !defined(TARGET_PC_ENDJINN)
-        dc_prof_request_exit();
+        if (!sPlayOn) {
+            dc_prof_request_exit();
+        }
 #endif
     }
     sEnded = sPlaying;

@@ -29,7 +29,8 @@ typedef struct {
     u32 freq;
     u32 key;
     u8 reverb;  /* START/UPDATE: the note's reverb send (0..127), as the N64 mixer would use it */
-    u8 pad[3];
+    u8 seqChannel;   /* START: the note's channel in its sequence, which music dynamics fade */
+    u8 pad[2];
 } AicaRecord;
 
 typedef struct {

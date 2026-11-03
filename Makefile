@@ -1306,10 +1306,12 @@ elf: $(EXE)
 scramble: elf
 	$(KOS_BASE)/utils/scramble/scramble $(EXE).bin $(BUILD_DIR)/1ST_READ.bin
 
+# DC_CDROM=<dir>: a folder for the disc as well, such as a DC_AICAFLOW build's stage (tools/aica/
+# sm64_audio_assets.sh), with DC_AICAFLOW_ROOT=/cd/afx.
 cdi: $(EXE)
 	sh-elf-objcopy -R .stack -O binary $< sm64.bin
 	kos-cc loader.c -o loader.elf
-	mkdcdisc -n "Super Mario 64" -N -f sm64.bin -e loader.elf -o mario64.cdi
+	mkdcdisc -n "Super Mario 64" -N -f sm64.bin -e loader.elf $(if $(DC_CDROM),-d $(DC_CDROM)) -o mario64.cdi
 
 .PHONY: scramble
 .PHONY: elf

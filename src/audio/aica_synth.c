@@ -125,6 +125,7 @@ typedef struct {
 #include "aica_record.h"
 static AicaRecord sRecRing[AICA_RECORD_RING];
 volatile u32 gAicaRecHead, gAicaRecTail;   /* head: audio thread; tail: main thread */
+static u8 sRecSeqChannel;
 u32 gAicaRecTick, gAicaRecDropped;
 u64 gAicaRecStartUs;   /* SH4 time of the first sub-update, for the measured sub-update rate */
 void aica_record(u8 cmd, u8 ch, u8 vol, u8 pan, u32 freq, u32 key, u8 reverb) {
@@ -132,7 +133,7 @@ void aica_record(u8 cmd, u8 ch, u8 vol, u8 pan, u32 freq, u32 key, u8 reverb) {
     if (head - gAicaRecTail >= AICA_RECORD_RING) { gAicaRecDropped++; return; }
     AicaRecord *r = &sRecRing[head % AICA_RECORD_RING];
     r->tick = gAicaRecTick; r->cmd = cmd; r->ch = ch; r->vol = vol; r->pan = pan;
-    r->freq = freq; r->key = key; r->reverb = reverb;
+    r->freq = freq; r->key = key; r->reverb = reverb; r->seqChannel = sRecSeqChannel;
     gAicaRecHead = head + 1;
 }
 const AicaRecord *aica_record_at(u32 index) { return &sRecRing[index % AICA_RECORD_RING]; }
@@ -140,7 +141,17 @@ const AicaRecord *aica_record_at(u32 index) { return &sRecRing[index % AICA_RECO
    logged (the N64 mixer's wet send, which AICAflow flows carry as DSP_SEND). */
 static u8 sRecReverb;
 #define AICA_REC(cmd, ch, vol, pan, freq, key) aica_record(cmd, ch, vol, pan, freq, key, sRecReverb)
-#define AICA_REC_NOTE(note) (sRecReverb = (note)->reverb)
+static void rec_note(const struct Note *note) {
+    sRecReverb = note->reverb;
+    sRecSeqChannel = 0xff;
+    if (note->parentLayer != NO_LAYER) {
+        const struct SequenceChannel *channel = note->parentLayer->seqChannel;
+        for (u8 i = 0; i < CHANNELS_MAX; i++) {
+            if (channel->seqPlayer->channels[i] == channel) sRecSeqChannel = i;
+        }
+    }
+}
+#define AICA_REC_NOTE(note) rec_note(note)
 #define AICA_REC_CHANGED(v, note) ((v)->sentRev != (note)->reverb)
 #define AICA_REC_SENT(v, note) ((v)->sentRev = (note)->reverb)
 #else
@@ -325,6 +336,9 @@ static int resolve(struct Note* note, u32* outKey, Resolved* res, AramEntry** ou
         AramEntry* e;
         if (s == NULL || s->sampleAddr == NULL) return 0;
         key = (u32)s->sampleAddr - (u32)sTblBase;
+#ifdef AICA_RECORD_HOST
+        key -= 0x130;   /* the keys are the Dreamcast's: the host's .tbl header has 64-bit entries */
+#endif
         if (!sample_lookup(key, &d)) return 0;
         if (d->stream) { *outDesc = d; *outKey = key; return 2; }   /* SH4-streamed */
         e = cache_acquire(key, d->pool_offset, d->byte_len);

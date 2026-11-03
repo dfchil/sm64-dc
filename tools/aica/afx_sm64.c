@@ -44,11 +44,12 @@ static int sibling(const char *path, const char *suffix, char *out, size_t cap) 
     return 0;
 }
 
-/* Insert a lane map (every channel in lane 0) between the setups and the stream and set
- * AFX_FLAG_LANES, so the host can pan the whole flow with afx_instance_lanes_set(AFX_LANE_PAN).
+/* Insert a lane map between the setups and the stream and set AFX_FLAG_LANES, for the host's
+ * afx_instance_lanes_set: every channel in lane 0, so it can pan a whole sound, or map, a file of
+ * one lane per channel, so it can fade a song's sequence channels.
  * The stream moves by the map's size: LOOP targets are stream-relative and setups keep their
  * place, so only the header changes. AFC checkpoints hold image positions: dropped here. */
-static int add_lanes(afx_c_output_t *out) {
+static int add_lanes(afx_c_output_t *out, const char *map) {
     afx_file_header_t h;
     if (afx_file_validate(out->afx, out->afx_bytes, &h)) return -1;
     uint32_t lanes = h.required_channels, setups = h.setup_count * AFX_SETUP_BYTES;
@@ -56,6 +57,12 @@ static int add_lanes(afx_c_output_t *out) {
     uint8_t *afx = calloc(1, bytes);
     if (!afx) return -1;
     memcpy(afx, out->afx, h.image_offset + setups);
+    if (map) {
+        FILE *f = fopen(map, "rb");
+        size_t got = f ? fread(afx + h.image_offset + setups, 1, lanes, f) : 0;
+        if (f) fclose(f);
+        if (got != lanes) return free(afx), -1;
+    }
     memcpy(afx + h.image_offset + setups + lanes, out->afx + h.image_offset + h.stream_offset, h.stream_size);
     h.flags |= AFX_FLAG_LANES;
     h.stream_offset = setups + lanes;
@@ -69,9 +76,10 @@ static int add_lanes(afx_c_output_t *out) {
 }
 
 int main(int argc, char **argv) {
-    int lanes = argc == 5 && !strcmp(argv[4], "--lanes");
-    if (lanes) argc--;
-    if (argc != 4) return fprintf(stderr, "usage: %s song.job out.afb out.afx [--lanes]\n", argv[0]), 2;
+    int lanes = argc >= 5 && !strcmp(argv[4], "--lanes");
+    const char *lane_map = lanes && argc == 6 ? argv[5] : NULL;
+    if (lanes) argc = 4;
+    if (argc != 4) return fprintf(stderr, "usage: %s song.job out.afb out.afx [--lanes [map]]\n", argv[0]), 2;
     uint32_t bytes;
     uint8_t *job = read_file(argv[1], &bytes);
     if (!job || bytes < 32 || afx_read32(job) != 0x424F4A53u) return fprintf(stderr, "bad job %s\n", argv[1]), 1;
@@ -128,7 +136,7 @@ int main(int argc, char **argv) {
     afx_write32(out.afx + 68, rate_num);
     afx_write32(out.afx + 72, rate_den);
     if (afx_file_validate(out.afx, out.afx_bytes, NULL)) return fprintf(stderr, "invalid AFX after the rate patch\n"), 1;
-    if (lanes && add_lanes(&out)) return fprintf(stderr, "cannot add the lane map\n"), 1;
+    if (lanes && add_lanes(&out, lane_map)) return fprintf(stderr, "cannot add the lane map\n"), 1;
     char afc[4096];
     if (write_file(argv[2], out.afb, out.afb_bytes) || write_file(argv[3], out.afx, out.afx_bytes) ||
         (out.afc && (sibling(argv[3], ".afc", afc, sizeof(afc)) || write_file(afc, out.afc, out.afc_bytes))))

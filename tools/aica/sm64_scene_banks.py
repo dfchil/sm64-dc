@@ -123,8 +123,10 @@ def fit(ranked, core_samples, budget, music):
     """The assets of ranked (in load order) that go in a level pack, and those left out.
 
     An asset whose samples are all in the core bank costs its flow; any other its flow and the
-    samples it adds to the level bank. The level's music and sounds go first while they fit. Of
-    the other songs, the set packed is the one that lets the most of them play: a song left out
+    samples it adds to the level bank. The level's music and sounds go first while they fit, and
+    leave free what the largest other song needs beyond the flows of the level's music, which
+    the runtime lets go for it: a sound left out loads from its own files when it plays, but a
+    song left out without room is silent. Of the other songs, the set packed is the one that lets the most of them play: a song left out
     plays when the room it needs on its own (its files, which the runtime loads when it plays)
     is free beside the pack; ties go to the larger set packed, which loads nothing mid-scene."""
     core = set(core_samples)
@@ -138,11 +140,11 @@ def fit(ranked, core_samples, budget, music):
     def alone(a):
         return len(a.afx) + sum(-len(v) % 32 + len(v) for v in a.samples().values())
 
-    def place(assets, have, used):
+    def place(assets, have, used, limit):
         taken, out = [], []
         for a in assets:
             c = cost(a, have)
-            if used + c <= budget:
+            if used + c <= limit:
                 taken.append(a)
                 used += c
                 if not set(a.samples()) <= core:
@@ -152,14 +154,17 @@ def fit(ranked, core_samples, budget, music):
         return taken, out, have, used
 
     later = [a for a in ranked if a.stem.startswith("seq") and a.stem not in music]
-    first, first_out, have, used = place([a for a in ranked if a not in later], set(), 0)
+    level_music = sum(len(a.afx) for a in ranked if a.stem in music)
+    reserve = max(0, max((alone(a) for a in later), default=0) - level_music)
+    first, first_out, have, used = place([a for a in ranked if a not in later], set(), 0, budget - reserve)
     best = None
     for bits in range(1 << len(later)):
-        packed, out, _, total = place([a for i, a in enumerate(later) if bits >> i & 1], have, used)
+        packed, out, _, total = place([a for i, a in enumerate(later) if bits >> i & 1], have, used, budget)
         if out:
             continue
         rest = [a for i, a in enumerate(later) if not bits >> i & 1]
-        room = budget - total >= max((alone(a) for a in rest), default=0)
+        idle = level_music + sum(len(a.afx) for a in packed)
+        room = budget - total + idle >= max((alone(a) for a in rest), default=0)
         score = (len(packed) + (len(rest) if room else 0), len(packed))
         if best is None or score > best[0]:
             best = (score, packed, rest, room)
@@ -178,7 +183,7 @@ def main():
     # afx_mem_stats on hardware: used + free with nothing loaded but the firmware's own state.
     ap.add_argument("--arena-kb", type=int, default=2023, help="AICA RAM arena (default %(default)s)")
     ap.add_argument("--reverb-kb", type=int, default=16, help="reverb ring, 0 without (default %(default)s)")
-    ap.add_argument("--margin-kb", type=int, default=8, help="kept free (default %(default)s)")
+    ap.add_argument("--margin-kb", type=int, default=32, help="kept free (default %(default)s)")
     args = ap.parse_args()
     stage = args.stage / "afx"
     lists = json.loads(args.assets.read_text())
@@ -221,6 +226,8 @@ def main():
         bank, offsets, bank_id = make_bank(samples)
         entries = [(a.stem, 1, a.bound(core_offsets, core_id)) if a in on_core else
                    (a.stem, 0, a.bound(offsets, bank_id)) for a in own]
+        # Songs load last: the room one leaves when it lets go joins the free end of AICA RAM.
+        entries.sort(key=lambda e: e[0].startswith("seq"))
         size = write_pack(stage / f"scene_{number:02d}.smp", bank, entries)
         flows = sum(struct.unpack_from("<I", e[2], 20)[0] for e in entries)
         out = f" left out {' '.join(a.stem for a in left_out)}" if left_out else ""

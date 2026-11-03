@@ -26,6 +26,14 @@ the first jump, and the flow ends at the first jump with LOOP. Voices still
 sounding there are keyed off, as the game's restart of its channels cuts
 them. Record at least two passes.
 
+--continuous: a sound the game requests every frame was recorded for as long as the requests
+went on, and plays until they stop. The flow loops over a stretch of its recording that ends as
+it began, so the sound holds rather than starting again.
+
+--lane-masks: sequence channel masks, for a song whose channels the game fades apart: lane n + 1
+holds the channels of mask n, lane 0 the rest. A lane's voices cannot share local channels with
+another's, so a song gets no more lanes than its fades need (SONG_LANES, sm64_afx_batch.py).
+
 Reverb: a song's voices carry the note's reverb send (logs with 20-byte records) as DSP_SEND,
 IMXL by level on MIXS0, which the scene's reverb program reads (src/pc/audio/sm64_aicaflow.c).
 --full-send gives every voice IMXL 15 instead, for sounds: the game scales it per lane at run
@@ -43,7 +51,7 @@ import sys
 from pathlib import Path
 
 REC = struct.Struct("<IBBBBII")
-REC20 = struct.Struct("<IBBBBIIB3x")   # with the note's reverb send
+REC20 = struct.Struct("<IBBBBIIBB2x")   # with the note's reverb send and sequence channel
 START, UPDATE, STOP, SEQ_JUMP, END = 1, 2, 3, 4, 5
 KEY_SYNTH, KEY_STREAM = 0x80000000, 0x40000000
 FIELD_ENV_AD, FIELD_ENV_DR, FIELD_PITCH, FIELD_DSP_SEND, FIELD_DIRECT, FIELD_MIX = 4, 5, 6, 8, 9, 10
@@ -58,6 +66,9 @@ EG_SLOPE = [0.0] + [1023.0 / 4.0 / ms * 1000.0 / (44100 / 44) for ms in EG_FULL_
 EG_ENV_DR = 0x3C1F            # KRS 0xF (no pitch scaling), DL 0, RR 31 (key-off as before)
 EG_TOP = 250.0                # EG attenuation (TL steps) a sounding voice keeps below: 255.75 ends it
 FULL_SEND = 0xF0
+CONTINUOUS_MIN_TICKS = 3000   # a held sound's recording runs 4 s; shorter ones ended by themselves
+CONTINUOUS_ATTACK_TICKS = 200
+CONTINUOUS_MIN_BODY = 300
 # The least N64 send (0..127, reverb / 128 of the voice) of each AICA IMXL code 1..15, which steps
 # 3 dB from -42 dB to 0 dB; the same table is send_code in src/pc/audio/sm64_aicaflow.c.
 SEND_LEVELS = [1, 2, 2, 3, 4, 5, 7, 10, 14, 20, 28, 39, 54, 77, 108]
@@ -126,7 +137,7 @@ def read_log(path):
     if struct.unpack_from("<I", data, 20)[0] == REC20.size:
         records = [REC20.unpack_from(data, i) for i in range(at, len(data) - REC20.size + 1, REC20.size)]
     else:
-        records = [REC.unpack_from(data, i) + (0,) for i in range(at, len(data) - REC.size + 1, REC.size)]
+        records = [REC.unpack_from(data, i) + (0, 0xFF) for i in range(at, len(data) - REC.size + 1, REC.size)]
     return upf, waves, records
 
 
@@ -182,12 +193,16 @@ def build_voices(records, full_send=False):
         w = words(freq, vol, pan)
         w[FIELD_DSP_SEND] = FULL_SEND if full_send else dsp_send(reverb)
         return w
-    voices, open_ = [], {}
-    for t, cmd, ch, vol, pan, freq, key, reverb in records:
+    voices, open_, last_channel = [], {}, {}
+    for t, cmd, ch, vol, pan, freq, key, reverb, seq_channel in records:
         if cmd == START:
+            # A note starting after its layer has gone logs no sequence channel: the voice's last.
+            seq_channel = last_channel.get(ch, 0) if seq_channel == 0xFF else seq_channel
+            last_channel[ch] = seq_channel
             if ch in open_:
                 open_.pop(ch)["stop"] = t
-            v = dict(id=len(voices), ch=ch, key=key, start=t, stop=None, words=voice_words(freq, vol, pan, reverb))
+            v = dict(id=len(voices), ch=ch, key=key, seq_channel=seq_channel, start=t, stop=None,
+                     words=voice_words(freq, vol, pan, reverb))
             v["events"] = [(t, "note", {f: x for f, x in v["words"].items() if f != FIELD_DSP_SEND or x})]
             voices.append(v)
             open_[ch] = v
@@ -392,13 +407,63 @@ def place_cut(voices, lt, b0, b1):
     return lt + d, b0 + d, links
 
 
-def allocate(voices, end, links):
-    """Local channels: voices that overlap get different ones, and each pair crossing the
-    loop (links: second-pass voice -> first-pass voice) gets one channel for both."""
+def word_at(v, t, field):
+    """A voice's register word at tick t."""
+    value = None
+    for when, _, w in v["events"]:
+        if when > t:
+            break
+        value = w.get(field, value)
+    return value
+
+
+def continuous_loop(voices, looped):
+    """(loop tick, end tick, links) for a sound held by the game's requests, or None if it ends by
+    itself. Past the first note's attack, the longest stretch whose end has the same notes
+    sounding as its start, at the nearest pitch and level. A voice crosses the LOOP on a looped
+    sample, or level with its partner in a one-shot (which would run out early otherwise); links
+    as in place_cut."""
+    last = max(v["stop"] if v["stop"] is not None else v["events"][-1][0] for v in voices)
+    if last < CONTINUOUS_MIN_TICKS:
+        return None
+    best = None
+    for end in range(last - 2, last // 2, -8):
+        x = sounding(voices, end)
+        for lt in range(voices[0]["start"] + CONTINUOUS_ATTACK_TICKS, end - CONTINUOUS_MIN_BODY, 8):
+            y = sounding(voices, lt)
+            if len(x) != len(y):
+                continue
+            links, off, free = {}, 0, list(y)
+            for vx in sorted(x, key=lambda v: v["start"]):
+                same = [v for v in free if v["key"] == vx["key"]
+                        and (looped(vx) or abs((end - vx["start"]) - (lt - v["start"])) <= 12)]
+                if not same:
+                    break
+                def distance(vy):
+                    return (abs(word_at(vx, end, FIELD_PITCH) - word_at(vy, lt, FIELD_PITCH))
+                            + abs((word_at(vx, end, FIELD_MIX) >> 8) - (word_at(vy, lt, FIELD_MIX) >> 8)))
+                vy = min(same, key=distance)
+                off += distance(vy)
+                free.remove(vy)
+                links[vx["id"]] = vy["id"]
+            else:
+                if best is None or (off, lt - end) < best[0]:
+                    best = ((off, lt - end), lt, end, links)
+    return best[1:] if best else None
+
+
+def allocate(voices, end, links, masks=()):
+    """Local channels, and each one's lane: voices that overlap get different ones, each pair
+    crossing the loop (links: second-pass voice -> first-pass voice) gets one channel for both, and
+    masks (--lane-masks) keeps each lane's voices on channels of their own."""
     import bisect
     span = {v["id"]: (v["start"], min(v["stop"] if v["stop"] is not None else end, end)) for v in voices
             if v["start"] < end}
     busy = []                    # per channel: sorted [(start, stop)]
+    lanes = []                   # per channel: its lane
+    def voice_lane(v):
+        return next((n + 1 for n, mask in enumerate(masks) if mask >> v["seq_channel"] & 1), 0)
+    lane_of = {v["id"]: voice_lane(v) for v in voices}
 
     def free(ch, intervals):
         for a, b in intervals:
@@ -416,7 +481,8 @@ def allocate(voices, end, links):
         while True:
             if ch == len(busy):
                 busy.append([])
-            if free(ch, intervals):
+                lanes.append(lane_of[ids[0]])
+            if lanes[ch] == lane_of[ids[0]] and free(ch, intervals):
                 for iv in intervals:
                     bisect.insort(busy[ch], iv)
                 return ch
@@ -430,7 +496,7 @@ def allocate(voices, end, links):
             channel_of[v["id"]] = place([v["id"]])
     if len(busy) > 64:
         sys.exit(f"{len(busy)} channels needed")
-    return channel_of
+    return channel_of, lanes
 
 
 def main():
@@ -440,6 +506,8 @@ def main():
     ap.add_argument("--pool", required=True)
     ap.add_argument("--out", required=True)
     ap.add_argument("--loop", action="store_true", help="loop between the sequence player's first two jumps")
+    ap.add_argument("--lane-masks", help="comma-separated sequence channel masks, one lane each (songs)")
+    ap.add_argument("--continuous", action="store_true", help="loop a sound the game keeps requesting")
     ap.add_argument("--player", type=int, default=0)
     ap.add_argument("--sub-rate", type=float, help="sub-updates per second (default: the log's measurement)")
     ap.add_argument("--tail", type=int, default=0, help="ticks appended after the last event of a one-shot")
@@ -505,7 +573,14 @@ def main():
               f"loop {end} -> {loop_tick}, {len(links)} voices carried across")
     else:
         end = last_tick + args.tail
-    channel_of = allocate(voices, end, links)
+        held = None
+        if args.continuous:
+            held = continuous_loop(voices, lambda v: v["key"] & KEY_SYNTH or table[v["key"] & 0x3FFFFFFF]["loop"])
+        if held:
+            loop_tick, end, links = held
+            print(f"held sound: loop {end} -> {loop_tick}, {len(links)} voices carried across")
+    masks = [int(m, 0) for m in args.lane_masks.split(",")] if args.lane_masks else []
+    channel_of, lanes = allocate(voices, end, links, masks)
     events = []
     carried = set(links) | set(links.values())
     if args.hw_env is not None:
@@ -580,9 +655,13 @@ def main():
     print(f"{len(zones)} setups, {len(spread)} events ({delayed} moved later to fit a tick's budget) on "
           f"{channels} channels, {end} ticks, {sum(len(z['data']) for z in zones)} sample bytes -> {out.with_suffix('.job')}")
     tool = Path(args.afx_sm64)
+    lane_args = ["--lanes"] if args.lanes else []
+    if masks:
+        out.with_suffix(".lanes").write_bytes(bytes(lanes[:channels]))
+        lane_args = ["--lanes", str(out.with_suffix(".lanes"))]
     if tool.exists():
         subprocess.run([str(tool), str(out.with_suffix(".job")), str(out.with_suffix(".afb")), str(out.with_suffix(".afx"))]
-                       + (["--lanes"] if args.lanes else []), check=True)
+                       + lane_args, check=True)
     else:
         print(f"afx_sm64 not built at {tool}; see tools/aica/afx_sm64.c")
 

@@ -6,10 +6,24 @@
 #include <PR/ultratypes.h>
 
 int sm64_afx_init(void);
-void sm64_afx_play_sequence(u8 player, u8 seqId, u16 fadeTimer);
-void sm64_afx_fade_out(u8 player, u16 fadeTimer);
-void sm64_afx_set_volume(u8 player, f32 scale, u16 fadeTimer);
-void sm64_afx_play_sound(s32 soundBits, f32 *pos);
+/* The music players: external.c keeps the original's queue and volumes in the sequence players,
+ * and plays a player's song here at a gain over the volume it was recorded at. */
+int sm64_afx_play_sequence(u8 player, u8 seqId);
+int sm64_afx_music_playing(u8 player);
+void sm64_afx_music_gain(u8 player, f32 gain);
+/* The song's sequence channels, as its flow's lanes: those it started, at their volume scales. */
+void sm64_afx_music_channels(u8 player, u16 enabled, const f32 *scale);
+void sm64_afx_music_stop(u8 player);
+/* The sound channels: one per sound bank, as update_game_sound chooses what they play. */
+void sm64_afx_sfx_start(u8 channel, u32 soundBits);
+int sm64_afx_sfx_active(u8 channel);
+void sm64_afx_sfx_stop(u8 channel);
+void sm64_afx_sfx_place(u8 channel, u32 soundBits, f32 volume, f32 pan, f32 pitch, int echo);
+void sm64_afx_sfx_fade(u8 channel, u16 ticks);
+/* The pause menu (set_sound_disabled), sound_reset, and the file select's mono option. */
+void sm64_afx_mute(u8 muted);
+void sm64_afx_stop_all(void);
+void sm64_afx_mono(u8 mono);
 void sm64_afx_tick(void);
 /* level_update.c init_level: read the level's scene pack (and the core pack, once) before the
  * level starts, so its songs and sounds do not load from /pc mid-scene. */
@@ -17,8 +31,6 @@ void sm64_afx_scene_prepare(s16 level);
 /* external.c sound_reset: the session preset's reverb (N64 ring length in 32 kHz samples, and
  * feedback, Q15) becomes the scene's DSP program. */
 void sm64_afx_reverb(u16 windowSize, u16 gain);
-/* external.c: a sound's volume and pan from its source position, as the game computes them. */
-void sm64_sound_dynamics(u32 soundBits, f32 *pos, f32 *volume, f32 *pan);
 /* external.c: a sound's reverb send (0..127) from its script's value and its volume. */
 u8 sm64_sound_reverb(u32 soundBits, f32 volume, u8 scriptReverb);
 /* external.c: sm64_afx_reverb with an audio session preset's values. */
