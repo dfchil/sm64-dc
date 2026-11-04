@@ -324,6 +324,12 @@ void config_gfx_pool(void) {
     gGfxSPTask = &gGfxPool->spTask;
     gDisplayListHead = gGfxPool->buffer;
     gGfxPoolEnd = (u8 *) (gGfxPool->buffer + GFX_POOL_SIZE);
+#ifdef TARGET_PC_ENDJINN
+    {
+        extern void interp_stats_pool_reset(void);
+        interp_stats_pool_reset();
+    }
+#endif
 }
 
 /** Handles vsync. */

@@ -720,6 +720,7 @@ static void nat_rec_cmd(const Gfx *cmd) {
 #endif
             if (cmd->words.w1) sRec.fail = 1;   // another Dreamcast tag (gfx_dc_tags.h)
             break;
+        case G_NATIVE:   // geometry handed over directly: drawn where the list stands
         case G_MTX:
         case (uint8_t) G_POPMTX:
         case G_TEXRECT:
@@ -1006,7 +1007,13 @@ static NatVariant *nat_record(Gfx *dl) {
         for (int i = 0; i < words; i++) sNatOne[i] = cmd[i];
         sNatOne[words].words.w0 = (uint32_t) (uint8_t) G_ENDDL << 24;
         sNatOne[words].words.w1 = 0;
+#ifdef TARGET_PC_ENDJINN
+        sIstatSkip++;   // the recording's own draw: not the interpreter's work
+#endif
         gfx_run_dl(sNatOne);
+#ifdef TARGET_PC_ENDJINN
+        sIstatSkip--;
+#endif
         cmd += words;
     }
     sRec.active = 0;
@@ -1111,8 +1118,8 @@ static uint32_t sNatLitCur;
 // gfx_sp_vertex_light's arithmetic, in the same order, from the vertex's snapshot (its normal is
 // where its colour goes until then). In .sub1 after cc_eval_float (SM_WARM): .sub0 is full.
 static void SM_WARM __attribute__((noinline)) nat_vertex_resolve(uint8_t idx) {
-    const NatLitSnap *sn = &sNatLit[sVtxLit[idx] - 1];
-    struct LoadedVertex *d = &rsp.loaded_vertices[idx];
+    const NatLitSnap *sn = &sNatLit[VB_LIT[idx] - 1];
+    struct LoadedVertex *d = &VB_LV[idx];
     const float nx = (float) (int8_t) d->color.r, ny = (float) (int8_t) d->color.g, nz = (float) (int8_t) d->color.b;
     const int nl = sn->nl;
     float r = sn->col[nl][0];
@@ -1129,7 +1136,7 @@ static void SM_WARM __attribute__((noinline)) nat_vertex_resolve(uint8_t idx) {
     d->color.r = r >= 255.0f ? 255 : (uint8_t) r;
     d->color.g = g >= 255.0f ? 255 : (uint8_t) g;
     d->color.b = b >= 255.0f ? 255 : (uint8_t) b;
-    sVtxLit[idx] = 0;
+    VB_LIT[idx] = 0;
 }
 
 // The snapshot of the current lights (after gfx_vertex_lights_prep), + 1. Before one is reused, the
@@ -1155,14 +1162,14 @@ static uint8_t nat_lit_snapshot(void) {
 static void SM_HOT __attribute__((noinline)) nat_vertex_lit(size_t n, size_t dest, const NatVtx *src) {
     for (size_t i = 0; i < n; i++, dest++) {
         const NatVtx *v = &src[i];
-        struct LoadedVertex *d = &rsp.loaded_vertices[dest];
+        struct LoadedVertex *d = &VB_LV[dest];
         shz_vec4_t out = shz_xmtrx_transform_vec4(shz_vec4_init(v->x, v->y, v->z, 1.0f));
         __builtin_prefetch(v + 3);
         const float x = out.x, y = out.y, z = out.z, w = out.w;
         d->color = v->c;
         d->u = v->u;
         d->v = v->v;
-        clip_rej[dest] = 128 | ((w < 0) ? 64 : 0x00) | trivial_reject(x, y, z, w);
+        VB_CLIP[dest] = 128 | ((w < 0) ? 64 : 0x00) | trivial_reject(x, y, z, w);
         d->_x = x;
         d->_y = y;
         d->_z = z;
@@ -1174,14 +1181,14 @@ static void SM_HOT __attribute__((noinline)) nat_vertex_lit(size_t n, size_t des
 static void SM_HOT __attribute__((noinline)) nat_vertex_no(size_t n, size_t dest, const NatVtx *src) {
     for (size_t i = 0; i < n; i++, dest++) {
         const NatVtx *v = &src[i];
-        struct LoadedVertex *d = &rsp.loaded_vertices[dest];
+        struct LoadedVertex *d = &VB_LV[dest];
         shz_vec4_t out = shz_xmtrx_transform_vec4(shz_vec4_init(v->x, v->y, v->z, 1.0f));
         __builtin_prefetch(v + 3);
         const float x = out.x, y = out.y, z = out.z, w = out.w;
         d->color = v->c;
         d->u = v->u;
         d->v = v->v;
-        clip_rej[dest] = ((w < 0) ? 64 : 0x00) | trivial_reject(x, y, z, w);
+        VB_CLIP[dest] = ((w < 0) ? 64 : 0x00) | trivial_reject(x, y, z, w);
         d->_x = x;
         d->_y = y;
         d->_z = z;
@@ -1202,9 +1209,9 @@ static void nat_vertex(size_t n, size_t dest, const NatVtx *src) {
     }
     DC_PROF_COUNT(DCC_VERTS, n);
     for (size_t i = 0; i < n; i++) {
-        sVtxBakeEpoch[dest + i] = 0;
-        sVtxProjGen[dest + i] = 0;
-        sVtxLit[dest + i] = lit;
+        VB_BAKE_EPOCH[dest + i] = 0;
+        VB_PROJ_GEN[dest + i] = 0;
+        VB_LIT[dest + i] = lit;
     }
 }
 

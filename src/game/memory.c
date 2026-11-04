@@ -533,6 +533,12 @@ void *alloc_display_list(u32 size) {
     if (gGfxPoolEnd - size >= (u8 *) gDisplayListHead) {
         gGfxPoolEnd -= size;
         ptr = gGfxPoolEnd;
+#ifdef TARGET_PC_ENDJINN
+        {   // SM64_INTERP_STATS: lists built at run time are named by the function that built them
+            extern void interp_stats_alloc(const void *ptr, unsigned size, const void *caller);
+            interp_stats_alloc(ptr, size, __builtin_return_address(0));
+        }
+#endif
     } else {
         // Callers write through the result unchecked, and on this port address 0 is mapped RAM, so
         // an exhausted pool silently corrupts memory instead of faulting. Say so once.

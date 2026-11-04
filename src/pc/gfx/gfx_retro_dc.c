@@ -25,6 +25,19 @@
 #include "sh4zam_port.h"
 #include "pc/dc_prof.h"
 #include "pc/gfx/gfx_dc_tags.h"
+#if DC_NATIVE
+#include "native/nat_mesh.h"
+#endif
+
+#ifdef TARGET_PC_ENDJINN
+// SM64_INTERP_STATS=1: what gfx_run_dl still draws, by list (pc_endjinn/interp_stats.c). Not while
+// the native renderer runs a command through it to record a list (sIstatSkip).
+#include "pc/pc_endjinn/interp_stats.h"
+static int sIstatSkip;
+#define ISTAT(x) do { if (gInterpStatsOn > 0 && !sIstatSkip) x; } while (0)
+#else
+#define ISTAT(x) ((void) 0)
+#endif
 
 int in_trilerp = 0;
 int doing_peach = 0;
@@ -232,6 +245,35 @@ static struct RSP {
     uint8_t use_fog;
     
 } rsp SM_HOT_DATA __attribute__((aligned(32)));
+
+// The loaded vertices the vertex loops write and gfx_sp_tri1 draws from (VB_*): the RSP's slots, or
+// in a native build a native mesh's own while it draws (nat_vb_set, native/gfx_native_mesh.inc.c),
+// whose vertices load once each instead of once per load that names them.
+#if DC_NATIVE
+typedef struct {
+    struct LoadedVertex *lv;
+    uint8_t *clip;
+    uint32_t *bake_epoch;
+    dc_fast_t *baked;
+    float (*proj)[4];
+    uint32_t *proj_gen;
+    uint8_t *lit;
+} VtxBuf;
+static SM_HOT_DATA VtxBuf sVB = { rsp.loaded_vertices, clip_rej, sVtxBakeEpoch, sVtxBaked,
+                                  sVtxProj, sVtxProjGen, sVtxLit };
+#define VB_LV sVB.lv
+#define VB_CLIP sVB.clip
+#define VB_BAKE_EPOCH sVB.bake_epoch
+#define VB_BAKED sVB.baked
+#define VB_PROJ sVB.proj
+#define VB_PROJ_GEN sVB.proj_gen
+#define VB_LIT sVB.lit
+#else
+#define VB_LV rsp.loaded_vertices
+#define VB_CLIP clip_rej
+#define VB_BAKE_EPOCH sVtxBakeEpoch
+#define VB_BAKED sVtxBaked
+#endif
 
 static struct RDP {
     const uint8_t *palette;
@@ -1027,10 +1069,10 @@ static void SM_HOT_VTX __attribute__((noinline)) gfx_sp_vertex(size_t n_vertices
     }
     DC_PROF_COUNT(DCC_VERTS, n_vertices);
     for (size_t i = 0; i < n_vertices; i++) {
-        sVtxBakeEpoch[dest_index + i] = 0;
+        VB_BAKE_EPOCH[dest_index + i] = 0;
 #if DC_NATIVE
-        sVtxProjGen[dest_index + i] = 0;
-        sVtxLit[dest_index + i] = 0;   // lit as it loaded
+        VB_PROJ_GEN[dest_index + i] = 0;
+        VB_LIT[dest_index + i] = 0;   // lit as it loaded
 #endif
     }
 }
@@ -1053,7 +1095,7 @@ static void SM_HOT_VTX __attribute__((noinline)) gfx_sp_vertex_light(size_t n_ve
 
     for (i = 0; i < n_vertices; i++, dest_index++) {
         const Vtx_tn *vn = &vertices[i].n;
-        struct LoadedVertex *d = &rsp.loaded_vertices[dest_index];
+        struct LoadedVertex *d = &VB_LV[dest_index];
 
         shz_vec4_t out = shz_xmtrx_transform_vec4(shz_vec4_init((float)vn->ob[0], (float)vn->ob[1], (float)vn->ob[2], 1.0f));
         MEM_BARRIER_PREF(vn + 4);   // Vtx is 16 bytes: two cache lines ahead
@@ -1137,7 +1179,7 @@ static void SM_HOT_VTX __attribute__((noinline)) gfx_sp_vertex_light(size_t n_ve
 
         // trivial clip rejection
         uint8_t cr = 128 | ((w < 0) ? 64 : 0x00);
-        clip_rej[dest_index] = cr | trivial_reject(x, y, z, w);
+        VB_CLIP[dest_index] = cr | trivial_reject(x, y, z, w);
 
         // raw CLIP coords (no perspective divide) — the PVR gfx_sp_tri1 path clips
         // homogeneously then bakes screen_x/y + 1/w from these (stage 3).
@@ -1154,7 +1196,7 @@ static void SM_HOT_VTX __attribute__((noinline)) gfx_sp_vertex_no(size_t n_verti
 
 	for (i = 0; i < n_vertices; i++, dest_index++) {
 		const Vtx_t* v = &vertices[i].v;
-		struct LoadedVertex* d = &rsp.loaded_vertices[dest_index];
+		struct LoadedVertex* d = &VB_LV[dest_index];
 
         shz_vec4_t out = shz_xmtrx_transform_vec4(shz_vec4_init((float)v->ob[0], (float)v->ob[1], (float)v->ob[2], 1.0f));
         MEM_BARRIER_PREF(v + 4);    // Vtx is 16 bytes: two cache lines ahead
@@ -1180,7 +1222,7 @@ static void SM_HOT_VTX __attribute__((noinline)) gfx_sp_vertex_no(size_t n_verti
 
         // trivial clip rejection
         uint8_t cr = ((w < 0) ? 64 : 0x00);
-        clip_rej[dest_index] = cr | trivial_reject(x, y, z, w);
+        VB_CLIP[dest_index] = cr | trivial_reject(x, y, z, w);
 
         d->_x = x;
         d->_y = y;
@@ -1956,18 +1998,18 @@ static inline void tri_bake_vertex(dc_fast_t *bv, const struct LoadedVertex *v) 
 // The screen position tri_bake_vertex gives a vertex (the same operations), taken once per load:
 // out of line, once, so that .sub0 keeps a single copy.
 static void SM_HOT __attribute__((noinline)) tri_proj_take(uint8_t idx) {
-    float *q = sVtxProj[idx];
-    const struct LoadedVertex *v = &rsp.loaded_vertices[idx];
+    float *q = VB_PROJ[idx];
+    const struct LoadedVertex *v = &VB_LV[idx];
     const float invw = shz_invf(v->_w);
     q[0] = sm_xscale * (v->_x * invw) + sm_xbias;
     q[1] = sm_yscale * (v->_y * invw) + sm_ybias;
     q[2] = invw;
-    sVtxProjGen[idx] = sProjGen;
+    VB_PROJ_GEN[idx] = sProjGen;
 }
 
 static inline const float *tri_proj(uint8_t idx) {
-    if (sVtxProjGen[idx] != sProjGen) tri_proj_take(idx);
-    return sVtxProj[idx];
+    if (VB_PROJ_GEN[idx] != sProjGen) tri_proj_take(idx);
+    return VB_PROJ[idx];
 }
 
 // DC_NATIVE: baked out of line, once, not inlined at each of gfx_sp_tri1's three corners, so that
@@ -1975,10 +2017,10 @@ static inline const float *tri_proj(uint8_t idx) {
 // is lit first.
 static void SM_HOT __attribute__((noinline)) tri_bake_slot(uint8_t idx) {
     DC_PROF_COUNT(DCC_BAKES, 1);
-    if (sVtxLit[idx]) nat_vertex_resolve(idx);
+    if (VB_LIT[idx]) nat_vertex_resolve(idx);
     const float *q = tri_proj(idx);
-    const struct LoadedVertex *v = &rsp.loaded_vertices[idx];
-    dc_fast_t *bv = &sVtxBaked[idx];
+    const struct LoadedVertex *v = &VB_LV[idx];
+    dc_fast_t *bv = &VB_BAKED[idx];
     const float invw = q[2];
     bv->vert.x = q[0];
     bv->vert.y = q[1];
@@ -1999,21 +2041,21 @@ static void SM_HOT __attribute__((noinline)) tri_bake_slot(uint8_t idx) {
     cc_eval(&sTri.cc, &v->color, &argb, &oargb);
     bv->color.packed = argb;
     bv->pad0.vertindex = oargb | ((uint32_t) v->fog << 24);
-    sVtxBakeEpoch[idx] = sTriStateEpoch;
+    VB_BAKE_EPOCH[idx] = sTriStateEpoch;
 }
 #endif
 
 static inline const dc_fast_t *tri_baked(uint8_t idx) {
-    if (sVtxBakeEpoch[idx] != sTriStateEpoch) {
+    if (VB_BAKE_EPOCH[idx] != sTriStateEpoch) {
 #if DC_NATIVE
         tri_bake_slot(idx);
 #else
         DC_PROF_COUNT(DCC_BAKES, 1);
-        tri_bake_vertex(&sVtxBaked[idx], &rsp.loaded_vertices[idx]);
-        sVtxBakeEpoch[idx] = sTriStateEpoch;
+        tri_bake_vertex(&VB_BAKED[idx], &VB_LV[idx]);
+        VB_BAKE_EPOCH[idx] = sTriStateEpoch;
 #endif
     }
-    return &sVtxBaked[idx];
+    return &VB_BAKED[idx];
 }
 
 // Everything the cached-vertex path can't draw: corners behind the near plane (clipped into a fan),
@@ -2183,11 +2225,14 @@ static void __attribute__((noinline, cold)) gfx_sp_tri1_slow(struct LoadedVertex
 }
 
 static void SM_HOT __attribute__((noinline)) gfx_sp_tri1(uint8_t vtx1_idx, uint8_t vtx2_idx, uint8_t vtx3_idx) {
-    struct LoadedVertex* v1 = &rsp.loaded_vertices[vtx3_idx];
+    struct LoadedVertex* v1 = &VB_LV[vtx3_idx];
     MEM_BARRIER_PREF(v1);
-    struct LoadedVertex* v2 = &rsp.loaded_vertices[vtx2_idx];
-    struct LoadedVertex* v3 = &rsp.loaded_vertices[vtx1_idx];
-    uint8_t l_clip_rej[3] = { clip_rej[vtx3_idx], clip_rej[vtx2_idx], clip_rej[vtx1_idx] };
+    struct LoadedVertex* v2 = &VB_LV[vtx2_idx];
+    struct LoadedVertex* v3 = &VB_LV[vtx1_idx];
+    uint8_t l_clip_rej[3] = { VB_CLIP[vtx3_idx], VB_CLIP[vtx2_idx], VB_CLIP[vtx1_idx] };
+#ifdef TARGET_PC_ENDJINN
+    if (gInterpStatsOn > 0) interp_stats_any_tri();
+#endif
     MEM_BARRIER_PREF(v2);
     uint8_t c0 = l_clip_rej[0];
     uint8_t c1 = l_clip_rej[1];
@@ -2270,9 +2315,9 @@ static void SM_HOT __attribute__((noinline)) gfx_sp_tri1(uint8_t vtx1_idx, uint8
 
 #if DC_NATIVE
     // The slow path reads the corners' colours: light them first.
-    if (sVtxLit[vtx1_idx]) nat_vertex_resolve(vtx1_idx);
-    if (sVtxLit[vtx2_idx]) nat_vertex_resolve(vtx2_idx);
-    if (sVtxLit[vtx3_idx]) nat_vertex_resolve(vtx3_idx);
+    if (VB_LIT[vtx1_idx]) nat_vertex_resolve(vtx1_idx);
+    if (VB_LIT[vtx2_idx]) nat_vertex_resolve(vtx2_idx);
+    if (VB_LIT[vtx3_idx]) nat_vertex_resolve(vtx3_idx);
 #endif
     gfx_sp_tri1_slow(v1, v2, v3, c0, c1, c2);
 }
@@ -3061,11 +3106,19 @@ static void SM_HOT_DL __attribute__((noinline)) gfx_run_dl(Gfx* cmd) {
             opcode != (uint8_t) G_DL && opcode != (uint8_t) G_ENDDL) {
             tri_state_bump();
         }
+        ISTAT(interp_stats_cmd(opcode));
 
         switch (opcode) {
             case (uint8_t) G_NOOP:
                 if (cmd->words.w1) gfx_dc_tag(cmd->words.w1);
                 break;
+#if DC_NATIVE
+            case G_NATIVE: {   // geometry handed over directly (native/nat_mesh.h)
+                const NatCall *c = (const NatCall *) cmd->words.w1;
+                c->fn(c->arg);
+                break;
+            }
+#endif
             // RSP commands:
             case G_MTX:
 #ifdef F3DEX_GBI_2
@@ -3106,6 +3159,7 @@ static void SM_HOT_DL __attribute__((noinline)) gfx_run_dl(Gfx* cmd) {
 #endif
                 break;
             case G_VTX:
+                ISTAT(interp_stats_vtx(C0(12, 8)));
 #ifdef F3DEX_GBI_2
                 gfx_sp_vertex(C0(12, 8), C0(1, 7) - C0(12, 8), seg_addr(cmd->words.w1));
 #elif defined(F3DEX_GBI) || defined(F3DLP_GBI)
@@ -3126,6 +3180,7 @@ static void SM_HOT_DL __attribute__((noinline)) gfx_run_dl(Gfx* cmd) {
                 }
 #endif
                 __builtin_prefetch(seg_addr(cmd->words.w1));
+                ISTAT(interp_stats_call(seg_addr(cmd->words.w1), C0(16, 1) == 0));
                 if (C0(16, 1) == 0) {
                   
                     dl_stack[dl_sp++] = cmd + 1; /* return to next command */
@@ -3148,6 +3203,7 @@ static void SM_HOT_DL __attribute__((noinline)) gfx_run_dl(Gfx* cmd) {
                     return;
                 } else {
                     /* pop return address and resume caller DL */
+                    ISTAT(interp_stats_return());
                     cmd = dl_stack[--dl_sp];
                     __builtin_prefetch(cmd);
                     --cmd; /* ++cmd at loop bottom -> first command after the call */
@@ -3169,6 +3225,7 @@ static void SM_HOT_DL __attribute__((noinline)) gfx_run_dl(Gfx* cmd) {
 #endif
 
             case (uint8_t)G_TRI1:
+                ISTAT(interp_stats_tri(1));
 #ifdef F3DEX_GBI_2
                 gfx_sp_tri1(C0(17, 7), C0(9, 7), C0(1, 7));
 #elif defined(F3DEX_GBI) || defined(F3DLP_GBI)
@@ -3179,6 +3236,7 @@ static void SM_HOT_DL __attribute__((noinline)) gfx_run_dl(Gfx* cmd) {
                 break;
 #if defined(F3DEX_GBI) || defined(F3DLP_GBI) || defined(F3DEX_GBI_2)
             case (uint8_t)G_TRI2:
+                ISTAT(interp_stats_tri(2));
                 gfx_sp_tri1(C0(17, 7), C0(9, 7), C0(1, 7));
                 gfx_sp_tri1(C1(17, 7), C1(9, 7), C1(1, 7));
                 break;
@@ -3238,6 +3296,7 @@ static void SM_HOT_DL __attribute__((noinline)) gfx_run_dl(Gfx* cmd) {
             case G_TEXRECT:
             case G_TEXRECTFLIP:
             {
+                ISTAT(interp_stats_rect());
                 int32_t lrx, lry, ulx, uly;
                 uint32_t uls, ult, dsdx, dtdy;
 #ifdef F3DEX_GBI_2E
@@ -3268,6 +3327,7 @@ static void SM_HOT_DL __attribute__((noinline)) gfx_run_dl(Gfx* cmd) {
                 break;
             }
             case G_FILLRECT:
+                ISTAT(interp_stats_rect());
 #ifdef F3DEX_GBI_2E
             {
                 int32_t lrx, lry, ulx, uly;
@@ -3300,6 +3360,7 @@ static void SM_HOT_DL __attribute__((noinline)) gfx_run_dl(Gfx* cmd) {
 
 #if DC_NATIVE
 #include "native/gfx_native.inc.c"
+#include "native/gfx_native_mesh.inc.c"
 #endif
 
 static void gfx_sp_reset() {
@@ -3411,6 +3472,9 @@ void gfx_run(Gfx *commands) {
     gfx_pvr_render_frame(gfx_run_op, commands);
 #else
     gfx_rapi->start_frame();
+#ifdef TARGET_PC_ENDJINN
+    interp_stats_frame();
+#endif
     gfx_run_dl(commands);
     gfx_rapi->end_frame();
 #endif
