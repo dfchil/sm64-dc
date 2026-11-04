@@ -1,13 +1,14 @@
 #ifndef NAT_MESH_H
 #define NAT_MESH_H
-// DC_NATIVE builds: geometry a game system hands the renderer directly instead of as display-list
+// Geometry a game system hands the renderer directly instead of as display-list
 // commands (gfx_native_mesh.inc.c). It is drawn with the state the display list has set where it
 // stands, and its triangles come out as the commands would have drawn them.
 #include <stdint.h>
 #include <PR/gbi.h>
+#include "nat_ops.h"
 
-// A display-list command (unused by F3DEX2) whose w1 is a NatCall: running the list calls fn(arg).
-#define G_NATIVE 0x0A
+// A display-list command whose w1 is a NatCall: running the list calls fn(arg) (nat_ops.h).
+#define G_NATIVE N_NATIVE
 typedef struct {
     void (*fn)(const void *arg);
     const void *arg;

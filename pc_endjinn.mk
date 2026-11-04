@@ -24,7 +24,6 @@ HOST_BUILD ?= build/pc-endjinn
 HOST_EXE ?= $(HOST_BUILD)/sm64
 DC_TRIG_TABLE ?= 1
 DC_EXACT_LOGIC ?= 0
-DC_NATIVE ?= 0
 HOST_OPT ?= -O2
 SM64_CC ?= $(CC)
 SHZ_INCLUDE ?= $(if $(KOS_BASE),$(KOS_BASE),/opt/toolchains/dc/kos)/addons/include/sh4zam
@@ -97,8 +96,7 @@ $(HOST_BUILD)/sound/sound_data.o: FIRST_INC := -I$(HOST_BUILD)/snd
 SM64_DEFINES := -D_LANGUAGE_C -DVERSION_US -DNON_MATCHING -DAVOID_UB -DF3DEX_GBI_2E -DTARGET_DC \
   -DTARGET_PC_ENDJINN -DNDEBUG -DDC_VBL_WAIT=1 -DDC_60FPS -DDC_OPAQUE_LAVA=0 -DDC_OVERLAY=0 \
   -DDC_HOLD_IDENTICAL=1 -DDC_TRIG_TABLE=$(DC_TRIG_TABLE) -DDC_SHZ_FSCA=1 -DDC_RAIL_TR=1 -DDC_PT_CHUNK=64 \
-  -DKOS_GENWAIT_3ARG -DGFX_BACKEND_PVR=1 -DDC_COVERS=1 -DNO_SEGMENTED_MEMORY -DENABLE_OPENGL -DDC_TAS \
-  -DDC_NATIVE=$(DC_NATIVE)
+  -DKOS_GENWAIT_3ARG -DGFX_BACKEND_PVR=1 -DDC_COVERS=1 -DNO_SEGMENTED_MEMORY -DENABLE_OPENGL -DDC_TAS
 # src/pc/pc_endjinn/compat first: it wraps pc-endjinn's <kos.h> with the few KOS calls SM64 needs.
 HOST_SHZ_DIR := $(HOST_BUILD)/shzinc
 SM64_INCLUDES := -Isrc/pc/pc_endjinn/compat -Iinclude -I$(DC_GEN) -I$(DC_GEN)/include -Isrc -I. \
@@ -140,6 +138,12 @@ $(HOST_BUILD)/enDjinn/host-common/%.o: $(ENJ_HOST_COMMON_DIR)/%.cpp
 $(HOST_BUILD)/enDjinn/pc-endjinn/%.o: $(PC_ENDJINN_BACKEND_DIR)%.cpp
 	@mkdir -p $(dir $@)
 	$(CXX) $(ENJ_CXXFLAGS) -MMD -MP -c $< -o $@
+
+# Display lists are translated where they stand, the program's constant ones too
+# (src/pc/gfx/native/nat_exec.inc.c): on macOS __TEXT's constants go to __DATA, writable.
+ifeq ($(shell uname -s),Darwin)
+PC_ENDJINN_LDFLAGS += -Wl,-rename_section,__TEXT,__const,__DATA,__const
+endif
 
 $(HOST_EXE): $(ALL_OBJS) $(ENJ_HOST_EXTRA_DEPS)
 	$(CXX) -o $@ $(ALL_OBJS) $(PC_ENDJINN_LDFLAGS)

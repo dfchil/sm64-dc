@@ -6,9 +6,9 @@
  * under it from the PT and TR lists too, so their fill is not paid behind black. */
 #define DC_GFX_COVER_BEGIN 0x434F5642u   /* "COVB" */
 #define DC_GFX_COVER_END   0x434F5645u   /* "COVE" */
-/* In a static list: DC_NATIVE leaves it to the interpreter. The compiled form has no 2D depth, and
+/* In a static list: it is never compiled, but runs command by command. The compiled form has no 2D depth, and
  * a transition's soft edge (screen_transition_mesh.h) must lie over the scene's TR list. */
-#define DC_GFX_INTERPRET   0x494E5450u   /* "INTP" */
+#define DC_GFX_NO_COMPILE   0x494E5450u   /* "INTP" */
 /* The skybox (bin/segment2.c dl_skybox_begin .. dl_skybox_end): its G_RM_OPA_SURF triangles are
  * opaque and go to the OP list. Only there: goddard's Mario head and the screen borders use the same
  * render mode and need the TR path (the head's highlight blends there). */

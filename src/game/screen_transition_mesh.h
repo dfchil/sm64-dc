@@ -248,7 +248,7 @@ static const Vtx dl_mask_star_feather_vtx[] = {
 };
 
 const Gfx dl_mask_star_feather[] = {
-    gsDPNoOpTag(DC_GFX_INTERPRET),
+    gsDPNoOpTag(DC_GFX_NO_COMPILE),
     gsSPVertex(dl_mask_star_feather_vtx + 0, 32, 0),
     gsSP2Triangles( 0,  1,  2, 0x0,  1,  3,  2, 0x0),
     gsSP2Triangles( 1,  4,  3, 0x0,  4,  5,  3, 0x0),
@@ -441,7 +441,7 @@ static const Vtx dl_mask_circle_feather_vtx[] = {
 };
 
 const Gfx dl_mask_circle_feather[] = {
-    gsDPNoOpTag(DC_GFX_INTERPRET),
+    gsDPNoOpTag(DC_GFX_NO_COMPILE),
     gsSPVertex(dl_mask_circle_feather_vtx + 0, 32, 0),
     gsSP2Triangles( 0,  1,  2, 0x0,  0,  3,  1, 0x0),
     gsSP2Triangles( 3,  4,  1, 0x0,  3,  5,  4, 0x0),
@@ -779,7 +779,7 @@ static const Vtx dl_mask_mario_feather_vtx[] = {
 };
 
 const Gfx dl_mask_mario_feather[] = {
-    gsDPNoOpTag(DC_GFX_INTERPRET),
+    gsDPNoOpTag(DC_GFX_NO_COMPILE),
     gsSPVertex(dl_mask_mario_feather_vtx + 0, 32, 0),
     gsSP2Triangles( 0,  1,  2, 0x0,  0,  3,  1, 0x0),
     gsSP2Triangles( 3,  4,  1, 0x0,  3,  5,  4, 0x0),
@@ -1588,7 +1588,7 @@ static const Vtx dl_mask_bowser_feather_vtx[] = {
 };
 
 const Gfx dl_mask_bowser_feather[] = {
-    gsDPNoOpTag(DC_GFX_INTERPRET),
+    gsDPNoOpTag(DC_GFX_NO_COMPILE),
     gsSPVertex(dl_mask_bowser_feather_vtx + 0, 32, 0),
     gsSP2Triangles( 0,  1,  2, 0x0,  0,  3,  1, 0x0),
     gsSP2Triangles( 3,  4,  1, 0x0,  3,  5,  4, 0x0),

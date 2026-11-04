@@ -5,7 +5,6 @@
 #include "renderer.h"
 #include "gd_native.h"
 
-#if DC_NATIVE
 #include <stdlib.h>
 #include <string.h>
 #include "pc/gfx/native/nat_mesh.h"
@@ -17,7 +16,7 @@
 #define gd_nat_memalign(n) memalign(32, n)
 #endif
 
-// DC_NATIVE: a shape's display list drawn as native meshes (nat_mesh.h).
+// A shape's display list drawn as native meshes (nat_mesh.h).
 //
 // create_shape_gddl builds the list once: groups of up to 12 vertices, each loaded and followed by
 // the triangles of the faces that use them, and a material's list called where the material
@@ -281,4 +280,3 @@ s32 gd_native_shape(struct ObjShape *shape, Gfx *dl, s32 ngfx) {
     free(b);
     return ok;
 }
-#endif

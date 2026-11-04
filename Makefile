@@ -601,22 +601,16 @@ ifeq ($(DC_OVERLAY),1)
   PLATFORM_CFLAGS += -I$(ENDJINN_DIR)/include -DENJ_CBASEPATH=\"/cd/\" -DENJ_FSAA=$(DC_FSAA)
 endif
 PLATFORM_CFLAGS += -DDC_HOLD_IDENTICAL=$(DC_HOLD_IDENTICAL)
-# DC_NATIVE=1: the native renderer (src/pc/gfx/native/gfx_native.inc.c): static display lists compiled to
-# PVR-ready meshes, the frame rendered through enDjinn's deferred render lists (enj_render.c).
-DC_NATIVE ?= 0
-PLATFORM_CFLAGS += -DDC_NATIVE=$(DC_NATIVE)
-# DC_ENJ_RENDER=1: the frame goes to the PVR through enDjinn's deferred render lists (enj_render.c),
-# one renderer per list, with the display list run in the opaque list's (gfx_pvr.c). DC_NATIVE needs it.
+# The renderer is native (src/pc/gfx/gfx_retro_dc.c, src/pc/gfx/native/): display lists run as
+# native commands, the program's own drawn from compiled PVR-ready meshes, and the frame goes to the
+# PVR through enDjinn's deferred render lists (enj_render.c), one renderer per list, with the display
+# list run in the opaque list's (gfx_pvr.c): DC_ENJ_RENDER is always on.
 # DC_ENJ_LOOP=1 (default): enDjinn runs the frame loop as well (enj_state_run, pc_main.c) and starts
 # the video and the PVR; each of its frames is one scene of the game's. 0: SM64's own loop (main_func).
 DC_ENJ_LOOP ?= 1
-DC_ENJ_RENDER ?= 0
+override DC_ENJ_RENDER := 1
 ifeq ($(DC_ENJ_LOOP),1)
-  override DC_ENJ_RENDER := 1
   PLATFORM_CFLAGS += -I$(ENDJINN_DIR)/include -DENJ_CBASEPATH=\"/cd/\" -DENJ_FSAA=$(DC_FSAA)
-endif
-ifeq ($(DC_NATIVE),1)
-  override DC_ENJ_RENDER := 1
 endif
 PLATFORM_CFLAGS += -DDC_ENJ_RENDER=$(DC_ENJ_RENDER) -DDC_ENJ_LOOP=$(DC_ENJ_LOOP)
 # DC_PVR_HASH=1 (a test build): a hash of every vertex the PVR is sent and the header it draws with,
@@ -639,10 +633,6 @@ endif
 DC_LAYOUT_PAD ?= 0
 ifneq ($(DC_LAYOUT_PAD),0)
   PLATFORM_CFLAGS += -DDC_LAYOUT_PAD=$(DC_LAYOUT_PAD)
-endif
-# DC_NATIVE_DL_COLD=1: the display-list decode loop out of the I-cache-pinned .sub0 (A/B of layouts).
-ifeq ($(DC_NATIVE_DL_COLD),1)
-  PLATFORM_CFLAGS += -DDC_NATIVE_DL_COLD
 endif
 # The default video options (src/pc/dc_video_options.h): DC_FSAA_MODE (DC_FSAA=1 builds) 0 off,
 # 1 on, 2 on except the water and lava courses (default); DC_FRAME_MODE (DC_60FPS=1 builds) 0 30 fps,
@@ -780,9 +770,9 @@ endif
   # SM_WARM (gfx_retro_dc.c): hot code that does not fit in .sub0, placed on I-cache sets
   # DC_SM_WARM_SET.. by an ld ordering file. .sub1 starts one I-cache size after .sub0, so the offset
   # into .sub1 is the I-cache index. Pick the set from samples: lines .sub0 leaves cold
-  # (tools/dc_icache_sets.py). (DC_NATIVE=1 measured best at 174 too: 69, its coldest stretch
-  # by samples, was 3% slower on 2026-11-03.)
-  DC_SM_WARM_SET ?= 174
+  # (tools/dc_icache_sets.py). 232: the sets after .sub0's 7.4 KB, which holds the rest of the
+  # native renderer's hot code (2026-11-04).
+  DC_SM_WARM_SET ?= 232
   # tri_state_setup in .sub2 at I-cache set DC_SM_WARM2_SET (gfx_retro_dc.c SM_WARM2). It is ~4.1 KB
   # and must end within .sub2's 8 KB: set 126 left 24 bytes, too few once it grew to 0x1048.
   DC_SM_WARM2_SET ?= 122

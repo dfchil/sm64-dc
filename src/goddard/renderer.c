@@ -963,13 +963,11 @@ void *Unknown8019BCD4(u32 size) {
 }
 
 /* 24A4DC -> 24A598 */
-#if DC_NATIVE
 // A shape's display list is built once (create_shape_gddl): the native renderer may compile it.
 void gd_native_stable_dl(s32 dlNum, s32 gfxCount) {
     extern void gfx_native_stable(const void *start, size_t bytes);
     gfx_native_stable(sGdDLArray[dlNum]->gfx, (size_t) gfxCount * sizeof(Gfx));
 }
-#endif
 
 void func_8019BD0C(s32 dlNum, s32 gfxIdx) {
     Gfx *dl; // 1c

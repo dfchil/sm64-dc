@@ -415,7 +415,7 @@ def main():
             tris, feather = build(field, level, widest)
             cover, ring = mesh_lists(tris, feather)
             nc = emit_list(f, 'dl_mask_%s_cover' % name, cover)
-            nr = emit_list(f, 'dl_mask_%s_feather' % name, ring, 'DC_GFX_INTERPRET')
+            nr = emit_list(f, 'dl_mask_%s_feather' % name, ring, 'DC_GFX_NO_COMPILE')
             ta = sum(tri_area(t) for t in ring) / 4
             ca = sum(tri_area(t) for t in cover) / 4
             print('%-7s cover %3d tris %3d verts %5.1f%%   feather %3d tris %3d verts %5.1f%% of the square'

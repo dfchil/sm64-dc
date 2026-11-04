@@ -1,9 +1,9 @@
-// DC_NATIVE: native meshes (nat_mesh.h), included by gfx_retro_dc.c after the native renderer.
+// Native meshes (nat_mesh.h), included by gfx_retro_dc.c after the native renderer.
 //
 // A run's vertices load into a vertex buffer of their own (sVB, VtxBuf) as many at a time as the
-// vertex loops take, and its triangles go to gfx_sp_tri1 with indices into it. The loads, the
-// triangle path and the bakes are the display list's: a vertex loaded once gives what each of its
-// copies would have, as nothing changes the state within a run. Runs draw one at a time and keep
+// vertex loops take, and its triangles are drawn as gfx_sp_tri1 draws them (nat_tris) with indices
+// into it. The loads, the triangle path and the bakes are the display list's: a vertex loaded once
+// gives what each of its copies would have, as nothing changes the state within a run. Runs draw one at a time and keep
 // nothing after, so one buffer serves them all.
 
 static struct LoadedVertex __attribute__((aligned(32))) sMeshLV[NAT_MESH_VERTS + 4];
@@ -28,9 +28,7 @@ static void gfx_native_mesh_run_draw(const void *arg) {
         const uint32_t n = r->nvtx - k < MAX_VERTICES ? r->nvtx - k : MAX_VERTICES;
         gfx_sp_vertex(n, k, &r->vtx[k]);
     }
-    for (uint32_t t = 0; t < r->ntri; t++) {
-        gfx_sp_tri1(r->tri[t][0], r->tri[t][1], r->tri[t][2]);
-    }
+    nat_tris(r->tri, r->ntri, 0);
     sVB = slots;
 }
 

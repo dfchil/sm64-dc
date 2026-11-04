@@ -1,9 +1,9 @@
-// DC_NATIVE=1: static display lists drawn from a compiled form (included by gfx_retro_dc.c, whose
-// state and triangle path it shares).
+// The native renderer (included by gfx_retro_dc.c, whose state and triangle path it shares): display
+// lists run as native commands (nat_exec.inc.c), and those in the program's data are drawn from a
+// compiled form.
 //
 // A display list in the program's data, one the game never builds at run time, is compiled the
-// first time it is called: it runs through the interpreter as always, one command at a time, and
-// what it does is recorded. Vertex loads keep their source vertices and the state they are lit and
+// first time it is called: it runs one command at a time, and what it does is recorded. Vertex loads keep their source vertices and the state they are lit and
 // scaled with; triangles are grouped by the triangle state they draw with (a segment: the computed
 // sTri, the list kind and the PVR header that state gives, with its texture already uploaded). No
 // command is decoded and no triangle state is set up when the list is drawn again from that.
@@ -14,26 +14,26 @@
 // NAT_MAX_VARIANTS states has that many. The environment and primitive colours are the exception:
 // objects fade by the environment alpha set before their list, so a segment whose combiner reads a
 // colour the list did not set compiles that combiner again per draw instead. What the list leaves
-// set (its exit state) is put back after it draws, as the interpreter would have left it.
+// set (its exit state) is put back after it draws, as running its commands would have left it.
 //
 // The vertex loads are grouped into chunks (a run of loads and the triangles drawn from them), each
 // with a bounding sphere: a chunk wholly outside one clip plane is skipped, loads and triangles,
 // since every triangle in it would have been rejected anyway. A list may also draw from vertices its
 // caller loaded (moving textures, shadows): those triangles' chunk is never skipped.
 //
-// Every vertex load in a native build, compiled or interpreted, goes through this file's loops. A lit
+// Every vertex load, from a compiled list or a command, goes through this file's loops. A lit
 // vertex is lit only when a drawn triangle first bakes it (nat_vertex_resolve), with the lights of
 // its load, and gfx_sp_tri1 tests back faces before it bakes (tri_proj): most triangles that reach
-// the test are back faces, so most loaded vertices are never lit or baked. The image is the
-// interpreter's, bit for bit (tools/dc_pvr_hash_compare.py, the host's SM64_PVR_HASH).
+// the test are back faces, so most loaded vertices are never lit or baked. The image is the one the
+// GBI interpreter drew before, bit for bit (tools/dc_pvr_hash_compare.py, the host's SM64_PVR_HASH).
 //
 // The compiled forms hold PVR texture addresses: a texture cache reset (a level change, an FSAA
 // switch) starts the cache over (sNatGen) and gives their memory back (nat_arena_release). They are
-// compiled NAT_COMPILES_PER_FRAME at most per frame, the rest interpreted until a later one.
+// compiled NAT_COMPILES_PER_FRAME at most per frame; the rest run as commands until a later one.
 
 #define NAT_MAX_VARIANTS 4
 #define NAT_HASH 2048                // display lists (power of two)
-#define NAT_HASH_PROBES 64           // a list not found within these slots is interpreted
+#define NAT_HASH_PROBES 64           // a list not found within these slots runs as commands
 // The compiled forms live in blocks taken from the heap as compiles need them, up to NAT_ARENA_MAX,
 // and given back when the texture cache resets (a level change): the rest of the heap is the
 // game's, and AICAflow needs 1.15 MB in one piece for its core bank when the first level loads.
@@ -44,8 +44,8 @@
 #define NAT_REC_LOADS 1024
 #define NAT_REC_LIGHTS 128
 #define NAT_REC_CHUNKS 1024
-// Lists compiled in one frame at most: the rest are interpreted until a later frame, so a scene's
-// first frame does not compile all of them (a compile costs a few times an interpreted draw).
+// Lists compiled in one frame at most: the rest run as commands until a later frame, so a scene's
+// first frame does not compile all of them (a compile costs a few times a draw from commands).
 #define NAT_COMPILES_PER_FRAME 12
 
 // State groups a list can read from the state it is called in, or leave changed.
@@ -142,7 +142,7 @@ typedef struct NatVariant {
 typedef struct {
     const Gfx *dl;
     uint8_t nvar;
-    uint8_t bad;              // never compiled: interpreted as always
+    uint8_t bad;              // never compiled: runs as commands
     NatVariant *var[NAT_MAX_VARIANTS];
 } NatEntry;
 
@@ -180,7 +180,7 @@ static NatBlock *sNatBlocks;                 // the newest first
 static uint32_t sNatArenaUsed, sNatArenaHigh;   // bytes in blocks
 static uint8_t sNatFull;                     // NAT_ARENA_MAX reached: compile nothing more
 static uint32_t sNatCacheGen;   // sNatGen + 1 when the cache was started (0: never)
-static uint8_t sNatOff;                      // allocation failed: interpret everything
+static uint8_t sNatOff;                      // allocation failed: everything runs as commands
 static uint32_t sNatCompileFrame, sNatCompiles;   // this frame's compiles (NAT_COMPILES_PER_FRAME)
 
 // Recording one list.
@@ -246,7 +246,8 @@ static void nat_stat_print(void) {
 #define NAT_STAT(i) ((void) 0)
 #endif
 
-static Gfx __attribute__((aligned(8))) sNatOne[4];   // one command (up to three words) and an end
+static void nat_xlate(Gfx *cmd);       // native/nat_exec.inc.c
+static int nat_one(const Gfx *cmd);
 
 #ifdef TARGET_PC_ENDJINN
 #define nat_memalign(a, n) aligned_alloc(a, n)
@@ -285,9 +286,23 @@ static int nat_is_stable(const void *p) {
 #if defined(TARGET_PC_ENDJINN) && defined(__APPLE__)
 #include <mach-o/getsect.h>
 #include <mach-o/ldsyms.h>
+#include <sys/mman.h>
+// Lists are translated where they stand (nat_exec.inc.c), the program's own too, and the host keeps
+// constant data read-only: the native host build links __TEXT's into __DATA (pc_endjinn.mk), and
+// __DATA_CONST is made writable before the first list runs (gfx_init).
+void gfx_native_host_writable(void) {
+    unsigned long size = 0;
+    uint8_t *p = getsegmentdata(&_mh_execute_header, "__DATA_CONST", &size);
+    const uintptr_t page = (uintptr_t) getpagesize();
+    const uintptr_t lo = (uintptr_t) p & ~(page - 1), hi = ((uintptr_t) p + size + page - 1) & ~(page - 1);
+    if (p != NULL && mprotect((void *) lo, hi - lo, PROT_READ | PROT_WRITE) != 0) {
+        perror("NATIVE: __DATA_CONST stays read-only");
+        abort();
+    }
+}
 static struct { uintptr_t lo, hi; } sNatStatic[3];
 static void nat_static_init(void) {
-    static const char *const seg[3][2] = { { "__DATA", "__data" }, { "__DATA_CONST", "__const" }, { "__TEXT", "__const" } };
+    static const char *const seg[3][2] = { { "__DATA", "__data" }, { "__DATA_CONST", "__const" }, { "__DATA", "__const" } };
     for (int i = 0; i < 3; i++) {
         unsigned long size = 0;
         uint8_t *p = getsectiondata(&_mh_execute_header, seg[i][0], seg[i][1], &size);
@@ -303,7 +318,16 @@ static inline int nat_is_static(const void *p) {
     return 0;
 }
 #elif defined(TARGET_PC_ENDJINN)
+#include <sys/mman.h>
 extern char __executable_start[], edata[];
+void gfx_native_host_writable(void) {   // as above: the lists in .rodata are translated in place
+    const uintptr_t page = (uintptr_t) getpagesize();
+    const uintptr_t lo = (uintptr_t) __executable_start & ~(page - 1), hi = ((uintptr_t) edata + page - 1) & ~(page - 1);
+    if (mprotect((void *) lo, hi - lo, PROT_READ | PROT_WRITE | PROT_EXEC) != 0) {
+        perror("NATIVE: the program's data stays read-only");
+        abort();
+    }
+}
 static void nat_static_init(void) {}
 static inline int nat_is_static(const void *p) {
     return (const char *) p >= __executable_start && (const char *) p < edata;
@@ -532,7 +556,7 @@ static void nat_rec_vtx(size_t n, size_t dest, const Vtx *v) {
     nat_emit(sRec.nloads - 1);
 }
 
-// The segment the next triangle draws in: the current state, set up as the interpreter would.
+// The segment the next triangle draws in: the current state, set up as gfx_sp_tri1 would.
 static int nat_rec_seg(void) {
     if (sTri.epoch == sTriStateEpoch && sRec.cur_seg >= 0) return sRec.cur_seg;
     if (sTri.epoch != sTriStateEpoch) tri_state_setup();
@@ -611,33 +635,31 @@ static void nat_rec_tri(uint8_t a, uint8_t b, uint8_t c) {
     nat_emit(a | (uint32_t) b << 8 | (uint32_t) c << 16);
 }
 
-// What a command does to the recording, before it runs.
+// What a command does to the recording, before it runs (a native command: nat_ops.h).
 static void nat_rec_cmd(const Gfx *cmd) {
-    const uint32_t opcode = cmd->words.w0 >> 24;
-    if (cmd->words.w0 == 0x424C4E44) {   // trilerp marker
-        sRec.fail = 1;
-        return;
-    }
-    switch (opcode) {
-        case G_VTX:
-            nat_rec_vtx(C0(12, 8), C0(1, 7) - C0(12, 8), (const Vtx *) seg_addr(cmd->words.w1));
+    const uint32_t op = cmd->words.w0 >> 24, w0 = cmd->words.w0;
+    switch (op) {
+        case N_VTX:
+            nat_rec_vtx(w0 & 0xFF, (w0 >> 8) & 0xFF, (const Vtx *) seg_addr(cmd->words.w1));
             break;
-        case (uint8_t) G_TRI1:
-            nat_rec_tri(C0(17, 7), C0(9, 7), C0(1, 7));
+        case N_TRI1:
+            nat_rec_tri(w0 & 0xFF, (w0 >> 8) & 0xFF, (w0 >> 16) & 0xFF);
             break;
-        case (uint8_t) G_TRI2:
-            nat_rec_tri(C0(17, 7), C0(9, 7), C0(1, 7));
-            nat_rec_tri(C1(17, 7), C1(9, 7), C1(1, 7));
+        case N_TRI2: {
+            const uint32_t w1 = cmd->words.w1;
+            nat_rec_tri(w0 & 0xFF, (w0 >> 8) & 0xFF, (w0 >> 16) & 0xFF);
+            nat_rec_tri(w1 & 0xFF, (w1 >> 8) & 0xFF, (w1 >> 16) & 0xFF);
             break;
-        case G_GEOMETRYMODE: {
+        }
+        case N_GEOMETRYMODE: {
             uint32_t bits = ~C0(0, 24) | cmd->words.w1;
             sRec.geom_w |= bits;
             sRec.tri_op = ~0u;
             break;
         }
-        case (uint8_t) G_SETOTHERMODE_L:
-        case (uint8_t) G_SETOTHERMODE_H: {
-            uint32_t shift = (opcode == (uint8_t) G_SETOTHERMODE_L ? 31 : 63) - C0(8, 8) - C0(0, 8);
+        case N_OTHERMODE_L:
+        case N_OTHERMODE_H: {
+            uint32_t shift = (op == N_OTHERMODE_L ? 31 : 63) - C0(8, 8) - C0(0, 8);
             uint32_t len = C0(0, 8) + 1;
             uint64_t mask = (((uint64_t) 1 << len) - 1) << shift;
             sRec.om_w_l |= (uint32_t) mask;
@@ -645,45 +667,45 @@ static void nat_rec_cmd(const Gfx *cmd) {
             sRec.written |= NG_OTHERMODE;
             break;
         }
-        case G_SETCOMBINE:
+        case N_SETCOMBINE:
             sRec.written |= NG_COMBINE;
             break;
-        case G_SETTIMG:
+        case N_SETTIMG:
             sRec.tex_w |= NTW_TIMG;
             sRec.written |= NG_TEX;
             break;
-        case G_LOADBLOCK:
-        case G_LOADTILE:
+        case N_LOADBLOCK:
+        case N_LOADTILE:
             if (!(sRec.tex_w & NTW_TIMG)) sRec.read |= NG_TEX;   // loads the caller's image
-            sRec.tex_w |= NTW_LOAD | (opcode == G_LOADTILE ? NTW_SIZE : 0);
+            sRec.tex_w |= NTW_LOAD | (op == N_LOADTILE ? NTW_SIZE : 0);
             sRec.written |= NG_TEX;
             break;
-        case G_SETTILE:
+        case N_SETTILE:
             if (C1(24, 3) == G_TX_RENDERTILE) sRec.tex_w |= NTW_TILE;
             sRec.written |= NG_TEX;
             break;
-        case G_SETTILESIZE:
+        case N_SETTILESIZE:
             sRec.tex_w |= NTW_SIZE;
             sRec.written |= NG_TEX;
             break;
-        case (uint8_t) G_TEXTURE:
+        case N_TEXTURE:
             sRec.written |= NG_SCALE;
             break;
-        case G_SETENVCOLOR:
+        case N_SETENVCOLOR:
             sRec.written |= NG_ENV;
             break;
-        case G_SETPRIMCOLOR:
+        case N_SETPRIMCOLOR:
             sRec.written |= NG_PRIM;
             break;
-        case G_SETFOGCOLOR:
+        case N_SETFOGCOLOR:
             sRec.written |= NG_FOGCOL;
             if (sRec.nfogcols < 16) sRec.fogcols[sRec.nfogcols++] = cmd->words.w1;
             else sRec.fail = 1;
             break;
-        case G_SETFILLCOLOR:
+        case N_SETFILLCOLOR:
             sRec.written |= NG_FILL;
             break;
-        case G_MOVEMEM:
+        case N_MOVEMEM:
             if (C0(0, 8) == G_MV_LIGHT) {
                 int lightidx = (int) (C0(8, 8) * 8) / 24 - 2;
                 if (lightidx >= 0 && lightidx <= MAX_LIGHTS) {
@@ -696,7 +718,7 @@ static void nat_rec_cmd(const Gfx *cmd) {
                 sRec.fail = 1;   // a viewport
             }
             break;
-        case (uint8_t) G_MOVEWORD:
+        case N_MOVEWORD:
             if (C0(16, 8) == G_MW_NUMLIGHT) {
                 sRec.light_w |= 0x80;
                 sRec.written |= NG_LIGHTS;
@@ -706,7 +728,7 @@ static void nat_rec_cmd(const Gfx *cmd) {
                 sRec.written |= NG_FOG;
             }
             break;
-        case (uint8_t) G_NOOP:
+        case N_TAG:
 #if DC_RAIL_TR
             if (cmd->words.w1 == DC_GFX_RAIL_TR_BEGIN || cmd->words.w1 == DC_GFX_RAIL_TR_END) {
                 // BBH's fence (gfx_dc_tag): the render mode's low word is set blended and then
@@ -718,17 +740,18 @@ static void nat_rec_cmd(const Gfx *cmd) {
                 break;
             }
 #endif
-            if (cmd->words.w1) sRec.fail = 1;   // another Dreamcast tag (gfx_dc_tags.h)
+            sRec.fail = 1;   // another Dreamcast tag (gfx_dc_tags.h)
             break;
-        case G_NATIVE:   // geometry handed over directly: drawn where the list stands
-        case G_MTX:
-        case (uint8_t) G_POPMTX:
-        case G_TEXRECT:
-        case G_TEXRECTFLIP:
-        case G_FILLRECT:
-        case G_SETSCISSOR:
-        case G_SETZIMG:
-        case G_SETCIMG:
+        case N_TRILERP:
+        case N_NATIVE:   // geometry handed over directly: drawn where the list stands
+        case N_MTX:
+        case N_POPMTX:
+        case N_TEXRECT:
+        case N_TEXRECTFLIP:
+        case N_FILLRECT:
+        case N_SETSCISSOR:
+        case N_SETZIMG:
+        case N_SETCIMG:
             sRec.fail = 1;
             break;
         default:
@@ -816,7 +839,7 @@ static void nat_sphere(const uintptr_t *ops, uint32_t first, uint32_t last, floa
 }
 
 // The recording as a variant in the arena: fog colours first, then the chunks with their bounds.
-static NatVariant *nat_finalize(void) {
+static NatVariant *__attribute__((noinline, cold)) nat_finalize(void) {
     const int cull = !sRec.dyn_vtx;
     // Loads with a slot no later load of the list overwrites: the next list may draw with them.
     {
@@ -950,9 +973,9 @@ static NatVariant *nat_finalize(void) {
     return v;
 }
 
-// Run dl through the interpreter, a command at a time, recording it. Returns its variant, or NULL
+// Run dl a command at a time, recording it. Returns its variant, or NULL
 // when it cannot be compiled (it has still been drawn).
-static NatVariant *nat_record(Gfx *dl) {
+static NatVariant *__attribute__((noinline, cold)) nat_record(Gfx *dl) {
     Gfx *stack[GFX_DL_STACK_MAX];
     int sp = 0;
     memset(&sRec, 0, offsetof(__typeof__(sRec), ops));
@@ -967,8 +990,9 @@ static NatVariant *nat_record(Gfx *dl) {
     sRec.active = 1;
 
     for (Gfx *cmd = dl;;) {
-        const uint32_t opcode = cmd->words.w0 >> 24;
-        if (opcode == G_DL) {
+        if (!NAT_IS_OP(cmd->words.w0 >> 24)) nat_xlate(cmd);
+        const uint32_t op = cmd->words.w0 >> 24;
+        if (op == N_CALL || op == N_BRANCH) {
             Gfx *to = (Gfx *) seg_addr(cmd->words.w1);
             if (!nat_is_static(to) && !nat_is_stable(to)) {
 #ifdef TARGET_PC_ENDJINN
@@ -978,7 +1002,7 @@ static NatVariant *nat_record(Gfx *dl) {
 #endif
                 sRec.fail = 1;
             }
-            if (C0(16, 1) == 0) {
+            if (op == N_CALL) {
                 if (sp == GFX_DL_STACK_MAX) {
                     sRec.fail = 1;
                     break;
@@ -988,14 +1012,13 @@ static NatVariant *nat_record(Gfx *dl) {
             cmd = to;
             continue;
         }
-        if (opcode == (uint8_t) G_ENDDL) {
+        if (op == N_END) {
             if (sp == 0) break;
             cmd = stack[--sp];
             continue;
         }
-        // A rectangle is two or three words (gfx_run_dl), and never compiled.
-        const int words = opcode == G_TEXRECT || opcode == G_TEXRECTFLIP ? 3 : opcode == G_FILLRECT ? 2 : 1;
-        if (words > 1) sRec.fail = 1;
+        // A rectangle is two or three words, and never compiled.
+        if (op == N_TEXRECT || op == N_TEXRECTFLIP || op == N_FILLRECT) sRec.fail = 1;
         if (!sRec.fail) {
             nat_rec_cmd(cmd);
 #ifdef TARGET_PC_ENDJINN
@@ -1004,20 +1027,16 @@ static NatVariant *nat_record(Gfx *dl) {
             }
 #endif
         }
-        for (int i = 0; i < words; i++) sNatOne[i] = cmd[i];
-        sNatOne[words].words.w0 = (uint32_t) (uint8_t) G_ENDDL << 24;
-        sNatOne[words].words.w1 = 0;
 #ifdef TARGET_PC_ENDJINN
-        sIstatSkip++;   // the recording's own draw: not the interpreter's work
+        sIstatSkip++;   // the recording's own draw: not a list run as commands
 #endif
-        gfx_run_dl(sNatOne);
+        cmd += nat_one(cmd);
 #ifdef TARGET_PC_ENDJINN
         sIstatSkip--;
 #endif
-        cmd += words;
     }
     sRec.active = 0;
-    // Recording set up triangles the interpreter rejects unset, binding their textures.
+    // Recording set up the state of triangles gfx_sp_tri1 rejects first, binding their textures.
     rdp.texture_changed = true;
     // A list that only sets state (a texture for its caller's rectangles, as the HUD's and the
     // text's do, each time with another): compiled, it would gain nothing and use up its variants.
@@ -1030,7 +1049,7 @@ static NatVariant *nat_record(Gfx *dl) {
 
 // ---- Drawing -----------------------------------------------------------------------------------
 
-// The clip planes the interpreter rejects against (trivial_reject), as gradients in model space
+// The clip planes a triangle is rejected against (trivial_reject), as gradients in model space
 // of x - w, -x - w, y - w, -y - w, z - w, -z - w, with their lengths.
 static float sNatPlane[6][4];
 
@@ -1054,7 +1073,7 @@ static void nat_planes(void) {
 static int sNatNoCull = -1;   // SM64_NAT_NOCULL=1: draw every chunk (host debugging)
 #endif
 
-static int __attribute__((noinline)) nat_classify(const float sp[4]) {
+static int SM_HOT __attribute__((noinline)) nat_classify(const float sp[4]) {
     if (sp[3] < 0.0f) return 1;
 #ifdef TARGET_PC_ENDJINN
     if (sNatNoCull < 0) sNatNoCull = getenv("SM64_NAT_NOCULL") != NULL;
@@ -1075,7 +1094,7 @@ static int __attribute__((noinline)) nat_classify(const float sp[4]) {
     return inside ? 2 : 1;
 }
 
-static void __attribute__((noinline)) nat_seg_begin(const NatSeg *s) {
+static void SM_HOT __attribute__((noinline)) nat_seg_begin(const NatSeg *s) {
     tri_state_bump();
     sTri = s->tri;
     sTri.epoch = sTriStateEpoch;
@@ -1116,8 +1135,8 @@ static NatLitSnap sNatLit[NAT_LIT_SNAPS];
 static uint32_t sNatLitCur;
 
 // gfx_sp_vertex_light's arithmetic, in the same order, from the vertex's snapshot (its normal is
-// where its colour goes until then). In .sub1 after cc_eval_float (SM_WARM): .sub0 is full.
-static void SM_WARM __attribute__((noinline)) nat_vertex_resolve(uint8_t idx) {
+// where its colour goes until then).
+static void SM_HOT __attribute__((noinline)) nat_vertex_resolve(uint8_t idx) {
     const NatLitSnap *sn = &sNatLit[VB_LIT[idx] - 1];
     struct LoadedVertex *d = &VB_LV[idx];
     const float nx = (float) (int8_t) d->color.r, ny = (float) (int8_t) d->color.g, nz = (float) (int8_t) d->color.b;
@@ -1157,65 +1176,70 @@ static uint8_t nat_lit_snapshot(void) {
     return id;
 }
 
-// A lit load over converted vertices: gfx_sp_vertex_light's position, texture coordinates and fog;
-// the normal and alpha go where the colour goes (NatVtx keeps them where an unlit one's colour is).
-static void SM_HOT __attribute__((noinline)) nat_vertex_lit(size_t n, size_t dest, const NatVtx *src) {
-    for (size_t i = 0; i < n; i++, dest++) {
-        const NatVtx *v = &src[i];
-        struct LoadedVertex *d = &VB_LV[dest];
-        shz_vec4_t out = shz_xmtrx_transform_vec4(shz_vec4_init(v->x, v->y, v->z, 1.0f));
-        __builtin_prefetch(v + 3);
-        const float x = out.x, y = out.y, z = out.z, w = out.w;
-        d->color = v->c;
-        d->u = v->u;
-        d->v = v->v;
-        VB_CLIP[dest] = 128 | ((w < 0) ? 64 : 0x00) | trivial_reject(x, y, z, w);
-        d->_x = x;
-        d->_y = y;
-        d->_z = z;
-        d->_w = w;
-        d->fog = gfx_calc_fog(z, w);
-    }
+static inline __attribute__((always_inline)) uint8_t nat_fog(float z, float w, float mul, float offset) {
+    // gfx_calc_fog's arithmetic, its fog parameters as floats from the caller
+    if (z < -w) return 0;
+    float f = mul * (z * shz_invf(w)) + offset;
+    if (f > 255.0f) f = 255.0f;
+    else if (f < 0.0f) f = 0.0f;
+    return (uint8_t) f;
 }
 
-static void SM_HOT __attribute__((noinline)) nat_vertex_no(size_t n, size_t dest, const NatVtx *src) {
+// A load over converted vertices: gfx_sp_vertex_light's or gfx_sp_vertex_no's position, texture
+// coordinates and fog. A lit load (lit_bit 128) keeps the normal and alpha where the colour goes
+// (NatVtx holds them where an unlit one's colour is), and its slots wait for light snapshot lit.
+// Each slot is marked unbaked as it loads, and takes its screen position (tri_proj_take's, with the
+// screen map of now) while its clip coordinates are at hand. The slots' arrays, the screen map and
+// the fog parameters are read once, into locals: GCC must assume the loop's stores may change them
+// where they live (sVB, rsp), and would read them again for every vertex.
+static void SM_HOT __attribute__((noinline)) nat_vertex_run(size_t n, size_t dest, const NatVtx *src, uint8_t lit,
+                                                           uint8_t lit_bit) {
+    struct LoadedVertex *const lv = VB_LV;
+    uint8_t *const clip = VB_CLIP, *const lits = VB_LIT;
+    uint32_t *const bake = VB_BAKE_EPOCH, *const proj = VB_PROJ_GEN;
+    float (*const scr)[4] = VB_PROJ;
+    const uint32_t proj_gen = sProjGen;
+    const float xscale = sm_xscale, xbias = sm_xbias, yscale = sm_yscale, ybias = sm_ybias;
+    const int fog = (rsp.geometry_mode & G_FOG) != 0;
+    const float fog_mul = (float) rsp.fog_mul, fog_offset = (float) rsp.fog_offset;
     for (size_t i = 0; i < n; i++, dest++) {
         const NatVtx *v = &src[i];
-        struct LoadedVertex *d = &VB_LV[dest];
+        struct LoadedVertex *d = &lv[dest];
         shz_vec4_t out = shz_xmtrx_transform_vec4(shz_vec4_init(v->x, v->y, v->z, 1.0f));
         __builtin_prefetch(v + 3);
         const float x = out.x, y = out.y, z = out.z, w = out.w;
         d->color = v->c;
         d->u = v->u;
         d->v = v->v;
-        VB_CLIP[dest] = ((w < 0) ? 64 : 0x00) | trivial_reject(x, y, z, w);
+        clip[dest] = lit_bit | ((w < 0) ? 64 : 0x00) | trivial_reject(x, y, z, w);
         d->_x = x;
         d->_y = y;
         d->_z = z;
         d->_w = w;
-        d->fog = gfx_calc_fog(z, w);
+        d->fog = fog ? nat_fog(z, w, fog_mul, fog_offset) : 0;
+        const float invw = shz_invf(w);
+        float *q = scr[dest];
+        q[0] = xscale * (x * invw) + xbias;
+        q[1] = yscale * (y * invw) + ybias;
+        q[2] = invw;
+        bake[dest] = 0;
+        proj[dest] = proj_gen;
+        lits[dest] = lit;
     }
 }
 
 static void nat_vertex(size_t n, size_t dest, const NatVtx *src) {
     shz_xmtrx_load_4x4((const shz_mat4x4_t *) &rsp.MP_matrix);
-    uint8_t lit = 0;
     if (rsp.geometry_mode & G_LIGHTING) {
         gfx_vertex_lights_prep();
-        lit = nat_lit_snapshot();
-        nat_vertex_lit(n, dest, src);
+        nat_vertex_run(n, dest, src, nat_lit_snapshot(), 128);
     } else {
-        nat_vertex_no(n, dest, src);
+        nat_vertex_run(n, dest, src, 0, 0);
     }
     DC_PROF_COUNT(DCC_VERTS, n);
-    for (size_t i = 0; i < n; i++) {
-        VB_BAKE_EPOCH[dest + i] = 0;
-        VB_PROJ_GEN[dest + i] = 0;
-        VB_LIT[dest + i] = lit;
-    }
 }
 
-// gfx_sp_vertex for a list that is interpreted: the vertices converted into a buffer as a compile
+// gfx_sp_vertex for a list run as commands: the vertices converted into a buffer as a compile
 // would, then the same loops. (Texture-generating loads read the raw normal against the lookat:
 // returns 0 for gfx_sp_vertex's own path.)
 static int nat_vertex_from_vtx(size_t n, size_t dest, const Vtx *vertices) {
@@ -1279,7 +1303,7 @@ static void nat_load_state(const NatVariant *v, uint32_t li) {
     if (v->loads[li].lights >= 0) rsp.lights_changed = v->loads[li].dirs;
 }
 
-static void __attribute__((noinline)) nat_load(const NatVariant *v, const uintptr_t *op) {
+static void SM_HOT __attribute__((noinline)) nat_load(const NatVariant *v, const uintptr_t *op) {
     const uint32_t w = (uint32_t) op[0];
     nat_load_state(v, (uint32_t) op[2]);
     if (w & NAT_CONV) {
@@ -1288,6 +1312,78 @@ static void __attribute__((noinline)) nat_load(const NatVariant *v, const uintpt
         gfx_sp_vertex((w >> 8) & 0xFF, (w >> 16) & 0xFF, (const Vtx *) op[1]);
     }
 }
+
+// Triangles drawn in one state, each as gfx_sp_tri1 draws it: a segment's (nat_run, its state set
+// up by nat_seg_begin), or a native mesh run's (gfx_native_mesh.inc.c), whose state the first
+// triangle gfx_sp_tri1 draws sets up. Once it is, what the fast path reads of the state is read
+// once, and a triangle costs no call; one that needs clipping goes to its slow path, a state the
+// fast path never draws (2D overlays, the trilerp passes) to gfx_sp_tri1. A triangle is its three
+// gfx_sp_tri1 arguments: a word a | b << 8 | c << 16 (words), or three bytes.
+#define NT_TRI(k) (words ? (uint32_t) ((const uintptr_t *) t)[k] \
+                         : (uint32_t) ((const uint8_t *) t)[3 * (k)] | (uint32_t) ((const uint8_t *) t)[3 * (k) + 1] << 8 | \
+                           (uint32_t) ((const uint8_t *) t)[3 * (k) + 2] << 16)
+static inline __attribute__((always_inline)) void nat_tris(const void *t, uint32_t n, const int words) {
+    uint32_t i = 0;
+    for (; i < n && sTri.epoch != sTriStateEpoch; i++) {
+        const uint32_t x = NT_TRI(i);
+        gfx_sp_tri1(x & 0xFF, (x >> 8) & 0xFF, (x >> 16) & 0xFF);
+    }
+    if (!sTri.fast) {
+        for (; i < n; i++) {
+            const uint32_t x = NT_TRI(i);
+            gfx_sp_tri1(x & 0xFF, (x >> 8) & 0xFF, (x >> 16) & 0xFF);
+        }
+        return;
+    }
+    // In locals, as in nat_vertex_loop: the vertex buffer, and the epoch and screen map its bakes
+    // and screen positions are current for (tri_baked, tri_proj).
+    const VtxBuf vb = sVB;
+    const uint32_t epoch = sTriStateEpoch, proj_gen = sProjGen;
+    const uint32_t cull = rsp.geometry_mode & G_CULL_BOTH;
+    const int flip = sTri.cull_flip, op_list = pvr_cur_kind == 0, persp = !proj_is_ortho;
+#define NT_PROJ(i) (vb.proj_gen[i] != proj_gen ? tri_proj_take(i) : (void) 0, vb.proj[i])
+#define NT_BAKED(i) (vb.bake_epoch[i] != epoch ? tri_bake_slot(i) : (void) 0, &vb.baked[i])
+    for (; i < n; i++) {
+        const uint32_t x = NT_TRI(i);
+        const uint8_t i1 = x & 0xFF, i2 = (x >> 8) & 0xFF, i3 = (x >> 16) & 0xFF;
+        const uint8_t c0 = vb.clip[i3], c1 = vb.clip[i2], c2 = vb.clip[i1];
+#ifdef TARGET_PC_ENDJINN
+        if (gInterpStatsOn > 0) interp_stats_any_tri();
+#endif
+        DC_PROF_COUNT(DCC_TRIS, 1);
+        if ((c0 & c1 & c2) & 0x3f) continue;   // wholly outside the visible area
+        if ((c0 | c1 | c2) & (64 | 16)) {     // a corner behind the near plane: gfx_sp_tri1's clipping
+            if (vb.lit[i1]) nat_vertex_resolve(i1);
+            if (vb.lit[i2]) nat_vertex_resolve(i2);
+            if (vb.lit[i3]) nat_vertex_resolve(i3);
+            gfx_sp_tri1_slow(&vb.lv[i3], &vb.lv[i2], &vb.lv[i1], c0, c1, c2);
+            continue;
+        }
+        DC_PROF_COUNT(DCC_FAST, 1);
+        if (cull != 0) {
+            const float *q1 = NT_PROJ(i3), *q2 = NT_PROJ(i2), *q3 = NT_PROJ(i1);
+            float cross = (q1[0] - q2[0]) * (q3[1] - q2[1]) - (q1[1] - q2[1]) * (q3[0] - q2[0]);
+            if (flip) cross = -cross;
+            if (cull == G_CULL_FRONT ? cross >= 0 : cull == G_CULL_BACK ? cross <= 0 : 0) continue;
+        }
+        const dc_fast_t *b1 = NT_BAKED(i3), *b2 = NT_BAKED(i2), *b3 = NT_BAKED(i1);
+        if (op_list) {
+            pvr_submit_op_tri(b1, b2, b3);
+        } else {
+            dc_fast_t *out = pvr_reserve(pvr_cur_kind, 3);
+            if (out != NULL) {
+                const uint32_t f0 = out[0].flags, f1 = out[1].flags, f2 = out[2].flags;
+                out[0] = *b1; out[0].flags = f0;
+                out[1] = *b2; out[1].flags = f1;
+                out[2] = *b3; out[2].flags = f2;
+            }
+        }
+        if (persp) has_done_3d = 1;
+    }
+#undef NT_PROJ
+#undef NT_BAKED
+}
+#undef NT_TRI
 
 // The stream's chunks, loads and triangles (nat_draw): the per-frame loop, in .sub0 with the
 // triangle and vertex code it calls.
@@ -1342,10 +1438,7 @@ static void SM_HOT __attribute__((noinline)) nat_run(const NatVariant *v, const 
                     cur_seg = seg;
                 }
                 const uint32_t n = (w >> 8) & 0xFF;
-                for (uint32_t i = 1; i <= n; i++) {
-                    const uint32_t t = (uint32_t) op[i];
-                    gfx_sp_tri1(t & 0xFF, (t >> 8) & 0xFF, (t >> 16) & 0xFF);
-                }
+                nat_tris(op + 1, n, 1);
                 op += 1 + n;
                 continue;
             }
@@ -1403,13 +1496,13 @@ static void __attribute__((noinline)) nat_draw(const NatVariant *v) {
         rsp.light_cols_changed = 1;
         if (differ && !(v->exit_mask & NG_LIGHTS) && v->lc_out == 0) {
             // The list lit with lights of its own compile, not the caller's (they did not show):
-            // leave the directions the interpreter would have taken, from the caller's lights.
+            // leave the directions its commands would have taken, from the caller's lights.
             rsp.lights_changed = 1;
             gfx_vertex_lights_prep();
         }
     }
     nat_state_exit(v);
-    // The bound texture is the interpreter's last, not the list's: bind again on the next setup.
+    // The bound texture is the last one bound by commands, not the list's: bind again on the next setup.
     rdp.texture_changed = true;
     if (v->exit_mask & NG_LIGHTS) rsp.light_cols_changed = 1;
     if (v->lc_out >= 0) rsp.lights_changed = (uint8_t) v->lc_out;
@@ -1438,12 +1531,14 @@ static int nat_init(void) {
     return 1;
 }
 
-// gfx_run_dl's G_DL: draw dl natively (compiling it first if need be). Returns 0 to interpret it.
-static int __attribute__((noinline)) nat_try(Gfx *dl) {
-    if (sRec.active || sCover || sSkybox || in_trilerp || !nat_init() ||
-        !(nat_is_static(dl) || nat_is_stable(dl))) {
-        return 0;
-    }
+// A call's (N_CALL, N_BRANCH, nat_exec.inc.c) own entry: the call command keeps where its list's
+// entry is, in its operands (index + 1), and finds it there the next time it runs, while the cache
+// is the same and the entry still the list's.
+_Static_assert(NAT_HASH < 0x1000, "a call command keeps an entry's index in 12 bits");
+static NatEntry *nat_entry(Gfx *dl, Gfx *call) {
+    const uint32_t c = call->words.w0 & 0xFFF;
+    if (c != 0 && sNatCacheGen == sNatGen + 1 && sNatHash[c - 1].dl == dl) return &sNatHash[c - 1];
+    if (!nat_init() || !(nat_is_static(dl) || nat_is_stable(dl))) return NULL;
     uint32_t h = (((uint32_t) (uintptr_t) dl >> 3) * 0x9E3779B1u) >> 21;
     NatEntry *e = NULL;
     for (int probe = 0; probe < NAT_HASH_PROBES; probe++, h = (h + 1) & (NAT_HASH - 1)) {
@@ -1453,15 +1548,24 @@ static int __attribute__((noinline)) nat_try(Gfx *dl) {
             break;
         }
         if (t->dl == NULL) {
-            if (sNatFull) return 0;   // nothing more compiles until the next reset
+            if (sNatFull) return NULL;   // nothing more compiles until the next reset
             t->dl = dl;
             e = t;
             break;
         }
     }
+    if (e != NULL) call->words.w0 = (call->words.w0 & ~0xFFFu) | (uint32_t) (e - sNatHash + 1);
+    return e;
+}
+
+// A call to dl (the command call): draw it natively, compiling it first if need be. Returns 0 to
+// run into it instead.
+static int __attribute__((noinline)) nat_try(Gfx *dl, Gfx *call) {
+    if (sRec.active || sCover || sSkybox || in_trilerp) return 0;
+    NatEntry *e = nat_entry(dl, call);
     if (e == NULL || e->bad) return 0;
 #ifdef TARGET_PC_ENDJINN
-    {   // SM64_NAT_SKIP=name,name: interpret these lists (host debugging)
+    {   // SM64_NAT_SKIP=name,name: run these lists as commands (host debugging)
         static const char *skip;
         static int init;
         if (!init) {

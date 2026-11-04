@@ -25,13 +25,11 @@
 #include "sh4zam_port.h"
 #include "pc/dc_prof.h"
 #include "pc/gfx/gfx_dc_tags.h"
-#if DC_NATIVE
 #include "native/nat_mesh.h"
-#endif
 
 #ifdef TARGET_PC_ENDJINN
-// SM64_INTERP_STATS=1: what gfx_run_dl still draws, by list (pc_endjinn/interp_stats.c). Not while
-// the native renderer runs a command through it to record a list (sIstatSkip).
+// SM64_INTERP_STATS=1: what is still drawn command by command (nat_exec) instead of from a compiled
+// list, by list (pc_endjinn/interp_stats.c). Not while a list is recorded (sIstatSkip).
 #include "pc/pc_endjinn/interp_stats.h"
 static int sIstatSkip;
 #define ISTAT(x) do { if (gInterpStatsOn > 0 && !sIstatSkip) x; } while (0)
@@ -124,8 +122,7 @@ SM_HOT_DATA uint8_t __attribute__((aligned(32))) clip_rej[MAX_VERTICES];
 static SM_HOT_DATA uint32_t sTriStateEpoch = 1;
 static SM_HOT_DATA uint32_t __attribute__((aligned(8))) sVtxBakeEpoch[MAX_VERTICES + 4];   // shz_memset8
 static SM_HOT_DATA dc_fast_t __attribute__((aligned(32))) sVtxBaked[MAX_VERTICES + 4];
-#if DC_NATIVE
-// DC_NATIVE: a loaded vertex's screen position (x, y, 1/w), taken when a triangle first needs it for
+// A loaded vertex's screen position (x, y, 1/w), taken when a triangle first needs it for
 // its back-face test (tri_proj), apart from its bake, which only a triangle that is drawn needs: most
 // triangles that reach the test are back faces, and their corners are then never baked or lit.
 static SM_HOT_DATA float __attribute__((aligned(32))) sVtxProj[MAX_VERTICES + 4][4];
@@ -137,7 +134,6 @@ static uint32_t sProjGen = 1;                                 // one per screen 
 static SM_HOT_DATA uint8_t sVtxLit[MAX_VERTICES + 4];
 static uint32_t sLightGen = 1;
 static void nat_vertex_resolve(uint8_t idx);
-#endif
 
 static inline void tri_state_bump(void) {
     DC_PROF_COUNT(DCC_EPOCHS, 1);
@@ -190,20 +186,16 @@ static uint8_t color_combiner_pool_size;
 #else
 #define SM_HOT __attribute__((section(".sub0.sm64_hot")))
 #endif
-// DC_NATIVE: most vertices load through the native renderer's own loops (native/gfx_native.inc.c),
-// which take these functions' place in .sub0.
-#if DC_NATIVE
+// Most vertices load through the native renderer's own loops (native/gfx_native.inc.c), which take
+// these functions' place in .sub0.
 #define SM_HOT_VTX
-#else
-#define SM_HOT_VTX SM_HOT
-#endif
 // Hot code that does not fit in .sub0 (cc_eval_float: ~20% of title-screen display-list
 // samples, goddard's combiners). Left in .text it lands wherever LTO puts it; one renderer edit
 // moved it onto gfx_sp_tri1 and title I-cache stalls went 8.7% -> 22.3% of display-list cycles.
 // .sub1 starts one I-cache size after .sub0, so an offset into it is an I-cache index: an ld
 // ordering file from the Makefile (DC_SM_WARM_SET) puts SM_WARM code on lines .sub0 leaves cold
-// (the middle of gfx_run_dl, from title samples) and checks after the link that it did. Re-pick
-// the set from samples when .sub0 changes much. cc_eval_float keeps `cold` for its size-optimised code
+// or free (tools/dc_icache_sets.py) and checks after the link that it did. Re-pick the set when
+// .sub0 changes much. cc_eval_float keeps `cold` for its size-optimised code
 // (without it, it doubles to ~1.4 KB); the section attribute overrides where `cold` would put it.
 #ifdef TARGET_PC_ENDJINN   // the host: no SH4 cache layout to keep
 #define SM_WARM
@@ -249,7 +241,6 @@ static struct RSP {
 // The loaded vertices the vertex loops write and gfx_sp_tri1 draws from (VB_*): the RSP's slots, or
 // in a native build a native mesh's own while it draws (nat_vb_set, native/gfx_native_mesh.inc.c),
 // whose vertices load once each instead of once per load that names them.
-#if DC_NATIVE
 typedef struct {
     struct LoadedVertex *lv;
     uint8_t *clip;
@@ -268,12 +259,6 @@ static SM_HOT_DATA VtxBuf sVB = { rsp.loaded_vertices, clip_rej, sVtxBakeEpoch, 
 #define VB_PROJ sVB.proj
 #define VB_PROJ_GEN sVB.proj_gen
 #define VB_LIT sVB.lit
-#else
-#define VB_LV rsp.loaded_vertices
-#define VB_CLIP clip_rej
-#define VB_BAKE_EPOCH sVtxBakeEpoch
-#define VB_BAKED sVtxBaked
-#endif
 
 static struct RDP {
     const uint8_t *palette;
@@ -412,9 +397,7 @@ static void gfx_recompute_screen_map(void) {
     sm_xbias  = (vpf_x + vw * 0.5f) * DC_FSAA_X;
     sm_yscale = -(vh * 0.5f);
     sm_ybias  = fb_h - vpf_y - vh * 0.5f;
-#if DC_NATIVE
     sProjGen++;   // the screen positions taken (tri_proj) are out of date
-#endif
 }
 
 // 3-way OP/PT/TR classifier + N64-blender->PVR factor derivation. The backend exposes the
@@ -566,17 +549,13 @@ static struct ColorCombiner *gfx_lookup_or_create_color_combiner(uint32_t cc_id)
 
 void gfx_clear_texidx(unsigned int texidx);
 
-#if DC_NATIVE
 static uint32_t sNatGen;   // native/gfx_native.inc.c
 static uint32_t sNatFrameNo;   // frames run (gfx_run), for its compile budget
 static void nat_arena_release(void);   // native/gfx_native.inc.c
-#endif
 
 void reset_texcache(void) {
-#if DC_NATIVE
     sNatGen++;   // the compiled display lists' headers point at the old textures
     nat_arena_release();   // and their memory goes back now, before the next level's loads
-#endif
     gfx_texture_cache.pool_pos = 0;
     memset(&gfx_texture_cache, 0, sizeof(gfx_texture_cache));
 }
@@ -1030,9 +1009,7 @@ static inline void gfx_vertex_lights_prep(void) {
         calculate_normal_dir(&rsp.current_lookat[0], rsp.current_lookat_coeffs[0]);
         calculate_normal_dir(&rsp.current_lookat[1], rsp.current_lookat_coeffs[1]);
         rsp.lights_changed = false;
-#if DC_NATIVE
         sLightGen++;
-#endif
     }
     if (rsp.light_cols_changed) {
         int i;
@@ -1045,21 +1022,15 @@ static inline void gfx_vertex_lights_prep(void) {
             rsp.current_lights_colf[i][2] = rsp.current_lights[i].col[2] * scale;
         }
         rsp.light_cols_changed = false;
-#if DC_NATIVE
         sLightGen++;
-#endif
     }
 }
 
-#if DC_NATIVE
 static int nat_vertex_from_vtx(size_t n, size_t dest, const Vtx *vertices);   // native/gfx_native.inc.c
-#endif
 
 static void SM_HOT_VTX __attribute__((noinline)) gfx_sp_vertex(size_t n_vertices, size_t dest_index, const Vtx *vertices) {
-#if DC_NATIVE
     // The native renderer's vertex loops, which stay in the instruction cache.
     if (nat_vertex_from_vtx(n_vertices, dest_index, vertices)) return;
-#endif
     shz_xmtrx_load_4x4((const shz_mat4x4_t *)&rsp.MP_matrix);
     if (rsp.geometry_mode & G_LIGHTING) {
         gfx_vertex_lights_prep();
@@ -1070,10 +1041,8 @@ static void SM_HOT_VTX __attribute__((noinline)) gfx_sp_vertex(size_t n_vertices
     DC_PROF_COUNT(DCC_VERTS, n_vertices);
     for (size_t i = 0; i < n_vertices; i++) {
         VB_BAKE_EPOCH[dest_index + i] = 0;
-#if DC_NATIVE
         VB_PROJ_GEN[dest_index + i] = 0;
         VB_LIT[dest_index + i] = 0;   // lit as it loaded
-#endif
     }
 }
 
@@ -1994,7 +1963,6 @@ static inline void tri_bake_vertex(dc_fast_t *bv, const struct LoadedVertex *v) 
     bv->pad0.vertindex = oargb | ((uint32_t) v->fog << 24);
 }
 
-#if DC_NATIVE
 // The screen position tri_bake_vertex gives a vertex (the same operations), taken once per load:
 // out of line, once, so that .sub0 keeps a single copy.
 static void SM_HOT __attribute__((noinline)) tri_proj_take(uint8_t idx) {
@@ -2012,9 +1980,8 @@ static inline const float *tri_proj(uint8_t idx) {
     return VB_PROJ[idx];
 }
 
-// DC_NATIVE: baked out of line, once, not inlined at each of gfx_sp_tri1's three corners, so that
-// .sub0 holds the decode loop and the native loops too. Its position is tri_proj's, and a lit vertex
-// is lit first.
+// Baked out of line, once, not inlined at each of gfx_sp_tri1's three corners, so that .sub0 holds
+// the list loop and the native loops too. Its position is tri_proj's, and a lit vertex is lit first.
 static void SM_HOT __attribute__((noinline)) tri_bake_slot(uint8_t idx) {
     DC_PROF_COUNT(DCC_BAKES, 1);
     if (VB_LIT[idx]) nat_vertex_resolve(idx);
@@ -2043,17 +2010,10 @@ static void SM_HOT __attribute__((noinline)) tri_bake_slot(uint8_t idx) {
     bv->pad0.vertindex = oargb | ((uint32_t) v->fog << 24);
     VB_BAKE_EPOCH[idx] = sTriStateEpoch;
 }
-#endif
 
 static inline const dc_fast_t *tri_baked(uint8_t idx) {
     if (VB_BAKE_EPOCH[idx] != sTriStateEpoch) {
-#if DC_NATIVE
         tri_bake_slot(idx);
-#else
-        DC_PROF_COUNT(DCC_BAKES, 1);
-        tri_bake_vertex(&VB_BAKED[idx], &VB_LV[idx]);
-        VB_BAKE_EPOCH[idx] = sTriStateEpoch;
-#endif
     }
     return &VB_BAKED[idx];
 }
@@ -2253,7 +2213,6 @@ static void SM_HOT __attribute__((noinline)) gfx_sp_tri1(uint8_t vtx1_idx, uint8
     // three corners are cached baked vertices and back-face culling works in screen space.
     if (sTri.fast && !((c0 | c1 | c2) & (64 | 16))) {
         DC_PROF_COUNT(DCC_FAST, 1);
-#if DC_NATIVE
         // The back-face test from the corners' screen positions: a culled triangle bakes nothing.
         const float *q1 = tri_proj(vtx3_idx);
         const float *q2 = tri_proj(vtx2_idx);
@@ -2263,16 +2222,6 @@ static void SM_HOT __attribute__((noinline)) gfx_sp_tri1(uint8_t vtx1_idx, uint8
             float dy1 = q1[1] - q2[1];
             float dx2 = q3[0] - q2[0];
             float dy2 = q3[1] - q2[1];
-#else
-        const dc_fast_t *b1 = tri_baked(vtx3_idx);
-        const dc_fast_t *b2 = tri_baked(vtx2_idx);
-        const dc_fast_t *b3 = tri_baked(vtx1_idx);
-        if ((rsp.geometry_mode & G_CULL_BOTH) != 0) {
-            float dx1 = b1->vert.x - b2->vert.x;
-            float dy1 = b1->vert.y - b2->vert.y;
-            float dx2 = b3->vert.x - b2->vert.x;
-            float dy2 = b3->vert.y - b2->vert.y;
-#endif
             float cross = dx1 * dy2 - dy1 * dx2;
             if (sTri.cull_flip) {
                 cross = -cross;
@@ -2292,11 +2241,9 @@ static void SM_HOT __attribute__((noinline)) gfx_sp_tri1(uint8_t vtx1_idx, uint8
                     break;
             }
         }
-#if DC_NATIVE
         const dc_fast_t *b1 = tri_baked(vtx3_idx);
         const dc_fast_t *b2 = tri_baked(vtx2_idx);
         const dc_fast_t *b3 = tri_baked(vtx1_idx);
-#endif
         if (pvr_cur_kind == 0) {
             pvr_submit_op_tri(b1, b2, b3);
         } else {
@@ -2313,12 +2260,10 @@ static void SM_HOT __attribute__((noinline)) gfx_sp_tri1(uint8_t vtx1_idx, uint8
         return;
     }
 
-#if DC_NATIVE
     // The slow path reads the corners' colours: light them first.
     if (VB_LIT[vtx1_idx]) nat_vertex_resolve(vtx1_idx);
     if (VB_LIT[vtx2_idx]) nat_vertex_resolve(vtx2_idx);
     if (VB_LIT[vtx3_idx]) nat_vertex_resolve(vtx3_idx);
-#endif
     gfx_sp_tri1_slow(v1, v2, v3, c0, c1, c2);
 }
 
@@ -3025,7 +2970,6 @@ extern Gfx dl_draw_quad_verts_0123[];
 
 #define GFX_DL_STACK_MAX 8 /* tune this to whatever nesting you expect */
 
-static Gfx __attribute__((aligned(32))) * dl_stack[GFX_DL_STACK_MAX];
 
 //int max_sp = 0;
 
@@ -3061,307 +3005,11 @@ static void __attribute__((noinline, cold)) gfx_dc_tag(uint32_t tag) {
 #endif
 }
 
-#if DC_NATIVE
-static int nat_try(Gfx *dl);   // native/gfx_native.inc.c
-#endif
+static int nat_try(Gfx *dl, Gfx *call);   // native/gfx_native.inc.c
 
-
-// DC_NATIVE_DL_COLD=1: the decode loop out of .sub0 (which then keeps the native loops alone).
-#if DC_NATIVE && defined(DC_NATIVE_DL_COLD)
-#define SM_HOT_DL
-#else
-#define SM_HOT_DL SM_HOT
-#endif
-static void SM_HOT_DL __attribute__((noinline)) gfx_run_dl(Gfx* cmd) {
-    int dl_sp = 0;
-
-    for (;;) {
-        uint32_t opcode = cmd->words.w0 >> 24;
-
-        __builtin_prefetch(clip_rej);
-
-        if (cmd->words.w0 == 0x424C4E44) {
-            tri_state_bump();   // trilerp markers switch the per-corner path on/off
-            __builtin_prefetch((void *) (cmd) + 32);
-            if (cmd->words.w1 == 0xAAAAAAAA) {
-                in_trilerp = 1;
-                doing_peach = 0;
-                doing_bowser = 0;
-            } else if (cmd->words.w1 == 0xBBBBBBBB) {
-                doing_peach = 1;
-                doing_bowser = 0;
-            } else if (cmd->words.w1 == 0xCCCCCCCC) {
-                doing_bowser = 1;
-                doing_peach = 0;
-            } else if (cmd->words.w1 == 0xDDDDDDDD) {
-                in_trilerp = 0;
-                doing_bowser = 0;
-                doing_peach = 0;
-            }
-            ++cmd;
-            continue;
-        }
-
-        if (opcode != (uint8_t) G_TRI1 && opcode != (uint8_t) G_TRI2 && opcode != (uint8_t) G_VTX &&
-            opcode != (uint8_t) G_DL && opcode != (uint8_t) G_ENDDL) {
-            tri_state_bump();
-        }
-        ISTAT(interp_stats_cmd(opcode));
-
-        switch (opcode) {
-            case (uint8_t) G_NOOP:
-                if (cmd->words.w1) gfx_dc_tag(cmd->words.w1);
-                break;
-#if DC_NATIVE
-            case G_NATIVE: {   // geometry handed over directly (native/nat_mesh.h)
-                const NatCall *c = (const NatCall *) cmd->words.w1;
-                c->fn(c->arg);
-                break;
-            }
-#endif
-            // RSP commands:
-            case G_MTX:
-#ifdef F3DEX_GBI_2
-                gfx_sp_matrix(C0(0, 8) ^ G_MTX_PUSH, (const int32_t *) seg_addr(cmd->words.w1));
-#else
-                gfx_sp_matrix(C0(16, 8), (const int32_t *) seg_addr(cmd->words.w1));
-#endif
-                break;
-
-            case (uint8_t)G_POPMTX:
-#ifdef F3DEX_GBI_2
-                gfx_sp_pop_matrix(cmd->words.w1 / 64);
-#else
-                gfx_sp_pop_matrix(1);
-#endif
-                break;
-
-            case G_MOVEMEM:
-#ifdef F3DEX_GBI_2
-                gfx_sp_movemem(C0(0, 8), C0(8, 8) * 8, seg_addr(cmd->words.w1));
-#else
-                gfx_sp_movemem(C0(16, 8), 0, seg_addr(cmd->words.w1));
-#endif
-                break;
-
-            case (uint8_t)G_MOVEWORD:
-#ifdef F3DEX_GBI_2
-                gfx_sp_moveword(C0(16, 8), cmd->words.w1);
-#else
-                gfx_sp_moveword(C0(0, 8), cmd->words.w1);
-#endif
-                break;
-            case (uint8_t)G_TEXTURE:
-#ifdef F3DEX_GBI_2
-                gfx_sp_texture(C1(16, 16), C1(0, 16));
-#else
-                gfx_sp_texture(C1(16, 16), C1(0, 16));
-#endif
-                break;
-            case G_VTX:
-                ISTAT(interp_stats_vtx(C0(12, 8)));
-#ifdef F3DEX_GBI_2
-                gfx_sp_vertex(C0(12, 8), C0(1, 7) - C0(12, 8), seg_addr(cmd->words.w1));
-#elif defined(F3DEX_GBI) || defined(F3DLP_GBI)
-                gfx_sp_vertex(C0(10, 6), C0(16, 8) / 2, seg_addr(cmd->words.w1));
-#else
-                gfx_sp_vertex((C0(0, 16)) / sizeof(Vtx), C0(16, 4), seg_addr(cmd->words.w1));
-#endif
-                break;
-
-            case G_DL:
-#if DC_NATIVE
-                if (nat_try((Gfx *) seg_addr(cmd->words.w1))) {
-                    if (C0(16, 1) == 0) break;   // called: on after the call
-                    if (dl_sp == 0) return;      // branched to: it ended this list
-                    cmd = dl_stack[--dl_sp];
-                    --cmd;
-                    break;
-                }
-#endif
-                __builtin_prefetch(seg_addr(cmd->words.w1));
-                ISTAT(interp_stats_call(seg_addr(cmd->words.w1), C0(16, 1) == 0));
-                if (C0(16, 1) == 0) {
-                  
-                    dl_stack[dl_sp++] = cmd + 1; /* return to next command */
-//                    if (dl_sp > max_sp) {
-//                        printf("max DL stack depth %d\n", dl_sp);
-//                        max_sp = dl_sp;
-//                    }
-                    cmd = (Gfx*) seg_addr(cmd->words.w1);
-                    --cmd; // increase after break
-                    // Push return address
-//                    gfx_run_dl((Gfx *)seg_addr(cmd->words.w1));
-                } else {
-                    cmd = (Gfx *)seg_addr(cmd->words.w1);
-                    --cmd; // increase after break
-                }
-                break;
-            case (uint8_t)G_ENDDL:
-                if (dl_sp == 0) {
-                    /* top-level ENDDL: we're done */
-                    return;
-                } else {
-                    /* pop return address and resume caller DL */
-                    ISTAT(interp_stats_return());
-                    cmd = dl_stack[--dl_sp];
-                    __builtin_prefetch(cmd);
-                    --cmd; /* ++cmd at loop bottom -> first command after the call */
-                }
-                break;
-            //                return;
-
-#ifdef F3DEX_GBI_2
-            case G_GEOMETRYMODE:
-                gfx_sp_geometry_mode(~C0(0, 24), cmd->words.w1);
-                break;
-#else
-            case (uint8_t)G_SETGEOMETRYMODE:
-                gfx_sp_geometry_mode(0, cmd->words.w1);
-                break;
-            case (uint8_t)G_CLEARGEOMETRYMODE:
-                gfx_sp_geometry_mode(cmd->words.w1, 0);
-                break;
-#endif
-
-            case (uint8_t)G_TRI1:
-                ISTAT(interp_stats_tri(1));
-#ifdef F3DEX_GBI_2
-                gfx_sp_tri1(C0(17, 7), C0(9, 7), C0(1, 7));
-#elif defined(F3DEX_GBI) || defined(F3DLP_GBI)
-                gfx_sp_tri1(C1(17, 7), C1(9, 7), C1(1, 7));
-#else
-                gfx_sp_tri1(C1(16, 8) / 10, C1(8, 8) / 10, C1(0, 8) / 10);
-#endif
-                break;
-#if defined(F3DEX_GBI) || defined(F3DLP_GBI) || defined(F3DEX_GBI_2)
-            case (uint8_t)G_TRI2:
-                ISTAT(interp_stats_tri(2));
-                gfx_sp_tri1(C0(17, 7), C0(9, 7), C0(1, 7));
-                gfx_sp_tri1(C1(17, 7), C1(9, 7), C1(1, 7));
-                break;
-#endif
-            case (uint8_t)G_SETOTHERMODE_L:
-#ifdef F3DEX_GBI_2
-                gfx_sp_set_other_mode(31 - C0(8, 8) - C0(0, 8), C0(0, 8) + 1, cmd->words.w1);
-#else
-                gfx_sp_set_other_mode(C0(8, 8), C0(0, 8), cmd->words.w1);
-#endif
-                break;
-            case (uint8_t)G_SETOTHERMODE_H:
-#ifdef F3DEX_GBI_2
-                gfx_sp_set_other_mode(63 - C0(8, 8) - C0(0, 8), C0(0, 8) + 1, (uint64_t) cmd->words.w1 << 32);
-#else
-                gfx_sp_set_other_mode(C0(8, 8) + 32, C0(0, 8), (uint64_t) cmd->words.w1 << 32);
-#endif
-                break;
-            
-            // RDP Commands:
-            case G_SETTIMG:
-                gfx_dp_set_texture_image(C0(19, 2), C0(0, 10), seg_addr(cmd->words.w1));
-                break;
-            case G_LOADBLOCK:
-                gfx_dp_load_block(C1(12, 12));
-                break;
-            case G_LOADTILE:
-                gfx_dp_load_tile(C0(12, 12), C0(0, 12), C1(12, 12), C1(0, 12));
-                break;
-            case G_SETTILE:
-                gfx_dp_set_tile(C0(21, 3), C0(19, 2), C0(9, 9), C1(24, 3), C1(18, 2), C1(8, 2));
-                break;
-            case G_SETTILESIZE:
-                gfx_dp_set_tile_size(C0(12, 12), C0(0, 12), C1(12, 12), C1(0, 12));
-                break;
-            case G_SETENVCOLOR:
-                gfx_dp_set_env_color(C1(24, 8), C1(16, 8), C1(8, 8), C1(0, 8));
-                break;
-            case G_SETPRIMCOLOR:
-                gfx_dp_set_prim_color(C1(24, 8), C1(16, 8), C1(8, 8), C1(0, 8));
-                break;
-            case G_SETFOGCOLOR:
-                gfx_dp_set_fog_color(C1(24, 8), C1(16, 8), C1(8, 8), C1(0, 8));
-                break;
-            case G_SETFILLCOLOR:
-                gfx_dp_set_fill_color(cmd->words.w1);
-                break;
-            case G_SETCOMBINE:
-                gfx_dp_set_combine_mode(
-                    color_comb(C0(20, 4), C1(28, 4), C0(15, 5), C1(15, 3)),
-                    color_comb(C0(12, 3), C1(12, 3), C0(9, 3), C1(9, 3)));
-                // raw words for the PVR combiner evaluator (the compressed cc_id drops
-                // G_CCMUX_1 + the true alpha mux), same bit layout the eval expects.
-                rdp.combine_w0 = cmd->words.w0;
-                rdp.combine_w1 = cmd->words.w1;
-                break;
-            case G_TEXRECT:
-            case G_TEXRECTFLIP:
-            {
-                ISTAT(interp_stats_rect());
-                int32_t lrx, lry, ulx, uly;
-                uint32_t uls, ult, dsdx, dtdy;
-#ifdef F3DEX_GBI_2E
-                lrx = (int32_t)(C0(0, 24) << 8) >> 8;
-                lry = (int32_t)(C1(0, 24) << 8) >> 8;
-                ++cmd;
-                ulx = (int32_t)(C0(0, 24) << 8) >> 8;
-                uly = (int32_t)(C1(0, 24) << 8) >> 8;
-                ++cmd;
-                uls = C0(16, 16);
-                ult = C0(0, 16);
-                dsdx = C1(16, 16);
-                dtdy = C1(0, 16);
-#else
-                lrx = C0(12, 12);
-                lry = C0(0, 12);
-//                tile = C1(24, 3);
-                ulx = C1(12, 12);
-                uly = C1(0, 12);
-                ++cmd;
-                uls = C1(16, 16);
-                ult = C1(0, 16);
-                ++cmd;
-                dsdx = C1(16, 16);
-                dtdy = C1(0, 16);
-#endif
-                gfx_dp_texture_rectangle(ulx, uly, lrx, lry, uls, ult, dsdx, dtdy, opcode == G_TEXRECTFLIP);
-                break;
-            }
-            case G_FILLRECT:
-                ISTAT(interp_stats_rect());
-#ifdef F3DEX_GBI_2E
-            {
-                int32_t lrx, lry, ulx, uly;
-                lrx = (int32_t)(C0(0, 24) << 8) >> 8;
-                lry = (int32_t)(C1(0, 24) << 8) >> 8;
-                ++cmd;
-                ulx = (int32_t)(C0(0, 24) << 8) >> 8;
-                uly = (int32_t)(C1(0, 24) << 8) >> 8;
-                gfx_dp_fill_rectangle(ulx, uly, lrx, lry);
-                break;
-            }
-#else
-                gfx_dp_fill_rectangle(C1(12, 12), C1(0, 12), C0(12, 12), C0(0, 12));
-                break;
-#endif
-            case G_SETSCISSOR:
-                gfx_dp_set_scissor(C0(12, 12), C0(0, 12), C1(12, 12), C1(0, 12));
-                break;
-            case G_SETZIMG:
-                gfx_dp_set_z_image(seg_addr(cmd->words.w1));
-                break;
-            case G_SETCIMG:
-                gfx_dp_set_color_image(seg_addr(cmd->words.w1));
-                break;
-        }
-
-        __builtin_prefetch((void*) (++cmd) + 32);
-    }
-}
-
-#if DC_NATIVE
 #include "native/gfx_native.inc.c"
 #include "native/gfx_native_mesh.inc.c"
-#endif
+#include "native/nat_exec.inc.c"
 
 static void gfx_sp_reset() {
     rsp.modelview_matrix_stack_size = 1;
@@ -3377,6 +3025,10 @@ void gfx_init(struct GfxWindowManagerAPI *wapi, struct GfxRenderingAPI *rapi, co
 
     gfx_wapi = wapi;
     gfx_rapi = rapi;
+#ifdef TARGET_PC_ENDJINN
+    extern void gfx_native_host_writable(void);
+    gfx_native_host_writable();
+#endif
     gfx_wapi->init(game_name, start_in_fullscreen);
     gfx_rapi->init();
 #if 1
@@ -3447,7 +3099,7 @@ extern void gfx_pvr_render_frame(void (*op_renderer)(void *data), void *data);
 // The OP list's renderer (gfx_pvr_render_frame): the frame's display list.
 static void gfx_run_op(void *commands) {
     gfx_rapi->start_frame();
-    gfx_run_dl(commands);
+    nat_exec(commands);
     gfx_rapi->end_frame();
 }
 #endif
@@ -3462,10 +3114,8 @@ void gfx_run(Gfx *commands) {
     gfx_pvr_prof_shadow(0);   // nor does a shadow tag
 #endif
     
-#if DC_NATIVE
     sNatFrameNo++;   // the compile budget's frame
-#endif
-#if DC_NATIVE && defined(TARGET_PC_ENDJINN)
+#ifdef TARGET_PC_ENDJINN
     sNatFrame++;   // SM64_NAT_DBG
 #endif
 #if DC_ENJ_RENDER && !defined(TARGET_PC_ENDJINN)
@@ -3475,7 +3125,7 @@ void gfx_run(Gfx *commands) {
 #ifdef TARGET_PC_ENDJINN
     interp_stats_frame();
 #endif
-    gfx_run_dl(commands);
+    nat_exec(commands);
     gfx_rapi->end_frame();
 #endif
 #if !DC_ENJ_LOOP

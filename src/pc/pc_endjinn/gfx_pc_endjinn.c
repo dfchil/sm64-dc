@@ -96,20 +96,16 @@ static void mark_dirty(void) {
     sPT.dirty = 1;
 }
 
-#if DC_NATIVE
 static const pvr_poly_hdr_t *sForcedHdr[3];   // gfx_pvr_native_header
 // Its depth test: this file's headers keep the test on in PT and TR (compile_header), so a forced
 // header cannot tell gfx_pvr_cover_begin that it was compiled with the test off.
 static uint8_t sForcedTestOff[3];
-#endif
 
 static void compile_header(pvr_poly_hdr_t *out, int kind) {
-#if DC_NATIVE
     if (sForcedHdr[kind] != NULL) {
         *out = *sForcedHdr[kind];
         return;
     }
-#endif
     pvr_list_t list = kind == KIND_TR ? PVR_LIST_TR_POLY : kind == KIND_PT ? PVR_LIST_PT_POLY : PVR_LIST_OP_POLY;
     struct HostTex *t = &sTextures[sBoundTex];
     int textured = sCurShader && sCurShader->texture_used && sBoundTex && t->addr;
@@ -129,7 +125,6 @@ static void compile_header(pvr_poly_hdr_t *out, int kind) {
     pvr_poly_compile(out, &cxt);
 }
 
-#if DC_NATIVE
 // The native renderer's headers (src/pc/gfx/gfx_native.inc.c; gfx_pvr.c has the Dreamcast's).
 void gfx_pvr_header_for(int kind, pvr_poly_hdr_t *out) {
     compile_header(out, kind);
@@ -147,7 +142,6 @@ void gfx_pvr_native_end(void) {
     sForcedHdr[0] = sForcedHdr[1] = sForcedHdr[2] = NULL;
     mark_dirty();
 }
-#endif
 
 // pc-endjinn reads a vertex colour of 0 as "use the header's colour" (white): keep a fully
 // transparent black vertex transparent black.
@@ -159,7 +153,7 @@ static inline void copy_vertex(pvr_vertex_t *dst, const dc_fast_t *src, uint32_t
 
 // SM64_PVR_HASH=file: one line per frame with a hash of every vertex sent and the header it draws
 // with (not where headers fall, so batches split differently still compare equal), to compare two
-// renderers' output frame by frame (the native one against the interpreter). SM64_PVR_DUMP=n writes
+// renderers' output frame by frame (a change against the build before it). SM64_PVR_DUMP=n writes
 // frame n's vertices to file.n too.
 static FILE *sHashFile;
 static int sHashInit, sHashDumpFrame = -1;
@@ -232,11 +226,7 @@ static int bucket_open(Bucket *b, int kind, size_t n) {
         }
         b->cur = b->nbatch++;
         compile_header(&b->batch[b->cur].hdr, kind);
-#if DC_NATIVE
         b->batch[b->cur].test_off = sForcedHdr[kind] != NULL ? sForcedTestOff[kind] : !sDepthTest;
-#else
-        b->batch[b->cur].test_off = !sDepthTest;
-#endif
         b->batch[b->cur].start = b->nverts;
         b->batch[b->cur].count = 0;
         b->dirty = 0;

@@ -1124,17 +1124,15 @@ create_shape_gddl(struct ObjShape *s) {
     enddl = gd_enddlsplist_parent();
     shape->gdDls[0] = shapedl;
     shape->gdDls[1] = shapedl;
-#if DC_NATIVE
     // Its geometry drawn as native meshes (gd_native.c), or else compiled as it stands.
 #ifdef TARGET_PC_ENDJINN
-    if (getenv("SM64_GD_INTERP") != NULL) {   // host A/B: the list as it was
+    if (getenv("SM64_GD_NO_MESH") != NULL) {   // host A/B: the list as it was, compiled
         gd_native_stable_dl(shapedl, enddl);
     } else
 #endif
     if (!gd_native_shape(shape, Unknown8019BE40(shapedl), enddl)) {
         gd_native_stable_dl(shapedl, enddl);
     }
-#endif
 
     if (shape->name[0] != '\0') {
         printf("Generated '%s' (%d) display list ok.(%d)\n", shape->name, shapedl, enddl);

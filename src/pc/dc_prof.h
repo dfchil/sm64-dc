@@ -37,7 +37,7 @@ enum DcProfCount {
     DCC_TR_OPQ_PX,
     DCC_HELD,        // 60 fps second draws skipped as identical to the first (pc_main.c)
     DCC_DROPPED,     // DC_FRAME_MODE_60_DROP: exact frames dropped after a late interpolated one
-    // DC_NATIVE (gfx_native.inc.c): display lists drawn from their compiled form, compiled, and
+    // The native renderer (gfx_native.inc.c): display lists drawn from their compiled form, compiled, and
     // vertex chunks drawn or culled by their bounding sphere.
     DCC_NAT_DRAWS,
     DCC_NAT_COMPILES,

@@ -3,7 +3,7 @@
 // Drop-in replacement for the GLdc backend (gfx_gldc.c): implements the same
 // struct GfxRenderingAPI, but submits geometry straight to the PVR via the
 // direct-render (store-queue) path instead of going through OpenGL. The
-// gfx_retro_dc.c front-end (command interpreter, combiner, SW clip/cull/scissor)
+// gfx_retro_dc.c front-end (display-list commands, combiner, SW clip/cull/scissor)
 // is shared; only this backend differs. SM64's rapi is the SINGLE-TEXTURE variant
 // (shader_get_info returns the used-texture bool; no tile params), so this backend
 // is adapted accordingly vs MK64's two-tile version.
@@ -279,19 +279,15 @@ static void pvr_ensure_base(int textured, int kind, int list) {
 // Build a poly header for the current state. pvr_poly_compile runs only ONCE per base (6 total);
 // per draw this copies the matching base and bit-patches the texture fields + per-draw state
 // in place (OoT technique) — no per-draw recompile. Per-list state stays from the base.
-#if DC_NATIVE
 // A native segment's precompiled header (gfx_native.inc.c), used for its kind instead of the
 // current state while the segment draws.
 static const pvr_poly_hdr_t *sForcedHdr[3];
-#endif
 
 static void pvr_compile_header(pvr_poly_hdr_t *out, int kind) {
-#if DC_NATIVE
     if (sForcedHdr[kind] != NULL) {
         *out = *sForcedHdr[kind];
         return;
     }
-#endif
     int list = (kind == PVR_KIND_TR) ? PVR_LIST_TR_POLY
              : (kind == PVR_KIND_PT) ? PVR_LIST_PT_POLY
              :                         PVR_LIST_OP_POLY;
@@ -1002,7 +998,6 @@ static void prof_count_bucket(const PvrBucket *b, int kind) {
 #define PROF_COUNT_OP(a, b, c) ((void) 0)
 #endif
 
-#if DC_NATIVE
 // The native renderer (gfx_native.inc.c). A segment is compiled with the header the current state
 // gives (gfx_pvr_header_for) and later drawn with that header (gfx_pvr_native_header) without the
 // state; gfx_pvr_native_end hands the lists back to the current state.
@@ -1022,7 +1017,6 @@ void gfx_pvr_native_end(void) {
     sForcedHdr[0] = sForcedHdr[1] = sForcedHdr[2] = NULL;
     pvr_mark_dirty();
 }
-#endif
 
 // (Re)emit the live OP header to the open OP list when depth/texture state changed.
 static inline void pvr_emit_op_header(void) {
