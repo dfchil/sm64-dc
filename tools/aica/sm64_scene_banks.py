@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Scene packs with one shared sample bank each (pack version 2), from sm64_scene_assets.py's lists.
+"""Scene packs with one shared sample bank each (pack version 3), from sm64_scene_assets.py's lists.
 
     tools/aica/sm64_scene_assets.py --json build/afx/scene_assets.json
     tools/aica/sm64_scene_banks.py build/afx/scene_assets.json --stage build/afx/stage
@@ -12,8 +12,10 @@ against the relocation), the bank identity and the control id. AICAflow's runtim
 identities from the headers only, so a bank built here is as good as one from AICAforge.
 
 scene_core.smp holds the global set, read once; scene_LL.smp (LL = gCurrLevelNum, decimal) the
-level's own assets. A level flow whose samples are all in the core bank binds to that instead,
-so its samples are not in the level bank at all.
+level's own assets. A level's bank holds only the samples the core bank does not: a level flow
+whose samples are all in the core bank binds to that instead, and one with samples in both plays
+from both (AICAflow's AFX_FLAG_BANKS, firmware ABI 13), the level bank in slot 0 and the core
+bank in slot 1.
 
 Each level pack is fitted to the AICA RAM left after the core pack and the reverb ring (--arena-kb,
 --reverb-kb): its music, then its sounds (smallest flow first), then other songs (jingles, event
@@ -21,9 +23,10 @@ music). A song left out is loaded from its own files when it plays, so the
 songs packed are chosen to leave room for the largest left out where that lets more of them play
 (see fit). The bank holds only the samples of what is in the pack.
 
-Pack format (little-endian): "SMPK", version 2, entry count, bank offset, bank bytes (a whole
+Pack format (little-endian): "SMPK", version 3, entry count, bank offset, bank bytes (a whole
 AFB file); per entry a 24-byte NUL-padded stem, the bank it binds (0 = this pack's, 1 = the core
-pack's), the offset and size of its AFX in the file, and a reserved word; files 32-byte aligned.
+pack's, 2 = both), the offset and size of its AFX in the file, and a reserved word; files 32-byte
+aligned. Version 2 is the same without entries of bank 2.
 """
 import argparse
 import hashlib
@@ -37,6 +40,18 @@ ROOT = Path(__file__).resolve().parent.parent.parent
 MAGIC = b"SMPK"
 ENTRY = struct.Struct("<24s4I")
 SETUP_BYTES = 36
+HEADER_BYTES = 80
+FLAG_BANKS = 64          # AICAflow format.h AFX_FLAG_BANKS
+SLOT_SHIFT = 21          # AFX_BANK_SLOT_SHIFT: bits 21-22 of a sample address are its bank slot
+BANK_TABLE_BYTES = 16    # AFX_BANK_TABLE_BYTES
+
+
+def control_id(image):
+    """AICAflow's afx_control_id: FNV-1a of the upload image, never zero."""
+    h = 2166136261
+    for b in image:
+        h = ((h ^ b) * 16777619) & 0xFFFFFFFF
+    return h or 1
 
 
 def level_numbers():
@@ -83,12 +98,39 @@ class Asset:
             control = struct.unpack_from("<H", x, at)[0]
             struct.pack_into("<HH", x, at, (control & ~0x7F) | (new >> 16), new & 0xFFFF)
         struct.pack_into("<II", x, 40, *bank_id)
-        image = bytes(x[image_off:image_off + image_size])
-        h = 2166136261
-        for b in image:
-            h = ((h ^ b) * 16777619) & 0xFFFFFFFF
-        struct.pack_into("<I", x, 32, h or 1)
+        struct.pack_into("<I", x, 32, control_id(x[image_off:image_off + image_size]))
         return bytes(x)
+
+    def bound_both(self, level, core):
+        """The AFX rebuilt to play from two banks (AFX_FLAG_BANKS, as AICAforge's afx_bank
+        --shared): level = (offsets, id) fills slot 0, core = (offsets, id) slot 1, which a
+        sample takes when the core bank holds it. The bank list goes after the relocations, and
+        the image ends with the zero bank table the loader fills."""
+        x = self.afx
+        image_off, image_size, stream_off, stream_size = struct.unpack_from("<4I", x, 16)
+        ro, rc = struct.unpack_from("<II", x, 48)
+        assert image_size == stream_off + stream_size, self.stem
+        listed = HEADER_BYTES + 12 * rc
+        image = (listed + 12 + 31) & ~31
+        table = (stream_off + stream_size + 3) & ~3
+        out = bytearray(image + table + BANK_TABLE_BYTES)
+        out[:HEADER_BYTES] = x[:HEADER_BYTES]
+        out[HEADER_BYTES:listed] = x[ro:ro + 12 * rc]
+        struct.pack_into("<III", out, listed, 1, *core[1])
+        out[image:image + image_size] = x[image_off:image_off + image_size]
+        flags = struct.unpack_from("<I", x, 12)[0] | FLAG_BANKS
+        struct.pack_into("<4I", out, 8, len(out), flags, image, table + BANK_TABLE_BYTES)
+        struct.pack_into("<II", out, 40, *level[1])
+        struct.pack_into("<I", out, 48, HEADER_BYTES)
+        struct.pack_into("<I", out, 60, listed)
+        for i, (pair, data) in enumerate(self.relocs):
+            digest = hashlib.sha1(data).digest()
+            new = core[0][digest] | 1 << SLOT_SHIFT if digest in core[0] else level[0][digest]
+            struct.pack_into("<I", out, HEADER_BYTES + 12 * i + 4, new)
+            control = struct.unpack_from("<H", out, image + pair)[0]
+            struct.pack_into("<HH", out, image + pair, (control & ~0x7F) | (new >> 16), new & 0xFFFF)
+        struct.pack_into("<I", out, 32, control_id(out[image:image + table + BANK_TABLE_BYTES]))
+        return bytes(out)
 
 
 def make_bank(samples):
@@ -107,7 +149,7 @@ def make_bank(samples):
 
 def write_pack(path, bank_file, entries):
     """entries: (stem, bank index, afx bytes)."""
-    out = bytearray(MAGIC + struct.pack("<4I", 2, len(entries), 0, 0) + bytes(ENTRY.size * len(entries)))
+    out = bytearray(MAGIC + struct.pack("<4I", 3, len(entries), 0, 0) + bytes(ENTRY.size * len(entries)))
     out += bytes(-len(out) % 32)
     struct.pack_into("<II", out, 12, len(out), len(bank_file))
     out += bank_file
@@ -122,8 +164,8 @@ def write_pack(path, bank_file, entries):
 def fit(ranked, core_samples, budget, music):
     """The assets of ranked (in load order) that go in a level pack, and those left out.
 
-    An asset whose samples are all in the core bank costs its flow; any other its flow and the
-    samples it adds to the level bank. The level's music and sounds go first while they fit, and
+    An asset costs its flow and the samples it adds to the level bank, which are those the core
+    bank does not hold. The level's music and sounds go first while they fit, and
     leave free what the largest other song needs beyond the flows of the level's music, which
     the runtime lets go for it: a sound left out loads from its own files when it plays, but a
     song left out without room is silent. Of the other songs, the set packed is the one that lets the most of them play: a song left out
@@ -132,10 +174,7 @@ def fit(ranked, core_samples, budget, music):
     core = set(core_samples)
 
     def cost(a, have):
-        s = a.samples()
-        if set(s) <= core:
-            return len(a.afx)
-        return len(a.afx) + sum(len(v) for k, v in s.items() if k not in have)
+        return len(a.afx) + sum(len(v) for k, v in a.samples().items() if k not in have and k not in core)
 
     def alone(a):
         return len(a.afx) + sum(-len(v) % 32 + len(v) for v in a.samples().values())
@@ -147,8 +186,7 @@ def fit(ranked, core_samples, budget, music):
             if used + c <= limit:
                 taken.append(a)
                 used += c
-                if not set(a.samples()) <= core:
-                    have = have | set(a.samples())
+                have = have | (set(a.samples()) - core)
             else:
                 out.append(a)
         return taken, out, have, used
@@ -218,20 +256,28 @@ def main():
         def rank(a):
             return (0 if a.stem in music else 1 if a.stem.startswith("sfx_") else 2, len(a.afx), a.stem)
         own, left_out = fit(sorted(load(stems), key=rank), core_samples, budget, music)
-        on_core = [a for a in own if set(a.samples()) <= set(core_samples)]
         samples = {}
         for a in own:
-            if a not in on_core:
-                samples.update(a.samples())
+            samples.update((k, v) for k, v in a.samples().items() if k not in core_samples)
+        assert samples, f"{lvl}: every sample is in the core bank, so the level has no bank"
         bank, offsets, bank_id = make_bank(samples)
-        entries = [(a.stem, 1, a.bound(core_offsets, core_id)) if a in on_core else
-                   (a.stem, 0, a.bound(offsets, bank_id)) for a in own]
+
+        def entry(a):
+            s = set(a.samples())
+            if s <= set(core_samples):
+                return (a.stem, 1, a.bound(core_offsets, core_id))
+            if s & set(core_samples):
+                return (a.stem, 2, a.bound_both((offsets, bank_id), (core_offsets, core_id)))
+            return (a.stem, 0, a.bound(offsets, bank_id))
+        entries = [entry(a) for a in own]
+        on_core = [e for e in entries if e[1] == 1]
+        both = [e for e in entries if e[1] == 2]
         # Songs load last: the room one leaves when it lets go joins the free end of AICA RAM.
         entries.sort(key=lambda e: e[0].startswith("seq"))
         size = write_pack(stage / f"scene_{number:02d}.smp", bank, entries)
         flows = sum(struct.unpack_from("<I", e[2], 20)[0] for e in entries)
         out = f" left out {' '.join(a.stem for a in left_out)}" if left_out else ""
-        print(f"scene_{number:02d}.smp {lvl:17s} {len(own):3d} assets ({len(on_core)} on core), "
+        print(f"scene_{number:02d}.smp {lvl:17s} {len(own):3d} assets ({len(on_core)} on core, {len(both)} on both), "
               f"bank {len(bank) // 1024:4d} KB, flows {flows // 1024:4d} KB{out}")
         report.append(f"{number:02d} {lvl} {len(own)} assets bank {len(bank)} flows {flows}{out}")
     (stage / "scenes.txt").write_text("\n".join(report) + "\n")

@@ -56,11 +56,14 @@ typedef struct {
     u8 resident;   /* loaded from a scene pack: kept until its scene ends, not retired */
     u8 core;       /* from scene_core: kept for the whole run */
     u8 lanes;      /* the flow's lane count: afx_instance_lanes_set drops a mask beyond it */
+    u8 holds_core; /* its flow plays from sCoreBank, alone or beside the level's (pack bank 1 or 2) */
     afx_bank_t *shared;   /* a version 2 pack's scene bank, which it does not own; else bank */
 } Asset;
 
-/* Version 2 packs (tools/aica/sm64_scene_banks.py) bring one sample bank each that all their
- * flows bind to: scene_core's for the run, the level's until its last flow is freed. */
+/* Version 2 and 3 packs (tools/aica/sm64_scene_banks.py) bring one sample bank each that their
+ * flows bind to: scene_core's for the run, the level's until its last flow is freed. In version
+ * 3 a level flow can play from both, the level's bank in slot 0 and scene_core's in slot 1. */
+enum { PACK_BANK_OWN, PACK_BANK_CORE, PACK_BANK_BOTH };
 static afx_bank_t sCoreBank, sLevelBank;
 static u8 sCoreBankUp, sLevelBankUp, sLevelBankDying;
 
@@ -134,9 +137,11 @@ static int read_file(const char *path, void **out, u32 *bytes) {
     return 0;
 }
 
-static int flow_upload(Asset *a, afx_bank_t *bank, const void *data, u32 bytes) {
+/* bank fills the flow's bank slot 0, and also (unless NULL) slot 1 (AFX_FLAG_BANKS). */
+static int flow_upload(Asset *a, afx_bank_t *bank, afx_bank_t *also, const void *data, u32 bytes) {
     afx_file_header_t h;
-    int result = afx_bank_flow_upload(bank, data, bytes, &a->flow);
+    const afx_bank_t *const banks[2] = { bank, also };
+    int result = afx_flow_upload(banks, also ? 2 : 1, data, bytes, &a->flow);
     a->lanes = 0;
     if (!result && afx_file_validate(data, bytes, &h) == AFX_OK && (h.flags & AFX_FLAG_LANES)) {
         const u8 *map = (const u8 *) data + h.image_offset + h.setup_count * AFX_SETUP_BYTES;
@@ -155,7 +160,7 @@ static int asset_load_files(Asset *a, const char *stem, u32 id, u32 *bytes) {
     int result = afx_bank_load_file(&a->bank, path);
     if (result) return result;
     snprintf(path, sizeof(path), "%s/%s.afx", DC_AICAFLOW_ROOT, stem);
-    result = read_file(path, &flow, bytes) ? -1 : flow_upload(a, &a->bank, flow, *bytes);
+    result = read_file(path, &flow, bytes) ? -1 : flow_upload(a, &a->bank, NULL, flow, *bytes);
     free(flow);
     if (result) {
         afx_bank_release(&a->bank);
@@ -244,15 +249,19 @@ typedef struct {
     u32 bank, afx_off, afx_size, reserved;
 } PackEntry2;
 
-static int pack_entry_load2(Asset *a, const u8 *base, const PackEntry2 *e, afx_bank_t *bank, u32 id, u8 core) {
+/* own is the pack's bank; the entry binds that, scene_core's, or both. */
+static int pack_entry_load2(Asset *a, const u8 *base, const PackEntry2 *e, afx_bank_t *own, u32 id, u8 core) {
+    afx_bank_t *bank = e->bank == PACK_BANK_CORE ? &sCoreBank : own;
     memset(a, 0, sizeof(*a));
-    int result = flow_upload(a, bank, base + e->afx_off, e->afx_size);
+    int result = flow_upload(a, bank, e->bank == PACK_BANK_BOTH ? &sCoreBank : NULL, base + e->afx_off,
+                             e->afx_size);
     if (result) {
         printf("AICAFLOW: %.24s: flow not loaded (%d)\n", e->stem, result);
         memset(a, 0, sizeof(*a));
         return result;
     }
     a->shared = bank;
+    a->holds_core = bank == &sCoreBank || e->bank == PACK_BANK_BOTH;
     a->id = id;
     a->resident = 1;
     a->core = core;
@@ -263,7 +272,7 @@ static int pack_entry_load(Asset *a, const u8 *base, const PackEntry *e, u32 id,
     memset(a, 0, sizeof(*a));
     int result = afx_bank_load_memory(&a->bank, base + e->afb_off, e->afb_size);
     if (result) return result;
-    result = flow_upload(a, &a->bank, base + e->afx_off, e->afx_size);
+    result = flow_upload(a, &a->bank, NULL, base + e->afx_off, e->afx_size);
     if (result) {
         afx_bank_release(&a->bank);
         memset(a, 0, sizeof(*a));
@@ -303,7 +312,7 @@ static int pack_load_v2(const char *path, const char *stem, u8 core, u32 *loaded
     FILE *f = fopen(path, "rb");
     if (f == NULL) return 0;
     u32 head[5];
-    if (fread(head, 1, sizeof(head), f) != sizeof(head) || head[0] != PACK_MAGIC || head[1] != 2 || head[2] > 1024) {
+    if (fread(head, 1, sizeof(head), f) != sizeof(head) || head[0] != PACK_MAGIC || (head[1] != 2 && head[1] != 3) || head[2] > 1024) {
         fclose(f);
         return 0;
     }
@@ -327,9 +336,8 @@ static int pack_load_v2(const char *path, const char *stem, u8 core, u32 *loaded
         u32 capacity = 0;
         for (u32 i = 0; i < head[2]; i++) {
             const PackEntry2 *e = &entries[i];
-            afx_bank_t *bank = e->bank == 1 ? &sCoreBank : own;
             u32 id;
-            if (e->bank == 1 && !sCoreBankUp) continue;
+            if (e->bank != PACK_BANK_OWN && !sCoreBankUp) continue;
             Asset *slot = pack_slot(e->stem, &id);
             if (!slot) continue;
             if (e->afx_size > capacity) {
@@ -339,10 +347,10 @@ static int pack_load_v2(const char *path, const char *stem, u8 core, u32 *loaded
             }
             if (!piece || fseek(f, (long) e->afx_off, SEEK_SET) || fread(piece, 1, e->afx_size, f) != e->afx_size) continue;
             *bytes += e->afx_size;
-            const PackEntry2 local = { .bank = 0, .afx_off = 0, .afx_size = e->afx_size };
+            const PackEntry2 local = { .bank = e->bank, .afx_off = 0, .afx_size = e->afx_size };
             PackEntry2 named = local;
             memcpy(named.stem, e->stem, sizeof(named.stem));
-            if (!pack_entry_load2(slot, piece, &named, bank, id, core)) (*loaded)++;
+            if (!pack_entry_load2(slot, piece, &named, own, id, core)) (*loaded)++;
         }
     }
     free(piece);
@@ -373,7 +381,8 @@ static int pack_load(const char *stem, u8 core) {
             Asset *slot = pack_slot(e->stem, &id);
             if (slot && !pack_entry_load(slot, base, e, id, core)) loaded++;
         }
-    } else if (ok && head[1] == 2 && 20 + head[2] * sizeof(PackEntry2) <= bytes && head[3] + head[4] <= bytes) {
+    } else if (ok && (head[1] == 2 || head[1] == 3) && 20 + head[2] * sizeof(PackEntry2) <= bytes &&
+               head[3] + head[4] <= bytes) {
         /* One bank for the pack: scene_core's for the run, a level's until the scene ends. */
         const u8 *base = data;
         afx_bank_t *own = core ? &sCoreBank : &sLevelBank;
@@ -387,10 +396,9 @@ static int pack_load(const char *stem, u8 core) {
             const PackEntry2 *e = (const PackEntry2 *) (base + 20);
             for (u32 n = head[2]; n--; e++) {
                 if (e->afx_off + e->afx_size > bytes) break;
-                afx_bank_t *bank = e->bank == 1 ? &sCoreBank : own;
-                if (e->bank == 1 && !sCoreBankUp) continue;
+                if (e->bank != PACK_BANK_OWN && !sCoreBankUp) continue;
                 Asset *slot = pack_slot(e->stem, &id);
-                if (slot && !pack_entry_load2(slot, base, e, bank, id, core)) loaded++;
+                if (slot && !pack_entry_load2(slot, base, e, own, id, core)) loaded++;
             }
         }
     } else {
@@ -490,16 +498,17 @@ static int pack_reload(const char *stem) {
     u32 head[5];
     PackEntry2 e;
     int result = -1;
-    if (fread(head, 1, sizeof(head), f) == sizeof(head) && head[0] == PACK_MAGIC && head[1] == 2) {
+    if (fread(head, 1, sizeof(head), f) == sizeof(head) && head[0] == PACK_MAGIC && (head[1] == 2 || head[1] == 3)) {
         for (u32 i = 0; i < head[2] && fread(&e, sizeof(e), 1, f) == 1; i++) {
             if (strncmp(e.stem, stem, sizeof(e.stem)) != 0) continue;
             u32 id;
             Asset *slot = pack_slot(e.stem, &id);
-            void *piece = slot && (e.bank == 1 ? sCoreBankUp : sLevelBankUp) ? memalign(32, e.afx_size) : NULL;
+            int up = (e.bank == PACK_BANK_OWN || sCoreBankUp) && (e.bank == PACK_BANK_CORE || sLevelBankUp);
+            void *piece = slot && up ? memalign(32, e.afx_size) : NULL;
             if (piece && fseek(f, (long) e.afx_off, SEEK_SET) == 0 && fread(piece, 1, e.afx_size, f) == e.afx_size) {
                 PackEntry2 local = e;
                 local.afx_off = 0;
-                result = pack_entry_load2(slot, piece, &local, e.bank == 1 ? &sCoreBank : &sLevelBank, id, 0);
+                result = pack_entry_load2(slot, piece, &local, &sLevelBank, id, 0);
             }
             free(piece);
             break;
@@ -522,9 +531,9 @@ static void core_drop(void) {
         sMusic[p].inst = 0;
     }
     for (int i = 0; i < SONG_CACHE; i++)
-        if (sSongs[i].id && (sSongs[i].core || sSongs[i].shared == &sCoreBank)) asset_free(&sSongs[i]);
+        if (sSongs[i].id && (sSongs[i].core || sSongs[i].holds_core)) asset_free(&sSongs[i]);
     for (int i = 0; i < SFX_ASSETS; i++)
-        if (sSfx[i].id && (sSfx[i].core || sSfx[i].shared == &sCoreBank)) asset_free(&sSfx[i]);
+        if (sSfx[i].id && (sSfx[i].core || sSfx[i].holds_core)) asset_free(&sSfx[i]);
     /* The bank goes once the last flow bound to it has: that waits for the stops above. */
     for (int wait = 0; wait < 50 && sCoreBankUp; wait++) {
         free_retired();
