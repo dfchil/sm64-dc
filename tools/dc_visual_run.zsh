@@ -8,7 +8,8 @@
 #
 # 100 s covers the title screen, the white fade, the star iris into the first attract demo and
 # that demo. A plain build never exits, so once the recording ends the console gets a soft reset
-# (kos-tool -r) while this script still holds the queue lock. The capture device is always free
+# (kos-tool -r) while this script still holds the queue lock, and a PixelFX restart if the loader
+# does not come back from it. The capture device is always free
 # to use (Daniel, 2026-10-24). AFX_STAGE=<dir> copies <dir>/afx into /pc for DC_AICAFLOW builds.
 setopt err_return
 cd "${0:A:h}/.." || exit 1
@@ -48,4 +49,12 @@ if kill -0 $run 2>/dev/null; then
   kill $run 2>/dev/null || true
 fi
 wait $run 2>/dev/null || true
+# The soft reset does not always bring dc-load-ip back (2026-11-04: a black screen twice). While the
+# lock is still ours, wait for it, and if it stays away restart the console through the PixelFX.
+for i in {1..15}; do dctool_loader_ready "$DCTOOL_HOST" && break; sleep 2; done
+if ! dctool_loader_ready "$DCTOOL_HOST"; then
+  echo "dc-load-ip did not come back after the soft reset: PixelFX restart" >> $out/console.log
+  reset_dctool_wait >> $out/console.log 2>&1 || true
+  for i in {1..30}; do dctool_loader_ready "$DCTOOL_HOST" && break; sleep 2; done
+fi
 echo $out
