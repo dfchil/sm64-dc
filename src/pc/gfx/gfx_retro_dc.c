@@ -339,6 +339,11 @@ static uint8_t sSkybox = 0;
 static uint32_t sRailMode;   // the render mode DC_GFX_RAIL_TR_END restores
 #endif
 extern void gfx_pvr_cover_begin(float world_z_max);
+#if DC_FADES
+extern void gfx_pvr_fade_begin(uint32_t rgba);
+extern void gfx_pvr_fade_end(void);
+static uint8_t sFadeNext;   // the next tag is DC_GFX_FADE's colour and alpha
+#endif
 #ifdef DC_PROF_SKIP
 extern void gfx_pvr_prof_shadow(int on);
 #endif
@@ -2976,6 +2981,21 @@ extern Gfx dl_draw_quad_verts_0123[];
 // Dreamcast display-list tags (gfx_dc_tags.h), kept out of .sub0. A cover's depth goes above
 // every world 1/w of the frame (at least 2, the ortho-3D range; decal and trilerp bias included).
 static void __attribute__((noinline, cold)) gfx_dc_tag(uint32_t tag) {
+#if DC_FADES
+    if (sFadeNext) {   // 0xRRGGBBAA, whatever tag it looks like
+        sFadeNext = 0;
+        gfx_pvr_fade_begin(tag);
+        return;
+    }
+    if (tag == DC_GFX_FADE) {
+        sFadeNext = 1;
+        return;
+    }
+    if (tag == DC_GFX_FADE_END) {
+        gfx_pvr_fade_end();
+        return;
+    }
+#endif
     if (tag == DC_GFX_COVER_BEGIN) {
         float bound = gfx_frame_invw_max > 2.0f ? gfx_frame_invw_max : 2.0f;
         gfx_pvr_cover_begin(bound * PVR_DECAL_ZBIAS * 1.01f);

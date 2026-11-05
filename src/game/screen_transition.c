@@ -97,6 +97,59 @@ Vtx *vertex_transition_color(struct WarpTransitionData *transData, u8 alpha) {
     return verts;
 }
 
+#if defined(TARGET_DC) && DC_FADES
+// Fades (gfx_dc_tags.h DC_GFX_FADE): the frame's fade goes into the master display list's first two
+// commands, and its rectangle is not drawn. One fade a frame: a transition's, drawn last, takes it
+// from the pause shade, whose rectangle is then drawn after all (and fades with the rest).
+static Gfx *sFadeHead;          // the master display list's first two commands
+static Gfx *sFadeShade;         // shade_screen's two commands while the fade is the shade's
+static const Gfx *sFadeShadeDraw;
+
+void dc_fade_frame_begin(void) {
+    sFadeHead = gDisplayListHead;
+    gDPNoOp(gDisplayListHead++);
+    gDPNoOp(gDisplayListHead++);
+    sFadeShade = NULL;
+}
+
+static void fade_take(u8 r, u8 g, u8 b, u8 alpha) {
+    gDPNoOpTag(&sFadeHead[0], DC_GFX_FADE);
+    gDPNoOpTag(&sFadeHead[1], (u32) r << 24 | (u32) g << 16 | (u32) b << 8 | alpha);
+}
+
+// shade_screen (ingame_menu.c): draw is its rectangle, state the same lists without the triangles.
+void dc_fade_shade(u8 r, u8 g, u8 b, u8 alpha, const Gfx *draw, const Gfx *state) {
+    if (sFadeHead == NULL || sFadeHead[0].words.w1 != 0) {   // the frame's fade is taken
+        gSPDisplayList(gDisplayListHead++, draw);
+        return;
+    }
+    fade_take(r, g, b, alpha);
+    sFadeShade = gDisplayListHead;
+    sFadeShadeDraw = draw;
+    gSPDisplayList(gDisplayListHead++, state);
+    gDPNoOpTag(gDisplayListHead++, DC_GFX_FADE_END);
+}
+
+// dl_transition_color's rectangle below full colour (a cover at 255): TRUE when it is not drawn. It
+// fades the frame unless it only covers the ending's letterbox band, and alpha 0 draws nothing.
+static s32 fade_transition(struct WarpTransitionData *transData, u8 alpha) {
+    if (alpha == 0) {
+        return TRUE;
+    }
+    if (sFadeHead == NULL || D_8032CE78 != NULL) {
+        return FALSE;
+    }
+    if (sFadeShade != NULL) {
+        gSPDisplayList(&sFadeShade[0], sFadeShadeDraw);
+        gDPNoOp(&sFadeShade[1]);
+        sFadeShade = NULL;
+    }
+    fade_take(transData->red, transData->green, transData->blue, alpha);
+    gDPNoOpTag(gDisplayListHead++, DC_GFX_FADE_END);
+    return TRUE;
+}
+#endif
+
 s32 dl_transition_color(s8 fadeTimer, u8 transTime, struct WarpTransitionData *transData, u8 alpha) {
     Vtx *verts = vertex_transition_color(transData, alpha);
 
@@ -109,6 +162,9 @@ s32 dl_transition_color(s8 fadeTimer, u8 transTime, struct WarpTransitionData *t
         /* A fade that has reached full colour is a solid cover (gfx_dc_tags.h); the steps before
          * it stay a blended quad. */
         if (alpha == 255) gDPNoOpTag(gDisplayListHead++, DC_GFX_COVER_BEGIN);
+#endif
+#if defined(TARGET_DC) && DC_FADES
+        if (alpha == 255 || !fade_transition(transData, alpha))
 #endif
         gSPDisplayList(gDisplayListHead++, dl_draw_quad_verts_0123);
 #if defined(TARGET_DC) && DC_COVERS

@@ -250,7 +250,14 @@ void create_task_structure(void) {
 }
 
 /** Starts rendering the scene. */
+#if defined(TARGET_DC) && DC_FADES
+#include "screen_transition.h"
+#endif
+
 void init_render_image(void) {
+#if defined(TARGET_DC) && DC_FADES
+    dc_fade_frame_begin();   // first: the frame's fade, if it gets one (screen_transition.c)
+#endif
     move_segment_table_to_dmem();
     my_rdp_init();
     my_rsp_init();

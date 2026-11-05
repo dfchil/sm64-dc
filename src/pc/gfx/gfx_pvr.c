@@ -201,6 +201,9 @@ static uint32_t sCurBound = 0;   // last select_texture id == upload target
 typedef struct {
     pvr_poly_hdr_t __attribute__((aligned(32))) hdr;
     uint32_t start, count;
+#if DC_FADES
+    uint8_t fade;    // FADE_*: how the frame's fade reaches its vertices (pvr_flush_bucket)
+#endif
 #ifdef DC_PROF_SKIP
     uint8_t is_2d;   // a batch of 2D quads (never shares a batch with 3D under DC_PROF_SKIP)
     uint8_t is_shadow;   // a batch of blob-shadow triangles (gfx_pvr_prof_shadow)
@@ -260,6 +263,158 @@ void gfx_pvr_prof_shadow(int on) {
     }
 }
 #endif
+#if DC_FADES
+// A fade (gfx_dc_tags.h DC_GFX_FADE: the colour C at alpha a over all drawn before its rectangle)
+// through the PVR's fog, which mixes a colour into a polygon's pixels after texturing and before
+// blending. lerp(pixel, C, a) is the fade for any texture mode, and blending keeps it: a blended
+// source over a faded destination is the faded blend (an additive one gains C*a*alpha).
+// * A polygon without the game's fog gets TABLE fog: the table is a everywhere, its colour C.
+// * One with vertex fog (amount f, colour F) keeps it. Its colours fade in its vertices
+//   (rgb*(1-a) + C*a, the C*a on the offset colour when textured) and the vertex fog colour is
+//   F*(1-a) + C*a: together the fade of the fogged pixel. REPLACE becomes MODULATE with a grey of
+//   1-a; DECAL's texel cannot be scaled, so a fogged DECAL polygon stays a little bright.
+// The fog registers are read while the PVR renders, and it renders the frame before while this one
+// is sent: they are written at the end of the frame if that render is done, else by its render-done
+// interrupt, which comes before this frame's render can begin (fade_registers).
+#define FADE_NONE        0
+#define FADE_TABLE       1   // the header's fog is the table's now
+#define FADE_VTX         2   // vertex fog kept, untextured: the vertex's base colour fades
+#define FADE_VTX_TEX     3   // the same, textured: base and offset colour fade, C*a on the offset
+#define FADE_VTX_REPLACE 4   // FADE_VTX_TEX, its REPLACE now MODULATE with a white base
+static uint8_t sFadeOn, sFadeFrame;   // a fade now / this frame
+static uint32_t sFadeRgba;            // 0xRRGGBBAA
+static uint8_t sFadeKeep[256];        // c * (255 - a) / 255, rounded down
+static uint32_t sFadeAdd;             // C * a / 255 as 0x00RRGGBB, rounded down: no carry with keep
+static uint8_t sHdrFade;              // FADE_* of the header pvr_compile_header made last
+static uint8_t sOpFade;               // FADE_* of the live OP header
+static uint32_t sFogColor;            // the game's vertex fog colour, as the register takes it
+static uint32_t sFogRegVertex, sFogRegTable;   // what the registers hold for this frame (sFogRegValid)
+static uint8_t sFogRegValid;          // 1 vertex colour, 2 table colour and table
+static uint8_t sFogTableUsed;         // a header of this frame has table fog
+static uint8_t sFogWant;              // what fade_write writes: 1 vertex colour, 2 the table's
+static volatile uint8_t sFogPending;  // fade_write waits for the render running now to end
+static volatile uint32_t sRendersDone;   // render-done interrupts (fade_render_done)
+static uint32_t sRendersBegun;        // scenes whose render has begun: one each frame start
+static uint8_t sSceneSent;            // this frame's scene goes to the PVR
+static asic_evt_handler_entry_t sKosRenderDone;   // KOS's handler, called after ours
+
+static inline uint32_t fade_rgb(uint32_t c) {
+    return (uint32_t) sFadeKeep[c >> 16 & 0xff] << 16 | (uint32_t) sFadeKeep[c >> 8 & 0xff] << 8 |
+           sFadeKeep[c & 0xff];
+}
+
+// The fade's change to a header just compiled; FADE_* for its vertices.
+static uint8_t fade_header(pvr_poly_hdr_t *h) {
+    if (!sFadeOn) return FADE_NONE;
+    if (h->m2.fog_type != PVR_FOG_VERTEX) {
+        h->m2.fog_type = PVR_FOG_TABLE;
+        sFogTableUsed = 1;
+        return FADE_TABLE;
+    }
+    if (!h->m0.txr_en) return FADE_VTX;
+    if (h->m2.shading != PVR_TXRENV_REPLACE) return FADE_VTX_TEX;
+    h->m2.shading = PVR_TXRENV_MODULATE;
+    return FADE_VTX_REPLACE;
+}
+
+// A vertex of a FADE_VTX* batch, faded in a copy (the store queues cannot be read back).
+static void __attribute__((noinline)) fade_vertex(pvr_vertex_t *v, uint8_t mode) {
+    uint32_t base = mode == FADE_VTX_REPLACE ? v->argb | 0x00ffffffu : v->argb;
+    base = (base & 0xff000000u) | fade_rgb(base);
+    uint32_t off = (v->oargb & 0xff000000u) | fade_rgb(v->oargb);
+    if (mode == FADE_VTX) base += sFadeAdd;
+    else off += sFadeAdd;
+    v->argb = base;
+    v->oargb = off;
+}
+
+// The frame's fade starts (gfx_retro_dc.c gfx_dc_tag): every header from here on takes it.
+void gfx_pvr_fade_begin(uint32_t rgba) {
+    uint32_t a = rgba & 0xff;
+    sFadeRgba = rgba;
+    sFadeOn = sFadeFrame = 1;
+    for (uint32_t c = 0; c < 256; c++) sFadeKeep[c] = (uint8_t) (c * (255 - a) / 255);
+    sFadeAdd = ((rgba >> 24) * a / 255) << 16 | ((rgba >> 16 & 0xff) * a / 255) << 8 |
+               (rgba >> 8 & 0xff) * a / 255;
+    // The background plane is no polygon (KOS draws it at the render's start): faded here.
+    extern int clear_color;
+    float bg[3];
+    bg[0] = ((clear_color >> 11) & 0x1F) * (1.0f / 31.0f);
+    bg[1] = ((clear_color >> 6) & 0x1F) * (1.0f / 31.0f);
+    bg[2] = ((clear_color >> 1) & 0x1F) * (1.0f / 31.0f);
+    const float fa = a * (1.0f / 255.0f);
+    pvr_set_bg_color(bg[0] + ((rgba >> 24) * (1.0f / 255.0f) - bg[0]) * fa,
+                     bg[1] + ((rgba >> 16 & 0xff) * (1.0f / 255.0f) - bg[1]) * fa,
+                     bg[2] + ((rgba >> 8 & 0xff) * (1.0f / 255.0f) - bg[2]) * fa);
+    pvr_mark_dirty();
+}
+
+// Where the fade's rectangle was: what follows is drawn as it is (the pause menu over its shade).
+void gfx_pvr_fade_end(void) {
+    sFadeOn = 0;
+    pvr_mark_dirty();
+}
+
+// Writes sFogRegVertex and sFogRegTable as sFogWant says.
+static void fade_write(void) {
+    if (sFogWant & 1) PVR_SET(PVR_FOG_VERTEX_COLOR, sFogRegVertex);
+    if (sFogWant & 2) {
+        const uint32_t a = sFogRegTable & 0xff;
+        PVR_SET(PVR_FOG_TABLE_COLOR, 0xff000000u | sFogRegTable >> 8);
+        for (uint32_t i = 0; i < 128; i++) PVR_SET(PVR_FOG_TABLE_BASE + i * 4, a << 8 | a);
+    }
+}
+
+// The TSP finished a render (interrupt context): the next frame's fog registers, if they wait.
+static void fade_render_done(uint32_t code, UNUSED void *data) {
+    if (sFogPending) {
+        fade_write();
+        sFogPending = 0;
+    }
+    sRendersDone++;
+    if (sKosRenderDone.hdl != NULL) sKosRenderDone.hdl(code, sKosRenderDone.data);
+}
+
+// pvr_post_init: after each pvr_init, which hooks KOS's own handler again.
+static void fade_hook_render_done(void) {
+    asic_evt_handler_entry_t old = asic_evt_set_handler(ASIC_EVT_PVR_RENDERDONE_TSP, fade_render_done, NULL);
+    if (old.hdl != fade_render_done) sKosRenderDone = old;
+    sFogPending = 0;
+    sFogRegValid = 0;   // pvr_init's values: written again at the frame's end
+    sRendersBegun = sRendersDone;
+    sSceneSent = 0;
+}
+
+// gfx_pvr_start_frame, once the PVR takes this frame (pvr_wait_ready: the frame before renders).
+static void fade_frame_start(void) {
+    if (sSceneSent) sRendersBegun++;
+    if (sRendersBegun < sRendersDone) sRendersBegun = sRendersDone;   // a scene not of gfx_pvr
+    sSceneSent = 0;
+    sFadeOn = sFadeFrame = 0;   // until the display list's DC_GFX_FADE
+    sFogTableUsed = 0;
+}
+
+// gfx_pvr_end_frame: the fog registers this frame renders with.
+static void fade_registers(void) {
+    uint32_t vtx = sFogColor;
+    if (sFadeFrame) vtx = (vtx & 0xff000000u) | (fade_rgb(vtx) + sFadeAdd);
+    const int table = sFadeFrame && sFogTableUsed;
+    uint8_t want = 0;
+    if (!(sFogRegValid & 1) || vtx != sFogRegVertex) want |= 1;
+    if (table && (!(sFogRegValid & 2) || sFadeRgba != sFogRegTable)) want |= 2;
+    sSceneSent = 1;
+    if (!want) return;
+    sFogRegVertex = vtx;
+    if (want & 2) sFogRegTable = sFadeRgba;
+    sFogRegValid |= want;
+    const irq_mask_t irq = irq_disable();
+    sFogWant = want;
+    if (sRendersBegun > sRendersDone) sFogPending = 1;   // the frame before still renders
+    else fade_write();
+    irq_restore(irq);
+}
+#endif
+
 // Compile one of the SIX base headers ONCE via the official pvr_poly_cxt+pvr_poly_compile, so
 // every PER-LIST field (list_type/alpha/txralpha/blend defaults) is correct for this list. The
 // textured bases seed from whatever texture is bound on first use; their texture-specific fields
@@ -291,7 +446,7 @@ static void pvr_ensure_base(int textured, int kind, int list) {
 // current state while the segment draws.
 static const pvr_poly_hdr_t *sForcedHdr[3];
 
-static void pvr_compile_header(pvr_poly_hdr_t *out, int kind) {
+static void pvr_compile_header_raw(pvr_poly_hdr_t *out, int kind) {
     if (sForcedHdr[kind] != NULL) {
         *out = *sForcedHdr[kind];
         return;
@@ -334,6 +489,14 @@ static void pvr_compile_header(pvr_poly_hdr_t *out, int kind) {
     }
 }
 
+// The header the current state (or the native renderer's forced header) draws with, with the fade.
+static void pvr_compile_header(pvr_poly_hdr_t *out, int kind) {
+    pvr_compile_header_raw(out, kind);
+#if DC_FADES
+    sHdrFade = fade_header(out);
+#endif
+}
+
 #ifdef DC_PROF_LISTS
 // Records where a new PT/TR batch's alpha comes from (PVR texenv: REPLACE and MODULATE take the
 // texel's alpha, DECAL the vertex's, MODULATEALPHA both; untextured, the vertex's).
@@ -372,6 +535,9 @@ static void pvr_append(PvrBucket *b, int kind, const dc_fast_t *tris, size_t n) 
         if (b->nbatch >= b->max_batch) { if (sDropB++ < 8) printf("PVR_DROP batch %d\n", kind); return; }
         b->cur = b->nbatch++;
         pvr_compile_header(&b->batch[b->cur].hdr, kind);
+#if DC_FADES
+        b->batch[b->cur].fade = sHdrFade;
+#endif
         PROF_BATCH_ALPHA(&b->batch[b->cur], kind);
 #ifdef DC_PROF_SKIP
         b->batch[b->cur].is_2d = 0;
@@ -404,6 +570,9 @@ dc_fast_t *pvr_reserve(int kind, size_t n) {
         if (b->nbatch >= b->max_batch) { if (sDropB++ < 8) printf("PVR_DROP batch %d\n", kind); return NULL; }
         b->cur = b->nbatch++;
         pvr_compile_header(&b->batch[b->cur].hdr, kind);
+#if DC_FADES
+        b->batch[b->cur].fade = sHdrFade;
+#endif
         PROF_BATCH_ALPHA(&b->batch[b->cur], kind);
 #ifdef DC_PROF_SKIP
         b->batch[b->cur].is_2d = 0;
@@ -592,6 +761,18 @@ static void pvr_flush_bucket(PvrBucket *b) {
         const uint32_t hh = hash_header(b == &sTR ? PVR_KIND_TR : PVR_KIND_PT, &bt->hdr);
 #endif
         const pvr_vertex_t *src = &b->verts[bt->start];
+#if DC_FADES
+        if (bt->fade >= FADE_VTX) {
+            for (uint32_t v = 0; v < bt->count; v++) {
+                pvr_vertex_t t = src[v];
+                fade_vertex(&t, bt->fade);
+                pvr_vertex_t *vp = sq_next(&addr);
+                *vp = t;
+                sq_send(vp);
+            }
+            continue;
+        }
+#endif
         for (uint32_t v = 0; v < bt->count; v++) {
             pvr_vertex_t *vp = sq_next(&addr);
             *vp = src[v];
@@ -877,9 +1058,13 @@ void gfx_pvr_set_fog(uint8_t enabled) {
 // Vertex fog colour register (0x00b4). Global, read at render time — write it directly
 // (KOS's pvr_fog_vertex_color is a stub). Not part of the poly header, so no dirty needed.
 void gfx_pvr_set_fog_color(uint8_t r, uint8_t g, uint8_t b, uint8_t a) {
+#if DC_FADES
+    sFogColor = (uint32_t) a << 24 | (uint32_t) r << 16 | (uint32_t) g << 8 | b;   // fade_registers writes it
+#else
     PVR_SET(PVR_FOG_VERTEX_COLOR,
             PVR_PACK_COLOR(a * (1.0f / 255.0f), r * (1.0f / 255.0f),
                            g * (1.0f / 255.0f), b * (1.0f / 255.0f)));
+#endif
 }
 static void gfx_pvr_set_viewport(UNUSED int x, UNUSED int y, UNUSED int w, UNUSED int h) { /* front-end SW viewport */ }
 static void gfx_pvr_set_scissor(UNUSED int x, UNUSED int y, UNUSED int w, UNUSED int h)  { /* front-end SW scissor */ }
@@ -1007,7 +1192,7 @@ static void prof_count_bucket(const PvrBucket *b, int kind) {
 // gives (gfx_pvr_header_for) and later drawn with that header (gfx_pvr_native_header) without the
 // state; gfx_pvr_native_end hands the lists back to the current state.
 void gfx_pvr_header_for(int kind, pvr_poly_hdr_t *out) {
-    pvr_compile_header(out, kind);
+    pvr_compile_header_raw(out, kind);   // kept: a fade reaches it when it is drawn
 }
 
 // (depth_test: the header has it as its depth compare here; the host's needs it apart.)
@@ -1028,6 +1213,9 @@ static inline void pvr_emit_op_header(void) {
     if (!sOpDirty) return;
     pvr_poly_hdr_t __attribute__((aligned(32))) hdr;
     pvr_compile_header(&hdr, PVR_KIND_OP);
+#if DC_FADES
+    sOpFade = sHdrFade;
+#endif
     HASH_OP_HEADER(&hdr);
     pvr_poly_hdr_t *hp = (pvr_poly_hdr_t *) pvr_dr_target(sDrState);
     *hp = hdr;
@@ -1044,6 +1232,13 @@ void pvr_submit_op(const dc_fast_t *tris, size_t n) {
     pvr_emit_op_header();
     for (size_t i = 0; i < n; i++) {
         pvr_vertex_t *v = (pvr_vertex_t *) pvr_dr_target(sDrState);
+#if DC_FADES
+        if (sOpFade >= FADE_VTX) {
+            pvr_vertex_t t = *(const pvr_vertex_t *) &tris[i];
+            fade_vertex(&t, sOpFade);
+            *v = t;
+        } else
+#endif
         *v = *(const pvr_vertex_t *) &tris[i];
         v->flags = ((i % 3) == 2) ? PVR_CMD_VERTEX_EOL : PVR_CMD_VERTEX;
         HASH_VERTEX(PVR_KIND_OP, sHashOpHdr, &tris[i], ((i % 3) == 2) ? PVR_CMD_VERTEX_EOL : PVR_CMD_VERTEX);
@@ -1056,11 +1251,26 @@ void pvr_submit_op(const dc_fast_t *tris, size_t n) {
 #endif
 }
 
+#if DC_FADES
+// pvr_submit_op_tri under a fade of vertex-fogged polygons, out of .sub0.
+static void __attribute__((noinline, cold)) op_tri_faded(const dc_fast_t *a, const dc_fast_t *b,
+                                                         const dc_fast_t *c) {
+    const dc_fast_t t[3] = { *a, *b, *c };
+    pvr_submit_op(t, 3);   // fades its vertices
+}
+#endif
+
 // One triangle from three separately stored vertices (the front-end's baked-vertex cache).
 __attribute__((section(".sub0.sm64_hot"))) void pvr_submit_op_tri(const dc_fast_t *a, const dc_fast_t *b,
                                                                    const dc_fast_t *c) {
     if (PROF_SKIP(SKIP_3D_OP) || (PROF_SKIP(SKIP_SKY) && a->vert.z < 0.0001f)) return;
     pvr_emit_op_header();
+#if DC_FADES
+    if (__builtin_expect(sOpFade >= FADE_VTX, 0)) {
+        op_tri_faded(a, b, c);
+        return;
+    }
+#endif
     uint32_t addr = pvr_dr_addr;
     pvr_vertex_t *v;
     v = sq_next(&addr);
@@ -1149,6 +1359,13 @@ static void gfx_pvr_draw_quad_2d(void *quad, UNUSED size_t buf_vbo_len, UNUSED s
         pvr_emit_op_header();
         for (int i = 0; i < 4; i++) {
             pvr_vertex_t *o = (pvr_vertex_t *) pvr_dr_target(sDrState);
+#if DC_FADES
+            if (sOpFade >= FADE_VTX) {
+                pvr_vertex_t t = *(const pvr_vertex_t *) &q[i];
+                fade_vertex(&t, sOpFade);
+                *o = t;
+            } else
+#endif
             *o = *(const pvr_vertex_t *) &q[i];
             o->flags = (i == 3) ? PVR_CMD_VERTEX_EOL : PVR_CMD_VERTEX;
             HASH_VERTEX(PVR_KIND_OP, sHashOpHdr, &q[i], (i == 3) ? PVR_CMD_VERTEX_EOL : PVR_CMD_VERTEX);
@@ -1168,6 +1385,9 @@ static void gfx_pvr_draw_quad_2d(void *quad, UNUSED size_t buf_vbo_len, UNUSED s
         if (b->nbatch >= b->max_batch) { if (sDropB++ < 8) printf("PVR_DROP batch %d\n", kind); return; }
         b->cur = b->nbatch++;
         pvr_compile_header(&b->batch[b->cur].hdr, kind);
+#if DC_FADES
+        b->batch[b->cur].fade = sHdrFade;
+#endif
         PROF_BATCH_ALPHA(&b->batch[b->cur], kind);
 #ifdef DC_PROF_SKIP
         b->batch[b->cur].is_2d = 1;
@@ -1268,6 +1488,9 @@ static void pvr_post_init(void) {
     pvr_set_bg_color(0.0f, 0.0f, 0.0f);
 
     // Headers are compiled lazily per depth/texture/list state at draw time.
+#if DC_FADES
+    fade_hook_render_done();
+#endif
 }
 
 #if DC_FSAA
@@ -1410,6 +1633,9 @@ static void gfx_pvr_start_frame(void) {
     cur_frame_persp = 0;
     gfx_frame_invw_max = 0.0f;   // the frame's world 1/w bound (transition covers)
     has_done_3d = 0;   // reset: no 3D drawn yet this frame (title bg -> far until flag)
+#if DC_FADES
+    fade_frame_start();
+#endif
 }
 
 #if DC_ENJ_RENDER
@@ -1476,6 +1702,9 @@ void gfx_pvr_render_frame(void (*op_renderer)(void *data), void *data) {
 static void gfx_pvr_end_frame(void) {
 #if !DC_ENJ_RENDER
     pvr_list_finish();   // close the OP list (opened once this frame)
+#endif
+#if DC_FADES
+    fade_registers();
 #endif
 #ifdef DC_PROF_LISTS
     prof_count_bucket(&sPunch, PVR_KIND_PT);

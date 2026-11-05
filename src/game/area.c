@@ -404,12 +404,15 @@ static void draw_credits_window_mask(Vp *window) {
 
 #ifdef DC_PROF_TRANS
 #include "pc/dc_prof.h"
-// The benchmark: every textured transition in turn, closing then opening over the running demo.
+// The benchmark: every textured transition in turn, closing then opening over the running demo,
+// then the colour fades, into and from black and white.
 static void prof_trans_step(void) {
     static const u8 types[] = { WARP_TRANSITION_FADE_INTO_STAR, WARP_TRANSITION_FADE_FROM_STAR,
                                 WARP_TRANSITION_FADE_INTO_CIRCLE, WARP_TRANSITION_FADE_FROM_CIRCLE,
                                 WARP_TRANSITION_FADE_INTO_MARIO, WARP_TRANSITION_FADE_FROM_MARIO,
-                                WARP_TRANSITION_FADE_INTO_BOWSER, WARP_TRANSITION_FADE_FROM_BOWSER };
+                                WARP_TRANSITION_FADE_INTO_BOWSER, WARP_TRANSITION_FADE_FROM_BOWSER,
+                                WARP_TRANSITION_FADE_INTO_COLOR, WARP_TRANSITION_FADE_FROM_COLOR,
+                                WARP_TRANSITION_FADE_INTO_COLOR, WARP_TRANSITION_FADE_FROM_COLOR };
     static u32 step, gap;
 
     if (gWarpTransition.isActive || gCurrDemoInput == NULL) {
@@ -419,10 +422,11 @@ static void prof_trans_step(void) {
     gDcProfSceneTag = 0;
     if (++gap >= 60) {
         u32 t = step++ % ARRAY_COUNT(types);
+        u8 c = t >= 10 ? 0xFF : 0x00;   // the last two fades are white
 
         gap = 0;
-        play_transition(types[t], 45, 0, 0, 0);
-        gDcProfSceneTag = 16 * (t & 1 ? (t >> 1) + 5 : (t >> 1) + 1);
+        play_transition(types[t], 45, c, c, c);
+        gDcProfSceneTag = 16 * (t >= 8 ? t + 1 : t & 1 ? (t >> 1) + 5 : (t >> 1) + 1);
     }
 }
 #endif

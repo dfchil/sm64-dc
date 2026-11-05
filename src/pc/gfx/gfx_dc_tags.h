@@ -23,4 +23,12 @@
  * 20.2 -> 16.0 ms; drawn in PT it was the course's biggest fill (134k pixels a frame). */
 #define DC_GFX_RAIL_TR_BEGIN 0x5241494Cu  /* "RAIL" */
 #define DC_GFX_RAIL_TR_END   0x5241494Eu  /* "RAIN" */
+/* DC_FADES builds: a fade is a full-screen rectangle of one colour at partial alpha over all that
+ * was drawn before it (screen_transition.c dl_transition_color, ingame_menu.c shade_screen). On the
+ * Dreamcast it is not drawn: the PVR's fog mixes its colour into every polygon drawn before it
+ * instead (gfx_pvr.c), which costs no fill. The master display list starts with two G_NOOPs
+ * (dc_fade_frame_begin): DC_GFX_FADE and the colour and alpha as 0xRRGGBBAA when the frame has a
+ * fade, else two plain G_NOOPs. DC_GFX_FADE_END stands where the rectangle was: the fade ends there. */
+#define DC_GFX_FADE      0x46414445u   /* "FADE" */
+#define DC_GFX_FADE_END  0x46414458u   /* "FADX" */
 #endif

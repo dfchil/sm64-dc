@@ -726,7 +726,8 @@ ifeq ($(DC_PROF),1)
   endif
   # DC_PROF_TRANS=1: every textured screen transition in turn during the demos, with a gap between
   # them. Their frames are reported as scenes of their own: area = 16 * n + area, n = 1..8 for
-  # star, circle, Mario and Bowser closing, then opening (area.c).
+  # star, circle, Mario and Bowser closing, then opening, 9..12 for fades into and from black, then
+  # white (area.c).
   ifeq ($(DC_PROF_TRANS),1)
     PLATFORM_CFLAGS += -DDC_PROF_TRANS
   endif
@@ -829,6 +830,10 @@ endif
   # of the polygon meshes in src/game/screen_transition_mesh.h (they need DC_COVERS), for A/B runs.
   DC_MASK_MESH ?= 1
   PLATFORM_CFLAGS += -DDC_MASK_MESH=$(DC_MASK_MESH)
+  # DC_FADES=0: a colour fade or the pause shade draws its full-screen blended rectangle again
+  # instead of fading the frame through the PVR's fog (src/pc/gfx/gfx_dc_tags.h), for A/B runs.
+  DC_FADES ?= 1
+  PLATFORM_CFLAGS += -DDC_FADES=$(DC_FADES)
   PLATFORM_LDFLAGS += -Wl,--section-ordering-file=$(BUILD_DIR)/sm_warm.ld
   # DC_AICAFLOW=1: music and sounds as AICAflow assets (src/pc/audio/sm64_aicaflow.c) from
   # DC_AICAFLOW_ROOT (default /pc/afx), made by tools/aica/sm64_afx.py. No sequencer thread, no
