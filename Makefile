@@ -687,6 +687,27 @@ DC_PT_CHUNK ?= 64
 PLATFORM_CFLAGS += -DDC_PT_CHUNK=$(DC_PT_CHUNK)
 # Above -Os GCC flags stock SM64 code (mario_actions_moving.c) as maybe-uninitialized.
 PLATFORM_CFLAGS += -Wno-error=maybe-uninitialized
+# DC_TAS_MENU=1 (with the debug menu): the movie in two debug menu rows (src/game/tas_slice.c).
+# TAS replay plays the whole run or one section (a star or two, a Bowser) over the player's game
+# from the next level change; Level select puts the pad in a star's level, with the movie's save
+# and state from when it went there. The movie waits until one is chosen. Implies DC_TAS, in any
+# build, and DC_EXACT_LOGIC, which an N64 movie needs to stay in sync. tas.m64 and tas_slices.bin
+# come from DC_TAS_ROOT (default /pc/afx, or DC_AICAFLOW_ROOT when that is set).
+DC_TAS_MENU ?= 0
+ifeq ($(DC_TAS_MENU),1)
+  ifneq ($(DC_DEBUG_MENU),1)
+    $(error DC_TAS_MENU=1 needs the debug menu, DC_DEBUG_MENU=1)
+  endif
+  DC_TAS := 1
+  DC_EXACT_LOGIC := 1
+  DC_TAS_TRACE_EVERY := 0
+  DC_TAS_ROOT ?= $(if $(DC_AICAFLOW_ROOT),$(DC_AICAFLOW_ROOT),/pc/afx)
+  PLATFORM_CFLAGS += -DDC_TAS_MENU -DDC_TAS_ROOT=\"$(DC_TAS_ROOT)\"
+  # A profiling build sets DC_TAS with its own switches below.
+  ifneq ($(DC_PROF),1)
+    PLATFORM_CFLAGS += -DDC_TAS -DDC_TAS_TRACE_EVERY=0
+  endif
+endif
 ifeq ($(DC_PROF),1)
   PLATFORM_CFLAGS += -DDC_PROF -DDC_AUTO_EXIT_SECONDS=$(DC_AUTO_EXIT_SECONDS) -DDC_HANG_SECONDS=$(DC_HANG_SECONDS)
   # DC_PROF_SAMPLE=1: also sample the PC at 500 Hz into /pc/sm64_samples.bin (tools/dc_prof_samples.py)

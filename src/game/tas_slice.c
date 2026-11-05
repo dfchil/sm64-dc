@@ -12,6 +12,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <strings.h>
 
 #include "sm64.h"
 #include "area.h"
@@ -142,6 +143,9 @@ static s16 sEndedAct;
 static s32 sEndedActSelect;           // the movie went through the act selector, the replay doesn't
 static u32 sSlicesExact;
 static FILE *sCapture;
+#ifdef DC_TAS_MENU
+static void tas_menu_build(void);
+#endif
 
 static u32 item_bytes(void) {
     u32 n = 0;
@@ -214,6 +218,9 @@ void tas_slice_setup(const char *captureFile, const char *sliceFile, const char 
         p = *end == ',' ? end + 1 : end;
     }
     printf("TAS: %u slices, playing %u\n", (unsigned) sSliceCount, (unsigned) sPlayCount);
+#ifdef DC_TAS_MENU
+    tas_menu_build();
+#endif
 }
 
 // One item's bytes in a slice.
@@ -250,16 +257,37 @@ s32 tas_slice_first_level(s32 levelNum) {
 
 // The playlist is done: a profiling build reports and exits, the host stops.
 int gTasSlicesDone;
+#ifdef DC_TAS_MENU
+// A replay from the debug menu is done: the movie stops at the next level's init_level, after its
+// end is checked, and the controller plays on from there.
+static s32 sStopAtInit;
+static s32 sMovie = 1;   // 0: the level select's slice, played by the controller from its state
+extern void dc_tas_stop(void);
+#endif
 
 // initiate_warp: once a slice's level is left, the next level change goes to the next slice.
 void tas_slice_warp(s16 *destLevel, s16 *destArea, s16 *destWarpNode, s32 *arg) {
+#ifdef DC_TAS_MENU
+    // A replay the menu could not start in the level (tas_menu_level_change): from this level change.
+    if (sSlices != NULL && sPlayNext == 0 && sPlayCount > 0 && *destLevel != gCurrLevelNum
+        && (sPending = next_slice()) != NULL) {
+        *destLevel = sPending->warp.levelNum;
+        *destArea = sPending->warp.areaIdx;
+        *destWarpNode = sPending->warp.nodeId;
+        *arg = (s32) sPending->warp.arg;
+        D_8032C9E0 = 1;
+        return;
+    }
+#endif
     if (sSlices == NULL || sPlayNext == 0 || *destLevel == gCurrLevelNum) {
         return;
     }
     if (sPlayNext >= sPlayCount && !gTasSlicesDone) {
         gTasSlicesDone = 1;
         printf("TAS: slices done\n");
-#if defined(DC_PROF) && !defined(TARGET_PC_ENDJINN)
+#ifdef DC_TAS_MENU
+        sStopAtInit = !sPlayOn;
+#elif defined(DC_PROF) && !defined(TARGET_PC_ENDJINN)
         if (!sPlayOn) {
             dc_prof_request_exit();
         }
@@ -367,6 +395,18 @@ void tas_slice_init_level(void) {
         fwrite(pad, slice_bytes() - sizeof(h) - item_bytes(), 1, sCapture);
         fflush(sCapture);
     }
+#ifdef DC_TAS_MENU
+    if (sStopAtInit) {   // the replay's last slice ended: checked, and the controller takes over
+        if (sMovie) {
+            slice_check_end();
+        }
+        sEnded = -1;
+        dc_tas_stop();
+        sStopAtInit = 0;
+        sPlayCount = sPlayNext = 0;
+        sPlaying = -1;
+    }
+#endif
     if (sPending != NULL) {
         slice_check_end();
         const u8 *p = (const u8 *) (sPending + 1);
@@ -376,9 +416,418 @@ void tas_slice_init_level(void) {
         }
         sWarpDest = sPending->warp;
         tas_random_seed16_set(sPending->seed);
+#ifdef DC_TAS_MENU
+        if (!sMovie) {
+            dc_tas_stop();   // the level select's: the controller plays from here
+        } else
+#endif
         dc_tas_seek(sPending->sample);
         sPending = NULL;
     }
 }
+
+#ifdef DC_TAS_MENU
+// make DC_TAS_MENU=1: the movie in the debug menu. A section is a slice that collects a star or a
+// few, or a Bowser fight; what it collects is the difference between its save data and the next
+// slice's. A replay plays over the player's game from the next level change (at once in a level),
+// and gives the controller back where it ends. From the first replay on, saves stay in memory, so
+// the movie's save never reaches the VMU.
+#include "course_table.h"
+#include "level_table.h"
+#include "memory.h"
+#include "segment2.h"
+
+#define TAS_SECTIONS 160
+#define SECTION_STARS 4
+static void tas_level_build(void);
+
+struct TasSection {
+    u16 slice;
+    u8 course;                      // where its stars are: COURSE_NONE for the castle's
+    u8 count;                       // stars in star[]
+    u8 star[SECTION_STARS][2];      // course, star index (0-6; the castle's: 0-2 Toad, 3-4 MIPS)
+    s16 before;                     // Mario's stars when it starts
+    s16 after;
+    char label[24];
+};
+
+static struct TasSection sSections[TAS_SECTIONS];
+static const char *sMenuLabels[TAS_SECTIONS + 2];
+static s32 sSectionCount;
+static char sHelp[320];
+extern s32 gTasSaveInMemory;
+extern unsigned int dc_tas_samples(void);
+extern s32 tas_menu_level_change(const struct WarpDest *dest);   // level_update.c
+
+static const char *const sCourseShort[] = {
+    "Castle", "BoB", "WF", "JRB", "CCM", "BBH", "HMC", "LLL", "SSL", "DDD", "SL", "WDW", "TTM",
+    "THI", "TTC", "RR", "BitDW", "BitFS", "BitS", "PSS", "CotMC", "TotWC", "VCutM", "WMotR", "SA",
+    "End",
+};
+
+static void slice_save(const struct SliceHeader *s, struct SaveFile *out) {
+    struct SaveBuffer save;
+    s16 file;
+    memcpy(&save, slice_item(s, &gSaveBuffer), sizeof(save));
+    memcpy(&file, slice_item(s, &gCurrSaveFileNum), sizeof(file));
+    *out = save.files[file >= 1 && file <= NUM_SAVE_FILES ? file - 1 : 0][0];
+}
+
+static s16 slice_stars(const struct SliceHeader *s) {
+    s16 stars;
+    memcpy(&stars, slice_item(s, &gMarioStates[0].numStars), sizeof(stars));
+    return stars;
+}
+
+// The movie's time at a sample: the game reads the controller once a frame, 30 a second.
+static u32 sample_seconds(u32 sample) {
+    return sample / 30;
+}
+
+static void section_add_star(struct TasSection *t, u8 course, u8 star) {
+    if (t->count < SECTION_STARS) {
+        t->star[t->count][0] = course;
+        t->star[t->count][1] = star;
+    }
+    t->count++;
+}
+
+static void tas_menu_build(void) {
+    sMenuLabels[0] = "Off";
+    sMenuLabels[1] = "All 120 stars";
+    sSectionCount = 0;
+    for (u32 i = 0; i < sSliceCount && sSectionCount < TAS_SECTIONS; i++) {
+        const struct SliceHeader *s = slice_at(i);
+        const struct SliceHeader *e = i + 1 < sSliceCount ? slice_at(i + 1) : NULL;
+        struct SaveFile was, now;
+        slice_save(s, &was);
+        if (e != NULL) {
+            slice_save(e, &now);
+        } else {
+            now = was;
+        }
+        struct TasSection *t = &sSections[sSectionCount];
+        memset(t, 0, sizeof(*t));
+        t->slice = (u16) i;
+        t->course = (u8) gLevelToCourseNumTable[s->warp.levelNum - 1];
+        t->before = slice_stars(s);
+        t->after = e != NULL ? slice_stars(e) : t->before;
+        for (u8 c = 0; c < COURSE_COUNT; c++) {
+            u8 got = now.courseStars[c] & ~was.courseStars[c] & 0x7F;
+            for (u8 b = 0; b < 7; b++) {
+                if (got >> b & 1) section_add_star(t, (u8) (c + 1), b);
+            }
+        }
+        u8 castle = (u8) ((now.flags & ~was.flags) >> 24 & 0x7F);
+        for (u8 b = 0; b < 7; b++) {
+            if (castle >> b & 1) section_add_star(t, COURSE_NONE, b);
+        }
+        s32 level = s->warp.levelNum;
+        s32 bowser = level == LEVEL_BOWSER_1 ? 1 : level == LEVEL_BOWSER_2 ? 2 : level == LEVEL_BOWSER_3 ? 3 : 0;
+        if (t->count == 0 && !bowser) {
+            continue;
+        }
+        // "BoB 1", "WF 3+4", "SSL 100", "Toad 2", "Bowser 1".
+        char *l = t->label;
+        size_t room = sizeof(t->label);
+        if (bowser) {
+            snprintf(l, room, "Bowser %d", (int) bowser);
+        } else {
+            u8 course = t->star[0][0];
+            int n = snprintf(l, room, "%s ", course == COURSE_NONE ? (t->star[0][1] < 3 ? "Toad" : "MIPS")
+                                                                   : sCourseShort[course]);
+            for (u8 k = 0; k < t->count && k < SECTION_STARS && n > 0 && (size_t) n < room; k++) {
+                u8 star = t->star[k][1];
+                if (course == COURSE_NONE) {
+                    star = star < 3 ? star : (u8) (star - 3);
+                }
+                if (star == 6) {
+                    n += snprintf(l + n, room - (size_t) n, k ? "+100" : "100");
+                } else {
+                    n += snprintf(l + n, room - (size_t) n, k ? "+%d" : "%d", star + 1);
+                }
+            }
+        }
+        sMenuLabels[2 + sSectionCount] = t->label;
+        sSectionCount++;
+    }
+    tas_level_build();
+}
+
+s32 tas_menu_count(void) {
+    return sSlices != NULL ? 2 + sSectionCount : 0;
+}
+
+const char *const *tas_menu_labels(void) {
+    return sMenuLabels;
+}
+
+// The game's own text (the courses' and the acts' names, in its character set) as ASCII, in title
+// case: "BIG BOB-OMB ON THE SUMMIT" -> "Big Bob-omb on the Summit".
+static size_t game_text(char *out, size_t room, const u8 *text) {
+    static const char *const small[] = { "a", "an", "and", "at", "by", "for", "in", "into", "of",
+                                         "on", "onto", "the", "to", "with" };
+    size_t n = 0;
+    while (*text == 0x9E || *text <= 0x09) {   // the course number before its name
+        text++;
+    }
+    size_t word = 0;
+    for (; *text != 0xFF && n + 1 < room; text++) {
+        u8 c = *text;
+        char ch = c <= 0x09 ? (char) ('0' + c) : c <= 0x23 ? (char) ('A' + c - 0x0A)
+                : c <= 0x3D ? (char) ('a' + c - 0x24) : c == 0x3E ? '\'' : c == 0x3F ? '.'
+                : c == 0x6F ? ',' : c == 0x9E ? ' ' : c == 0x9F ? '-' : c == 0xE5 ? '&'
+                : c == 0xE6 ? ':' : c == 0xF2 ? '!' : c == 0xF4 ? '?' : 0;
+        if (!ch) {
+            continue;
+        }
+        int first = n == word;
+        if (ch >= 'A' && ch <= 'Z' && !first) {
+            ch = (char) (ch - 'A' + 'a');
+        }
+        out[n++] = ch;
+        if (ch == ' ' || (ch == '-' && !(text[1] == 0x18 && text[2] == 0x16 && text[3] == 0x0B))) {
+            word = n;   // a new word, but "Bob-omb"
+        }
+    }
+    out[n] = 0;
+    // Small words in lower case, but the first.
+    for (size_t k = 1; k < n; k++) {
+        if (out[k - 1] != ' ') continue;
+        size_t end = k;
+        while (end < n && out[end] != ' ') end++;
+        for (u32 w = 0; w < ARRAY_COUNT(small); w++) {
+            size_t len = strlen(small[w]);
+            if (len == end - k && strncasecmp(out + k, small[w], len) == 0) {
+                out[k] = (char) (out[k] | 0x20);
+            }
+        }
+    }
+    return n;
+}
+
+static size_t star_name(char *out, size_t room, u8 course, u8 star) {
+    if (course == COURSE_NONE) {
+        return (size_t) snprintf(out, room, star < 3 ? "Toad's star %d" : "MIPS %d", star < 3 ? star + 1 : star - 2);
+    }
+    if (COURSE_IS_MAIN_COURSE(course) && star < 6) {
+        void **acts = segmented_to_virtual(seg2_act_name_table);
+        return game_text(out, room, segmented_to_virtual(acts[(course - 1) * 6 + star]));
+    }
+    if (COURSE_IS_MAIN_COURSE(course)) {
+        return (size_t) snprintf(out, room, "100 coins");
+    }
+    if (course == COURSE_PSS) {
+        return (size_t) snprintf(out, room, star == 0 ? "the slide" : "under 21 seconds");
+    }
+    return (size_t) snprintf(out, room, "8 red coins");
+}
+
+static size_t course_name(char *out, size_t room, u8 course) {
+    if (course == COURSE_NONE) {
+        return (size_t) snprintf(out, room, "The castle");
+    }
+    void **courses = segmented_to_virtual(seg2_course_name_table);
+    return game_text(out, room, segmented_to_virtual(courses[course - 1]));
+}
+
+const char *tas_menu_help(s32 entry) {
+    u32 total = sample_seconds(dc_tas_samples());
+    if (entry <= 0 || entry >= tas_menu_count()) {
+        snprintf(sHelp, sizeof(sHelp),
+                 "The 120-star TAS, a star or two or the whole run, over your game from the next "
+                 "level change. Saves stay off the VMU from then on. A here: the pad plays again.");
+        return sHelp;
+    }
+    if (entry == 1) {
+        snprintf(sHelp, sizeof(sHelp),
+                 "The whole 120-star run, from the castle grounds to the credits: %d sections, "
+                 "%u:%02u:%02u. A: play it.",
+                 (int) sSectionCount, (unsigned) (total / 3600), (unsigned) (total / 60 % 60),
+                 (unsigned) (total % 60));
+        return sHelp;
+    }
+    const struct TasSection *t = &sSections[entry - 2];
+    const struct SliceHeader *s = slice_at(t->slice);
+    u32 end = t->slice + 1u < sSliceCount ? slice_at(t->slice + 1u)->sample : dc_tas_samples();
+    u32 length = sample_seconds(end - s->sample), at = sample_seconds(s->sample);
+    s32 level = s->warp.levelNum;
+    u8 course = t->count ? t->star[0][0] : (u8) gLevelToCourseNumTable[level - 1];
+    size_t n = course_name(sHelp, sizeof(sHelp), course);
+    if (level == LEVEL_BOWSER_1 || level == LEVEL_BOWSER_2 || level == LEVEL_BOWSER_3) {
+        n += (size_t) snprintf(sHelp + n, sizeof(sHelp) - n, level == LEVEL_BOWSER_3 ? ": the last fight"
+                                                                                     : ": the fight for the key");
+    }
+    for (u8 k = 0; k < t->count && k < SECTION_STARS && n + 4 < sizeof(sHelp); k++) {
+        n += (size_t) snprintf(sHelp + n, sizeof(sHelp) - n, k ? ", " : ": ");
+        n += star_name(sHelp + n, sizeof(sHelp) - n, t->star[k][0], t->star[k][1]);
+    }
+    if (n + 1 < sizeof(sHelp)) {
+        snprintf(sHelp + n, sizeof(sHelp) - n,
+                 "\n%d star%s, %d to %d of 120. %u:%02u long, at %u:%02u:%02u of the run.\nSection %u "
+                 "of the movie. A: play it.",
+                 (int) t->count, t->count == 1 ? "" : "s", (int) t->before, (int) t->after,
+                 (unsigned) (length / 60), (unsigned) (length % 60), (unsigned) (at / 3600),
+                 (unsigned) (at / 60 % 60), (unsigned) (at % 60), (unsigned) t->slice);
+    }
+    return sHelp;
+}
+
+static void menu_stop(void) {
+    sPending = NULL;
+    sPlayCount = sPlayNext = 0;
+    sPlaying = sEnded = -1;
+    sStopAtInit = 0;
+    gTasSlicesDone = 0;
+    sMovie = 1;
+    dc_tas_stop();
+}
+
+// Plays the playlist from the next level change: in a level at once (tas_menu_level_change), from
+// the title through the file select's first level. movie 0: the controller plays the slice.
+static void menu_play(s32 movie, const char *what) {
+    sMovie = movie;
+    gTasSaveInMemory = 1;
+    printf("TAS: %s of %s armed\n", movie ? "replay" : "level", what);
+    // In a level now: its warp goes to the slice's level, whose init_level restores the rest.
+    struct SliceHeader *s = slice_at((u32) sPlaylist[0]);
+    if (tas_menu_level_change(&s->warp)) {
+        sPending = next_slice();
+        D_8032C9E0 = 1;   // no act selector: the slice has the act
+    }
+}
+
+// Entry 0 gives the game back to the controller, 1 plays the whole run, the others a section.
+void tas_menu_start(s32 entry) {
+    menu_stop();
+    if (entry <= 0 || entry >= tas_menu_count()) {
+        printf("TAS: the controller plays\n");
+        return;
+    }
+    if (entry == 1) {
+        for (u32 i = 0; i < sSliceCount && sPlayCount < ARRAY_COUNT(sPlaylist); i++) {
+            sPlaylist[sPlayCount++] = (s32) i;
+        }
+        sPlayOn = 1;
+    } else {
+        sPlaylist[sPlayCount++] = sSections[entry - 2].slice;
+        sPlayOn = 0;
+    }
+    menu_play(1, sMenuLabels[entry]);
+}
+
+// The level select: each of the 120 stars (and the Bowser fights) by course, played by the
+// controller from the state the movie had when it entered that level for it.
+#define TAS_LEVELS (120 + 3 + 8)
+
+struct TasLevel {
+    u16 section;
+    u8 course, star;   // as in struct TasSection; star 7 + n for Bowser n
+};
+
+static struct TasLevel sLevels[TAS_LEVELS];
+static char sLevelText[TAS_LEVELS][16];
+static const char *sLevelLabels[TAS_LEVELS + 1];
+static s32 sLevelCount;
+
+// Course order, then star: the castle's stars after the courses, the Bowser fights last.
+static u32 level_key(const struct TasLevel *l) {
+    return (l->star >= 8 ? 40u : l->course == COURSE_NONE ? 30u : l->course) * 16u + l->star;
+}
+
+static void level_add(u16 section, u8 course, u8 star) {
+    if (sLevelCount >= TAS_LEVELS) {
+        return;
+    }
+    struct TasLevel l = { section, course, star };
+    s32 at = sLevelCount++;
+    while (at > 0 && level_key(&sLevels[at - 1]) > level_key(&l)) {
+        sLevels[at] = sLevels[at - 1];
+        at--;
+    }
+    sLevels[at] = l;
+}
+
+static void tas_level_build(void) {
+    sLevelCount = 0;
+    for (s32 i = 0; i < sSectionCount; i++) {
+        const struct TasSection *t = &sSections[i];
+        for (u8 k = 0; k < t->count && k < SECTION_STARS; k++) {
+            level_add((u16) i, t->star[k][0], t->star[k][1]);
+        }
+        s32 level = slice_at(t->slice)->warp.levelNum;
+        if (level == LEVEL_BOWSER_1 || level == LEVEL_BOWSER_2 || level == LEVEL_BOWSER_3) {
+            level_add((u16) i, (u8) gLevelToCourseNumTable[level - 1],
+                      (u8) (7 + (level == LEVEL_BOWSER_1 ? 1 : level == LEVEL_BOWSER_2 ? 2 : 3)));
+        }
+    }
+    sLevelLabels[0] = "Off";
+    for (s32 i = 0; i < sLevelCount; i++) {
+        const struct TasLevel *l = &sLevels[i];
+        u8 star = l->star;
+        if (star >= 8) {
+            snprintf(sLevelText[i], sizeof(sLevelText[i]), "Bowser %d", star - 7);
+        } else if (l->course == COURSE_NONE) {
+            snprintf(sLevelText[i], sizeof(sLevelText[i]), star < 3 ? "Toad %d" : "MIPS %d", star < 3 ? star + 1 : star - 2);
+        } else if (star == 6) {
+            snprintf(sLevelText[i], sizeof(sLevelText[i]), "%s 100", sCourseShort[l->course]);
+        } else {
+            snprintf(sLevelText[i], sizeof(sLevelText[i]), "%s %d", sCourseShort[l->course], star + 1);
+        }
+        sLevelLabels[1 + i] = sLevelText[i];
+    }
+}
+
+s32 tas_level_count(void) {
+    return sSlices != NULL ? 1 + sLevelCount : 0;
+}
+
+const char *const *tas_level_labels(void) {
+    return sLevelLabels;
+}
+
+const char *tas_level_help(s32 entry) {
+    if (entry <= 0 || entry >= tas_level_count()) {
+        snprintf(sHelp, sizeof(sHelp),
+                 "Each star, and the Bowser fights, to play yourself: from the save and the moment the "
+                 "TAS had when it entered that level for it. Saves stay off the VMU from then on.");
+        return sHelp;
+    }
+    const struct TasLevel *l = &sLevels[entry - 1];
+    const struct TasSection *t = &sSections[l->section];
+    const struct SliceHeader *s = slice_at(t->slice);
+    s16 act;
+    memcpy(&act, slice_item(s, &gCurrActNum), sizeof(act));
+    u32 at = sample_seconds(s->sample);
+    size_t n = course_name(sHelp, sizeof(sHelp), l->course);
+    if (l->star >= 8) {
+        n += (size_t) snprintf(sHelp + n, sizeof(sHelp) - n, l->star == 10 ? ": the last fight" : ": the fight for the key");
+    } else {
+        n += (size_t) snprintf(sHelp + n, sizeof(sHelp) - n, ": ");
+        n += star_name(sHelp + n, sizeof(sHelp) - n, l->course, l->star);
+    }
+    if (COURSE_IS_MAIN_COURSE(l->course) && n + 1 < sizeof(sHelp)) {
+        n += (size_t) snprintf(sHelp + n, sizeof(sHelp) - n, "\nAct %d, with", (int) act);
+    } else if (n + 1 < sizeof(sHelp)) {
+        n += (size_t) snprintf(sHelp + n, sizeof(sHelp) - n, "\nWith");
+    }
+    if (n + 1 < sizeof(sHelp)) {
+        snprintf(sHelp + n, sizeof(sHelp) - n, " %d of 120 stars, as the TAS came there at %u:%02u:%02u. A: play it.",
+                 (int) t->before, (unsigned) (at / 3600), (unsigned) (at / 60 % 60), (unsigned) (at % 60));
+    }
+    return sHelp;
+}
+
+// Entry 0 does nothing (the TAS replay row's Off gives a running replay's controller back).
+void tas_level_start(s32 entry) {
+    if (entry <= 0 || entry >= tas_level_count()) {
+        return;
+    }
+    menu_stop();
+    sPlaylist[sPlayCount++] = sSections[sLevels[entry - 1].section].slice;
+    sPlayOn = 0;
+    menu_play(0, sLevelLabels[entry]);
+}
+#endif
 
 #endif

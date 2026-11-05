@@ -340,6 +340,36 @@ static void dbg_reverb_changed(UNUSED enj_menu_row_t *row, UNUSED void *data) {
     sm64_afx_reverb_returns();
 }
 #endif
+#ifdef DC_TAS_MENU
+#include "game/tas_slice.h"
+
+static int sDbgTas;
+
+static void dbg_tas_changed(enj_menu_row_t *row, UNUSED void *data) {
+    row->help = tas_menu_help(sDbgTas);
+}
+
+// A starts the replay: the game warps when the menu closes, as its logic runs again.
+static void dbg_tas_pressed(enj_menu_row_t *row, UNUSED void *data) {
+    tas_menu_start(sDbgTas);
+    row->help = sDbgTas ? "Starts when the menu closes: at once in a level, else at the file's "
+                          "first level. Off and A: the pad plays again."
+                        : tas_menu_help(0);
+}
+
+static int sDbgLevel;
+
+static void dbg_level_changed(enj_menu_row_t *row, UNUSED void *data) {
+    row->help = tas_level_help(sDbgLevel);
+}
+
+static void dbg_level_pressed(enj_menu_row_t *row, UNUSED void *data) {
+    tas_level_start(sDbgLevel);
+    if (sDbgLevel) {
+        row->help = "Starts when the menu closes: at once in a level, else at the file's first level.";
+    }
+}
+#endif
 
 // The player's video options (dc_video_options.h) and the overlay.
 static enj_menu_row_t sDbgRows[] = {
@@ -372,6 +402,19 @@ static enj_menu_row_t sDbgRows[] = {
               "bottom left corner.",
       .type = ENJ_MENU_CHOICE,
       .choice = { .value = &gDcOverlayOn, .labels = sDbgOffOn, .count = 2 } },
+#ifdef DC_TAS_MENU
+    // Last: left out without the movie's files. Labels and counts come from tas_slice.c.
+    { .name = "TAS replay",
+      .type = ENJ_MENU_CHOICE,
+      .choice = { .value = &sDbgTas },
+      .on_change = dbg_tas_changed,
+      .on_press = dbg_tas_pressed },
+    { .name = "Level select",
+      .type = ENJ_MENU_CHOICE,
+      .choice = { .value = &sDbgLevel },
+      .on_change = dbg_level_changed,
+      .on_press = dbg_level_pressed },
+#endif
 };
 
 static enj_debug_menu_t sDbgMenu = {
@@ -424,6 +467,18 @@ static void enj_loop_run(void) {
         extern void enj_ctrl_init_local_devices(void);
         enj_ctrl_init_local_devices();
     }
+#ifdef DC_TAS_MENU
+    enj_menu_row_t *tas = &sDbgRows[sizeof(sDbgRows) / sizeof(sDbgRows[0]) - 2];
+    tas[0].choice.labels = tas_menu_labels();
+    tas[0].choice.count = tas_menu_count();
+    tas[0].help = tas_menu_help(0);
+    tas[1].choice.labels = tas_level_labels();
+    tas[1].choice.count = tas_level_count();
+    tas[1].help = tas_level_help(0);
+    if (tas[0].choice.count == 0) {
+        sDbgMenu.row_count -= 2;   // no tas.m64 and tas_slices.bin
+    }
+#endif
     enj_debug_menu_set(&sDbgMenu);
 #endif
     enj_state_run();

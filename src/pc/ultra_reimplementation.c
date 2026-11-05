@@ -163,13 +163,21 @@ uint8_t icondata[512];
 char *ico_fn = "/rd/mario.ico";
 
 #ifdef DC_TAS
-// A movie starts from a console with a blank save and no VMU: the EEPROM lives in memory.
+// A movie starts from a console with a blank save and no VMU: the EEPROM lives in memory. With
+// DC_TAS_MENU the VMU holds the player's save until the debug menu's first replay (tas_slice.c),
+// and from then on the movie's stays here.
 static u8 sTasEeprom[512];
+#ifdef DC_TAS_MENU
+s32 gTasSaveInMemory;
+#define TAS_EEPROM gTasSaveInMemory
+#else
+#define TAS_EEPROM 1
+#endif
 #endif
 
 s32 osEepromProbe(UNUSED OSMesgQueue *mq) {
 #ifdef DC_TAS
-    return 1;
+    if (TAS_EEPROM) return 1;
 #endif
     maple_device_t *vmudev = maple_enum_type(0, MAPLE_FUNC_MEMCARD);
     if (!vmudev) {
@@ -234,8 +242,10 @@ s32 osEepromProbe(UNUSED OSMesgQueue *mq) {
 
 s32 osEepromLongRead(UNUSED OSMesgQueue *mq, unsigned char address, unsigned char *buffer, s32 length) {
 #ifdef DC_TAS
-    memcpy(buffer, sTasEeprom + address * 8, (size_t) length);
-    return 0;
+    if (TAS_EEPROM) {
+        memcpy(buffer, sTasEeprom + address * 8, (size_t) length);
+        return 0;
+    }
 #endif
     if (eeprom_file == -1) {
         maple_device_t *vmudev = maple_enum_type(0, MAPLE_FUNC_MEMCARD);
@@ -289,8 +299,10 @@ s32 osEepromRead(OSMesgQueue* mq, u8 address, u8* buffer) {
 
 s32 osEepromLongWrite(UNUSED OSMesgQueue *mq, unsigned char address, unsigned char *buffer, s32 length) {
 #ifdef DC_TAS
-    memcpy(sTasEeprom + address * 8, buffer, (size_t) length);
-    return 0;
+    if (TAS_EEPROM) {
+        memcpy(sTasEeprom + address * 8, buffer, (size_t) length);
+        return 0;
+    }
 #endif
     if (eeprom_file == -1) {
         maple_device_t *vmudev = maple_enum_type(0, MAPLE_FUNC_MEMCARD);
