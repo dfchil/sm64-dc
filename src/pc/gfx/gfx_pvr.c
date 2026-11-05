@@ -58,20 +58,28 @@ static int sRenderW = DC_RENDER_W_1X << DC_FSAA;
 #else
 #define DC_RENDER_W DC_RENDER_W_1X
 #endif
-// DC_FSAA builds draw these courses without FSAA (comma-separated level numbers): their water
-// and lava fill the TR list over much of the screen, which FSAA makes twice as expensive.
+// DC_FSAA builds draw these scenes without FSAA in the curated mode, as FSAA_SCENE(level, area)
+// (comma-separated): their fill does not fit 60 fps with FSAA, which doubles it.
 #include "pc/dc_video_options.h"
 #include "pc/dc_overlay.h"
-#ifndef DC_FSAA_OFF_LEVELS
-// From the benchmark tour (make DC_PROF_BENCH=1, FSAA on, 60 fps strict, 2026-10-26): the levels
-// under 98% on time. TTC 87-89%, DDD 93%, Bowser 1 94%, JRB 96%, WDW 96%, WF 97-98%; every other
-// level 98% or better (LLL 100% since its lava is opaque).
-#define DC_FSAA_OFF_LEVELS 14, 23, 30, 12, 11, 24   /* TTC, DDD, BOWSER_1, JRB, WDW, WF */
+#include "level_table.h"
+#define FSAA_SCENE(level, area) ((level) * 16 + (area))
+#ifndef DC_FSAA_OFF_SCENES
+// Water and lava, whose TR fill covers much of the screen (Daniel 2026-11-02: no FSAA there): WDW
+// 1-2, JRB 1, THI 1, LLL 2, DDD 1-2, COTMC 1. And the scenes under 98% on time with FSAA forced on in
+// the TAS (build/hw/sndt5-20261031-212517; VCUTM with DC_GRATE_TR: g1-20261105-164223): VCUTM 97.1%,
+// SL 93.5%, BITDW 97.9%; Bowser 1, which no TAS run visits, from the camera-orbit benchmark
+// (2026-10-26, 94%). TTC holds 99.2% with DC_GRATE_TR.
+#define DC_FSAA_OFF_SCENES                                                                         \
+    FSAA_SCENE(LEVEL_WDW, 1), FSAA_SCENE(LEVEL_WDW, 2), FSAA_SCENE(LEVEL_JRB, 1),                  \
+    FSAA_SCENE(LEVEL_THI, 1), FSAA_SCENE(LEVEL_LLL, 2), FSAA_SCENE(LEVEL_DDD, 1),                  \
+    FSAA_SCENE(LEVEL_DDD, 2), FSAA_SCENE(LEVEL_COTMC, 1), FSAA_SCENE(LEVEL_VCUTM, 1),              \
+    FSAA_SCENE(LEVEL_SL, 1), FSAA_SCENE(LEVEL_BITDW, 1), FSAA_SCENE(LEVEL_BOWSER_1, 1)
 #endif
 static void pvr_post_init(void);
 #if DC_FSAA
-static void gfx_pvr_request_fsaa_for_level(int level);
-extern s16 gCurrLevelNum;
+static void gfx_pvr_request_fsaa_for_scene(int level, int area);
+extern s16 gCurrLevelNum, gCurrAreaIndex;
 #endif
 
 // DC_PROF_SKIP (profile builds): leave one part of the frame out of the PVR lists, so its PVR
@@ -834,9 +842,6 @@ extern void reset_texcache(void);
 void nuke_everything(void) {
     gfx_pvr_clear_all_textures();
     reset_texcache();
-#if DC_FSAA
-    gfx_pvr_request_fsaa_for_level(gCurrLevelNum);
-#endif
 }
 
 
@@ -1268,25 +1273,28 @@ static void pvr_post_init(void) {
 #if DC_FSAA
 static int sFsaaWant = DC_FSAA;
 
-// nuke_everything (a course load, inside a frame whose scene is open): choose the new course's
-// mode; gfx_pvr_start_frame switches before the next scene begins.
-// The player's choice (dc_video_options.h): off, on, or on except the courses whose fill does not
-// fit 60 fps with it.
+// The player's choice (dc_video_options.h): off, on, or on except the scenes whose fill does not
+// fit 60 fps with it. gfx_pvr_start_frame switches before the next scene begins.
 int gDcFsaaMode = DC_FSAA_MODE;
 
-static void gfx_pvr_request_fsaa_for_level(int level) {
-    static const s16 kOff[] = { DC_FSAA_OFF_LEVELS };
+static void gfx_pvr_request_fsaa_for_scene(int level, int area) {
+    static const s16 kOff[] = { DC_FSAA_OFF_SCENES };
     sFsaaWant = gDcFsaaMode != DC_FSAA_MODE_OFF;
     if (gDcFsaaMode != DC_FSAA_MODE_CURATED) return;
     for (unsigned i = 0; i < sizeof(kOff) / sizeof(kOff[0]); i++) {
-        if (kOff[i] == level) sFsaaWant = 0;
+        if (kOff[i] == FSAA_SCENE(level, area)) sFsaaWant = 0;
     }
 }
 
-// The debug menu changed gDcFsaaMode (pc_main.c): the current course's mode by it, switched before
-// the next scene as at a course load.
+// area.c load_area: a course's first area, or another of its areas (a warp inside the course).
+void gfx_pvr_area_loaded(void) {
+    gfx_pvr_request_fsaa_for_scene(gCurrLevelNum, gCurrAreaIndex);
+}
+
+// The debug menu changed gDcFsaaMode (pc_main.c): the current scene's mode by it, switched before
+// the next frame as at an area load.
 void gfx_pvr_fsaa_mode_changed(void) {
-    gfx_pvr_request_fsaa_for_level(gCurrLevelNum);
+    gfx_pvr_request_fsaa_for_scene(gCurrLevelNum, gCurrAreaIndex);
 }
 
 extern void reset_texcache(void);

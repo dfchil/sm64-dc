@@ -372,8 +372,8 @@ extern float gfx_pvr_get_v_scale(void);
 #ifndef DC_FSAA
 #define DC_FSAA 0
 #endif
-// The x scale follows the PVR's current FSAA mode, which can change per course (gfx_pvr.c
-// DC_FSAA_OFF_LEVELS); gfx_dc_set_fsaa_x sets it while no frame is in flight.
+// The x scale follows the PVR's current FSAA mode, which can change per scene (gfx_pvr.c
+// DC_FSAA_OFF_SCENES); gfx_dc_set_fsaa_x sets it while no frame is in flight.
 static float sDcFsaaX = (float) (1 << DC_FSAA);
 #define DC_FSAA_X sDcFsaaX
 static float vpf_x = 0.0f, vpf_y = 0.0f, vpf_w = 640.0f, vpf_h = 480.0f;
@@ -2992,7 +2992,12 @@ static void __attribute__((noinline, cold)) gfx_dc_tag(uint32_t tag) {
         sRailMode = rdp.other_mode_l;
 #pragma GCC diagnostic push
 #pragma GCC diagnostic ignored "-Wparentheses"   // gbi.h's GBL_c1/GBL_c2
-        rdp.other_mode_l = (sRailMode & 4) | ((G_RM_AA_ZB_XLU_SURF | G_RM_AA_ZB_XLU_SURF2) & ~7u);
+        if ((sRailMode >> 30) == G_BL_CLR_FOG) {
+            // Two cycles, fog in the first (TTC's grid): that cycle stays, the second blends.
+            rdp.other_mode_l = (sRailMode & (0xCCCC0000u | 4)) | (G_RM_AA_ZB_XLU_SURF2 & 0x3333FFF8u);
+        } else {
+            rdp.other_mode_l = (sRailMode & 4) | ((G_RM_AA_ZB_XLU_SURF | G_RM_AA_ZB_XLU_SURF2) & ~7u);
+        }
 #pragma GCC diagnostic pop
     } else if (tag == DC_GFX_RAIL_TR_END) {
         rdp.other_mode_l = sRailMode;

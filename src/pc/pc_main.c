@@ -382,8 +382,8 @@ static enj_menu_row_t sDbgRows[] = {
 #endif
 #if DC_FSAA
     { .name = "FSAA",
-      .help = "Twice the width, filtered down. Auto: off in the water and lava courses. Switches "
-              "when the menu closes, and the textures load again.",
+      .help = "Twice the width, filtered down. Auto: off in water, lava and the heaviest scenes. "
+              "Switches when the menu closes, and the textures load again.",
       .type = ENJ_MENU_CHOICE,
       .choice = { .value = &gDcFsaaMode, .labels = sDbgFsaaModes, .count = 3 },
       .on_change = dbg_fsaa_changed,

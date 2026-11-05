@@ -646,7 +646,7 @@ ifneq ($(DC_LAYOUT_PAD),0)
   PLATFORM_CFLAGS += -DDC_LAYOUT_PAD=$(DC_LAYOUT_PAD)
 endif
 # The default video options (src/pc/dc_video_options.h): DC_FSAA_MODE (DC_FSAA=1 builds) 0 off,
-# 1 on, 2 on except the water and lava courses (default); DC_FRAME_MODE (DC_60FPS=1 builds) 0 30 fps,
+# 1 on, 2 on except the scenes in gfx_pvr.c DC_FSAA_OFF_SCENES (default); DC_FRAME_MODE (DC_60FPS=1 builds) 0 30 fps,
 # 1 60 fps that slows down when late, 2 60 fps that drops a late step's second frame (default).
 ifneq ($(DC_FSAA_MODE),)
   PLATFORM_CFLAGS += -DDC_FSAA_MODE=$(DC_FSAA_MODE)
@@ -676,6 +676,11 @@ endif
 # its biggest fill there (gfx_dc_tags.h DC_GFX_RAIL_TR_*). Unlike DC_CUTOUT_TR, only that fence.
 DC_RAIL_TR ?= 1
 PLATFORM_CFLAGS += -DDC_RAIL_TR=$(DC_RAIL_TR)
+# DC_GRATE_TR=1 (default, needs DC_RAIL_TR): the same for VCUTM's grate and TTC's grid, their
+# biggest PT fill (perfl-20261030: 118k and 113k pixels). FSAA on, 60 fps strict, TAS slices
+# (build/hw/g0-20261105-163603, g1-20261105-164223): VCUTM 91.2 -> 97.1% on time, TTC 98.2 -> 99.2%.
+DC_GRATE_TR ?= 1
+PLATFORM_CFLAGS += -DDC_GRATE_TR=$(DC_GRATE_TR)
 # DC_CUTOUT_TR=1: alpha-test cutouts (fences, railings, foliage) are blended in the TR list instead
 # of punch-through; same picture, softer edges. An experiment: PT costs extra passes per tile.
 DC_CUTOUT_TR ?= 0
