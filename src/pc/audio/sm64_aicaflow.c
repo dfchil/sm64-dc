@@ -708,6 +708,7 @@ void sm64_afx_reverb(u16 windowSize, u16 gain) {
     int result = afx_dsp_program_delay(&program, samples, feedback, false);
     if (!result) result = afx_dsp_program_coefficient(&program, 6, 32760);
     if (!result) result = afx_dsp_scene_program_ring(&program, sizeof(program), 0);
+    if (!result && !gDcReverbOn) afx_dsp_scene_returns(false);   /* a new program returns at full */
     printf("AICAFLOW: reverb %u samples, feedback %d: %d\n", samples, feedback, result);
     if (result) samples = 0;   /* DSP is off: try again at the next preset */
     sReverbSamples = samples;
@@ -715,6 +716,14 @@ void sm64_afx_reverb(u16 windowSize, u16 gain) {
 #else
     (void) windowSize;
     (void) gain;
+#endif
+}
+
+int gDcReverbOn = DC_AICAFLOW_REVERB;
+
+void sm64_afx_reverb_returns(void) {
+#if DC_AICAFLOW_REVERB
+    if (sReady) afx_dsp_scene_returns(gDcReverbOn != 0);   /* no program yet: the next one applies it */
 #endif
 }
 

@@ -1283,6 +1283,12 @@ static void gfx_pvr_request_fsaa_for_level(int level) {
     }
 }
 
+// The debug menu changed gDcFsaaMode (pc_main.c): the current course's mode by it, switched before
+// the next scene as at a course load.
+void gfx_pvr_fsaa_mode_changed(void) {
+    gfx_pvr_request_fsaa_for_level(gCurrLevelNum);
+}
+
 extern void reset_texcache(void);
 extern void gfx_dc_set_fsaa_x(int fsaa);
 
@@ -1298,7 +1304,7 @@ static void gfx_pvr_switch_fsaa(void) {
     enj_state_get()->video.pvr_params.fsaa_enabled = sFsaaWant;   // enDjinn's copy of the parameters
 #endif
     pvr_post_init();
-#if DC_OVERLAY
+#if DC_OVERLAY_CODE
     dc_overlay_pvr_reset();
 #endif
     for (uint32_t i = 0; i < PVR_TEX_MAX; i++) {
@@ -1407,6 +1413,12 @@ void *enj_state_get(void) {
     static uint32_t __attribute__((aligned(32))) state[64];   // zero: flags.started = 0
     return state;
 }
+#if DC_OVERLAY_CODE
+// The overlay's text: enDjinn's font scales x by the PVR's FSAA mode, which it asks enj_state.c for.
+int enj_video_xscale(void) {
+    return sPvrParams.fsaa_enabled ? 2 : 1;
+}
+#endif
 #endif
 
 static void pvr_render_pt(UNUSED void *data) {
@@ -1417,7 +1429,7 @@ static void pvr_render_pt(UNUSED void *data) {
 static void pvr_render_tr(UNUSED void *data) {
     pvr_dr_init(&sDrState);
     if (!PROF_SKIP(SKIP_TR)) pvr_flush_bucket(&sTR);
-#if DC_OVERLAY
+#if DC_OVERLAY_CODE
     dc_overlay_draw();   // last, over everything
 #endif
 }
@@ -1455,7 +1467,7 @@ static void gfx_pvr_end_frame(void) {
     if (sPunch.nbatch > 0 && !PROF_SKIP(SKIP_PT)) {
         enj_render_list_add(PVR_LIST_PT_POLY, pvr_render_pt, NULL);
     }
-    if ((sTR.nbatch > 0 && !PROF_SKIP(SKIP_TR)) || DC_OVERLAY) {
+    if ((sTR.nbatch > 0 && !PROF_SKIP(SKIP_TR)) || DC_OVERLAY_SHOWN) {
         enj_render_list_add(PVR_LIST_TR_POLY, pvr_render_tr, NULL);
     }
     return;
@@ -1471,11 +1483,11 @@ static void gfx_pvr_end_frame(void) {
     }
     // TR SECOND: real alpha-blend surfaces, autosorted, composited over OP + PT (depth-tested).
     const int tr = sTR.nbatch > 0 && !PROF_SKIP(SKIP_TR);
-    if (tr || DC_OVERLAY) {
+    if (tr || DC_OVERLAY_SHOWN) {
         pvr_list_begin(PVR_LIST_TR_POLY);
         pvr_dr_init(&sDrState);
         if (tr) pvr_flush_bucket(&sTR);
-#if DC_OVERLAY
+#if DC_OVERLAY_CODE
         dc_overlay_draw();   // last, over everything
 #endif
         pvr_list_finish();

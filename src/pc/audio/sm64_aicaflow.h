@@ -31,6 +31,10 @@ void sm64_afx_scene_prepare(s16 level);
 /* external.c sound_reset: the session preset's reverb (N64 ring length in 32 kHz samples, and
  * feedback, Q15) becomes the scene's DSP program. */
 void sm64_afx_reverb(u16 windowSize, u16 gain);
+/* The debug menu's reverb switch: the DSP program keeps running, its output to the mix is gated
+ * (sm64_afx_reverb_returns applies gDcReverbOn at once, and each new program keeps it). */
+extern int gDcReverbOn;
+void sm64_afx_reverb_returns(void);
 /* external.c: a sound's reverb send (0..127) from its script's value and its volume. */
 u8 sm64_sound_reverb(u32 soundBits, f32 volume, u8 scriptReverb);
 /* external.c: sm64_afx_reverb with an audio session preset's values. */

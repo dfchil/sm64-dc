@@ -1,12 +1,14 @@
-/* make DC_OVERLAY=1: the frame rate and the frame losses of the current scene in the bottom left
- * corner, in enDjinn's quick font (third_party/endjinn). FPS counts the pictures drawn in the
- * last second. Since the level or area last changed: MISS counts presents that came after the
- * vblank they were paced for (a frame shown late), SKIP the exact second frames skipped on
- * purpose after a late first one (DC_FRAME_MODE_60_DROP). Each scene's totals also go to the
- * console when it ends. The text goes into the PVR's TR list after everything else, with depth
+/* make DC_OVERLAY=1 (or the debug menu's Show FPS, DC_DEBUG_MENU): the frame rate and the frame
+ * losses of the current scene in the bottom left corner, in enDjinn's quick font
+ * (third_party/endjinn). FPS counts the pictures drawn in the last second. Since the level or
+ * area last changed: MISS counts presents that came after the vblank they were paced for (a frame
+ * shown late), SKIP the exact second frames skipped on purpose after a late first one
+ * (DC_FRAME_MODE_60_DROP). With DC_OVERLAY=1 each scene's totals also go to the console when it
+ * ends. The text goes into the PVR's TR list after everything else, with depth
  * compare off, so it is drawn over the scene. Kept free of the game's headers: KOS and
  * libultra both define the CONT_* button names. */
-#if DC_OVERLAY
+#include "pc/dc_overlay.h"
+#if DC_OVERLAY_CODE
 
 #include <stdio.h>
 #include <kos.h>
@@ -15,12 +17,11 @@
 #include <enDjinn/enj_font.h>
 #include <enDjinn/enj_qfont.h>
 
-#include "pc/dc_overlay.h"
-
 extern volatile uint64_t vblticker;
 extern unsigned int gfx_dc_vbl_late;
 extern int16_t gCurrLevelNum, gCurrAreaIndex;
-extern int gfx_pvr_fsaa_x(void);
+
+int gDcOverlayOn = DC_OVERLAY;
 
 static uint32_t sDraws, sFps, sSceneDraws, sSkips;
 static uint64_t sSince;
@@ -31,7 +32,7 @@ static pvr_sprite_hdr_t sHdr, sShadowHdr;
 
 void dc_overlay_count_draw(void) {
     if (gCurrLevelNum != sLevel || gCurrAreaIndex != sArea) {
-        if (sLevel >= 0) {
+        if (DC_OVERLAY && sLevel >= 0) {
             printf("OVERLAY scene level=%d area=%d frames=%lu miss=%u skip=%lu\n", sLevel, sArea,
                    (unsigned long) sSceneDraws, gfx_dc_vbl_late - sLateBase, (unsigned long) sSkips);
         }
@@ -55,12 +56,12 @@ void dc_overlay_count_skip(void) {
 }
 
 // A PVR restart (gfx_pvr.c, a per-course FSAA switch) drops the font's texture with the rest of
-// video memory: upload it again on the next draw.
+// video memory: upload it again on the next draw, the overlay's or the debug menu's.
 void dc_overlay_pvr_reset(void) {
     sFontReady = 0;
 }
 
-static int font_ready(void) {
+int dc_overlay_font_ready(void) {
     if (sFontReady) {
         return 1;
     }
@@ -93,13 +94,13 @@ static void line_out(const char *text, int x, int y) {
 
 // Called by gfx_pvr.c with the TR list open.
 void dc_overlay_draw(void) {
-    if (!font_ready()) {
+    if (!gDcOverlayOn || !dc_overlay_font_ready()) {
         return;
     }
     char line[32];
-    // enDjinn scales x by its build-time FSAA setting (ENJ_XSCALE); divide by it and multiply
-    // by the PVR's current one, so the text sits right with FSAA on or off.
-    const int x = 24 * gfx_pvr_fsaa_x() / ENJ_XSCALE;
+    // enDjinn scales x by the PVR's current FSAA mode (enj_video_xscale), which gfx_pvr.c keeps
+    // in enDjinn's parameters.
+    const int x = 24;
     snprintf(line, sizeof(line), "FPS %u", (unsigned) sFps);
     line_out(line, x, 404);
     snprintf(line, sizeof(line), "MISS %u", gfx_dc_vbl_late - sLateBase);

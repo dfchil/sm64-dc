@@ -124,6 +124,9 @@ void send_display_list(struct SPTask *spTask) {
 #include <enDjinn/enj_mode.h>
 #include <enDjinn/enj_render.h>
 #include <enDjinn/enj_state.h>
+#if DC_DEBUG_MENU
+#include <enDjinn/enj_debug_menu.h>
+#endif
 #endif
 #undef bool
 #undef true
@@ -279,7 +282,7 @@ static void enj_frame(UNUSED void *data) {
         if (sDropExact) {
             mtx_patch_interpolated();   // still empties its table (it points into this display list)
             DC_PROF_COUNT(DCC_DROPPED, 1);
-#if DC_OVERLAY
+#if DC_OVERLAY_CODE
             dc_overlay_count_skip();
 #endif
         } else if (!gResetTimer) {
@@ -300,13 +303,99 @@ static void enj_frame(UNUSED void *data) {
     enj_frame_step();
 }
 
+#if DC_DEBUG_MENU
+// enDjinn's debug menu (third_party/endjinn enj_debug_menu.h): hold both triggers and press
+// Up+X+Y. It is a mode on top of the game's, so no logic step runs while it is open; behind it the
+// game's last display list is drawn again as it was last drawn, and those frames are the menu's,
+// not the game's (enj_frame_shown). The quick font it draws with is the overlay's (dc_overlay.c),
+// which a PVR restart drops and loads again.
+
+static int sMenuFrame;   // this frame is the one behind the menu
+
+static void dbg_menu_behind(UNUSED void *data) {
+    sMenuFrame = 1;
+    dc_overlay_font_ready();
+    if (sStepped && gGfxSPTask != NULL) {   // else nothing has been drawn: the background colour
+        gfx_run((Gfx *) gGfxSPTask->task.t.data_ptr);
+    }
+}
+
+#ifdef DC_60FPS
+static const char *const sDbgFrameModes[] = { "30 fps", "60 fps", "60 fps, drops" };
+#endif
+#if DC_FSAA
+extern int gDcFsaaMode;
+extern void gfx_pvr_fsaa_mode_changed(void);
+static const char *const sDbgFsaaModes[] = { "Off", "On", "Auto" };
+
+static void dbg_fsaa_changed(UNUSED enj_menu_row_t *row, UNUSED void *data) {
+    gfx_pvr_fsaa_mode_changed();   // the PVR restarts before the game's next frame
+}
+#endif
+static const char *const sDbgOffOn[] = { "Off", "On" };
+#if defined(DC_AICAFLOW) && DC_AICAFLOW_REVERB
+#include "audio/sm64_aicaflow.h"
+
+static void dbg_reverb_changed(UNUSED enj_menu_row_t *row, UNUSED void *data) {
+    sm64_afx_reverb_returns();
+}
+#endif
+
+// The player's video options (dc_video_options.h) and the overlay.
+static enj_menu_row_t sDbgRows[] = {
+#ifdef DC_60FPS
+    { .name = "Frame rate",
+      .help = "30 fps shows each logic step for two refreshes. 60 fps adds a frame between steps: "
+              "a late one slows the game, or with drops it is skipped.",
+      .type = ENJ_MENU_CHOICE,
+      .choice = { .value = &gDcFrameMode, .labels = sDbgFrameModes, .count = 3 } },
+#endif
+#if DC_FSAA
+    { .name = "FSAA",
+      .help = "Twice the width, filtered down. Auto: off in the water and lava courses. Switches "
+              "when the menu closes, and the textures load again.",
+      .type = ENJ_MENU_CHOICE,
+      .choice = { .value = &gDcFsaaMode, .labels = sDbgFsaaModes, .count = 3 },
+      .on_change = dbg_fsaa_changed,
+      .apply_on_close = 1 },
+#endif
+#if defined(DC_AICAFLOW) && DC_AICAFLOW_REVERB
+    { .name = "Reverb",
+      .help = "The N64's echo, as the AICA DSP's program. Off silences its output; the program "
+              "runs on. Changes at once.",
+      .type = ENJ_MENU_CHOICE,
+      .choice = { .value = &gDcReverbOn, .labels = sDbgOffOn, .count = 2 },
+      .on_change = dbg_reverb_changed },
+#endif
+    { .name = "Show FPS",
+      .help = "The frame rate, late frames (MISS) and skipped ones (SKIP) of the scene, in the "
+              "bottom left corner.",
+      .type = ENJ_MENU_CHOICE,
+      .choice = { .value = &gDcOverlayOn, .labels = sDbgOffOn, .count = 2 } },
+};
+
+static enj_debug_menu_t sDbgMenu = {
+    .title = "Super Mario 64",
+    .rows = sDbgRows,
+    .row_count = sizeof(sDbgRows) / sizeof(sDbgRows[0]),
+    .draw_behind = dbg_menu_behind,
+};
+#endif
+
 static void enj_frame_shown(UNUSED void *data) {
+#if DC_DEBUG_MENU
+    if (sMenuFrame) {   // behind the debug menu: shown and paced, but none of the game's frames
+        sMenuFrame = 0;
+        gfx_end_frame();
+        return;
+    }
+#endif
     if (sFrameHeld) {
         gfx_dc_hold_frame();
     } else {
         DC_PROF_MARK(DCP_DL);
         gfx_end_frame();
-#if DC_OVERLAY
+#if DC_OVERLAY_CODE
         dc_overlay_count_draw();
 #endif
     }
@@ -328,6 +417,15 @@ static void enj_loop_run(void) {
     strncpy(sGameMode.name, "sm64", sizeof(sGameMode.name) - 1);
     enj_render_post_callback_set(enj_frame_shown, NULL);
     enj_mode_push(&sGameMode);
+#if DC_DEBUG_MENU
+    if (enj_state_get()->flags.no_input_init) {
+        // The menu's buttons are read through enDjinn's controller layer, which the game's own
+        // maple code (controller_dc.c) leaves unstarted.
+        extern void enj_ctrl_init_local_devices(void);
+        enj_ctrl_init_local_devices();
+    }
+    enj_debug_menu_set(&sDbgMenu);
+#endif
     enj_state_run();
 }
 #endif
@@ -403,7 +501,7 @@ void main_func(void) {
         gfx_start_frame();
         game_loop_one_iteration();
         gfx_end_frame();
-#if DC_OVERLAY
+#if DC_OVERLAY_CODE
         dc_overlay_count_draw();
 #endif
 #ifdef DC_60FPS
@@ -422,7 +520,7 @@ void main_func(void) {
             extern s32 mtx_patch_interpolated(void);
             mtx_patch_interpolated();   // still empties its table (it points into this display list)
             DC_PROF_COUNT(DCC_DROPPED, 1);
-#if DC_OVERLAY
+#if DC_OVERLAY_CODE
             dc_overlay_count_skip();
 #endif
         } else if (!gResetTimer) {
@@ -434,7 +532,7 @@ void main_func(void) {
                 gfx_start_frame();
                 send_display_list(gGfxSPTask);
                 gfx_end_frame();
-#if DC_OVERLAY
+#if DC_OVERLAY_CODE
                 dc_overlay_count_draw();
 #endif
             } else {

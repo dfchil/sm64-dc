@@ -613,6 +613,17 @@ ifeq ($(DC_ENJ_LOOP),1)
   PLATFORM_CFLAGS += -I$(ENDJINN_DIR)/include -DENJ_CBASEPATH=\"/cd/\" -DENJ_FSAA=$(DC_FSAA)
 endif
 PLATFORM_CFLAGS += -DDC_ENJ_RENDER=$(DC_ENJ_RENDER) -DDC_ENJ_LOOP=$(DC_ENJ_LOOP)
+# DC_DEBUG_MENU=1 (default with DC_ENJ_LOOP=1): enDjinn's debug menu over the running game (pc_main.c,
+# third_party/endjinn enj_debug_menu.h): hold both triggers and press Up+X+Y. It sets the frame
+# rate, the FSAA mode and the frame-rate overlay (src/pc/dc_overlay.c, in the build with it). 0
+# leaves it out. Delete build/<variant>/endjinn after switching it: the flags are not dependencies.
+DC_DEBUG_MENU ?= $(DC_ENJ_LOOP)
+ifeq ($(DC_DEBUG_MENU),1)
+  ifneq ($(DC_ENJ_LOOP),1)
+    $(error DC_DEBUG_MENU=1 needs DC_ENJ_LOOP=1: the menu is a mode on enDjinn's mode stack)
+  endif
+  PLATFORM_CFLAGS += -DDC_DEBUG_MENU=1 -DENJ_DEBUG_MENU=1
+endif
 # DC_PVR_HASH=1 (a test build): a hash of every vertex the PVR is sent and the header it draws with,
 # printed for every DC_PVR_HASH_EVERY frames (gfx_pvr.c), to compare two renderers frame by frame
 # (tools/dc_pvr_hash_compare.py). Use DC_FRAME_MODE=1, which draws the same frames however late.
@@ -1102,24 +1113,30 @@ endif
 # The enDjinn sources the overlay's quick font, the render lists and the frame loop need, built
 # with its own C dialect.
 ENDJINN_SRCS :=
-ifeq ($(DC_OVERLAY),1)
+ifneq ($(DC_OVERLAY)$(DC_DEBUG_MENU),00)
 ENDJINN_SRCS += enj_qfont.c enj_font.c enj_draw.c enj_bitmap.c
 endif
 ifeq ($(DC_ENJ_RENDER),1)
 ENDJINN_SRCS += enj_render.c
 endif
 ifeq ($(DC_ENJ_LOOP),1)
-ENDJINN_SRCS += enj_state.c enj_mode.c enj_ctrl.c enj_rumble.c
+ENDJINN_SRCS += enj_state.c enj_mode.c enj_ctrl.c enj_rumble.c enj_pacing.c
+endif
+ENJ_MENU_DEFINE :=
+ifeq ($(DC_DEBUG_MENU),1)
+ENDJINN_SRCS += enj_debug_menu.c enj_debug_menu_mode.c
+ENJ_MENU_DEFINE := -DENJ_DEBUG_MENU=1
 endif
 ifneq ($(ENDJINN_SRCS),)
 ENDJINN_O_FILES := $(addprefix $(BUILD_DIR)/endjinn/,$(ENDJINN_SRCS:.c=.o))
 SOUND_OBJ_FILES += $(ENDJINN_O_FILES)
-# The overlay loads the quick font itself (dc_overlay.c), so enDjinn's startup must not load it too.
+# The overlay loads the quick font itself (dc_overlay.c, for the debug menu too), so enDjinn's
+# startup must not load it too.
 ENJ_QFONT_DEFINE := -DENJ_INJECT_QFONT=1
 $(BUILD_DIR)/endjinn/enj_state.o: ENJ_QFONT_DEFINE :=
 $(BUILD_DIR)/endjinn/%.o: $(ENDJINN_DIR)/code/%.c
 	@mkdir -p $(dir $@)
-	$(CC) -std=gnu23 -O2 -c -I$(ENDJINN_DIR)/include -I$(KOS_BASE)/utils -DENJ_CBASEPATH=\"/cd/\" -DENJ_FSAA=$(DC_FSAA) $(ENJ_QFONT_DEFINE) -o $@ $<
+	$(CC) -std=gnu23 -O2 -c -I$(ENDJINN_DIR)/include -I$(KOS_BASE)/utils -DENJ_CBASEPATH=\"/cd/\" -DENJ_FSAA=$(DC_FSAA) $(ENJ_QFONT_DEFINE) $(ENJ_MENU_DEFINE) -o $@ $<
 endif
 
 $(SOUND_BIN_DIR)/aica_pool.c: $(SOUND_BIN_DIR)/sound_data.tbl $(SOUND_BIN_DIR)/sound_data.ctl $(AICA_TOOLS)
