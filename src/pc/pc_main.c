@@ -326,7 +326,7 @@ static const char *const sDbgFrameModes[] = { "30 fps", "60 fps", "60 fps, drops
 #if DC_FSAA
 extern int gDcFsaaMode;
 extern void gfx_pvr_fsaa_mode_changed(void);
-static const char *const sDbgFsaaModes[] = { "Off", "On", "Auto" };
+static const char *const sDbgFsaaModes[] = { "Off", "On", "Auto", "Toggle X button", "Toggle B button" };
 
 static void dbg_fsaa_changed(UNUSED enj_menu_row_t *row, UNUSED void *data) {
     gfx_pvr_fsaa_mode_changed();   // the PVR restarts before the game's next frame
@@ -382,10 +382,11 @@ static enj_menu_row_t sDbgRows[] = {
 #endif
 #if DC_FSAA
     { .name = "FSAA",
-      .help = "Twice the width, filtered down. Auto: off in water, lava and the heaviest scenes. "
-              "Switches when the menu closes, and the textures load again.",
+      .help = "Twice the width, filtered down. Auto: off in water, lava and the heaviest scenes. Toggle: "
+              "that button switches it in play, the other of B and X stays B. Each switch loads "
+              "the textures again.",
       .type = ENJ_MENU_CHOICE,
-      .choice = { .value = &gDcFsaaMode, .labels = sDbgFsaaModes, .count = 3 },
+      .choice = { .value = &gDcFsaaMode, .labels = sDbgFsaaModes, .count = 5 },
       .on_change = dbg_fsaa_changed,
       .apply_on_close = 1 },
 #endif

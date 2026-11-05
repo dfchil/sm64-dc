@@ -1279,6 +1279,9 @@ int gDcFsaaMode = DC_FSAA_MODE;
 
 static void gfx_pvr_request_fsaa_for_scene(int level, int area) {
     static const s16 kOff[] = { DC_FSAA_OFF_SCENES };
+    if (gDcFsaaMode == DC_FSAA_MODE_TOGGLE_X || gDcFsaaMode == DC_FSAA_MODE_TOGGLE_B) {
+        return;   // the button's choice, kept across scenes
+    }
     sFsaaWant = gDcFsaaMode != DC_FSAA_MODE_OFF;
     if (gDcFsaaMode != DC_FSAA_MODE_CURATED) return;
     for (unsigned i = 0; i < sizeof(kOff) / sizeof(kOff[0]); i++) {
@@ -1295,6 +1298,13 @@ void gfx_pvr_area_loaded(void) {
 // the next frame as at an area load.
 void gfx_pvr_fsaa_mode_changed(void) {
     gfx_pvr_request_fsaa_for_scene(gCurrLevelNum, gCurrAreaIndex);
+}
+
+// The toggle button (DC_FSAA_MODE_TOGGLE_X/_B, controller_dc.c): the other mode, switched before
+// the next frame as at an area load.
+void gfx_pvr_fsaa_toggle(void) {
+    sFsaaWant = !sFsaaWant;
+    printf("FSAA: %s by the toggle button\n", sFsaaWant ? "on" : "off");
 }
 
 extern void reset_texcache(void);

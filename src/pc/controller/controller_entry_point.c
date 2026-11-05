@@ -141,6 +141,10 @@ void osContGetReadData(OSContPad *pad) {
     pad->stick_x = 0;
     pad->stick_y = 0;
     pad->errnum = 0;
+#if DC_FSAA && !defined(TARGET_PC_ENDJINN)
+    extern void controller_dc_fsaa_poll(void);
+    controller_dc_fsaa_poll();   // the FSAA toggle button, also under a movie
+#endif
 #ifdef DC_TAS
 #ifdef DC_TAS_MENU
     if (sTasOn && sTasNext >= sTasSamples) {
