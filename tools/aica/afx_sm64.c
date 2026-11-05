@@ -9,9 +9,11 @@
  * The job: "SJOB", zone count, event count, duration ticks, loop tick (~0 for
  * none), tick rate numerator, channels, tick rate denominator (0 = 1); then each zone (format, loop, loop start, loop
  * end, frames, bytes, data padded to 4) and each event (tick, order, opcode,
- * channel, setup, mask, 18 field words). Zones are complete AICA samples: the
- * NOTE events carry the pitch, pan and level words, so every zone is one
- * setup template selected by index. */
+ * channel, setup, mask, 18 field words). Zones are complete AICA samples, and a
+ * NOTE event selects one by index and carries the words it sets. The flow's
+ * setups come from AICAforge's setup dictionary (afx_c_optimize_events): one per
+ * envelope, pan and send combination the notes use often enough, so most NOTEs
+ * carry only their pitch and level. Every NOTE writes the same words as before. */
 #include <aicaflow/codec.h>
 #include "afx_compile_c.h"
 #include <stdio.h>
@@ -126,11 +128,18 @@ int main(int argc, char **argv) {
         if (afx_c_simplify_events(events, &event_count, &options))
             return fprintf(stderr, "cannot simplify %s\n", argv[1]), 1;
     }
+    /* Needs AICAforge with the template count fix (fix/optimize-templates): before it, more
+     * setups than zones overflowed. */
+    afx_c_event_t *notes = NULL;
+    afx_c_zone_t *setups = NULL;
+    uint32_t setup_count = 0;
+    if (afx_c_optimize_events(events, event_count, zones, zone_count, &notes, &setups, &setup_count))
+        return fprintf(stderr, "cannot build the setups of %s\n", argv[1]), 1;
     afx_c_output_t out;
     int result = loop_tick == UINT32_MAX
-        ? afx_c_compile_events(events, event_count, duration, rate, zones, zone_count, &out)
-        : afx_c_compile_events_loop(events, event_count, duration, loop_tick, rate, zones, zone_count, &out);
-    if (result) return fprintf(stderr, "cannot compile %s (%u zones, %u events, %u ticks)\n", argv[1], zone_count, event_count, duration), 1;
+        ? afx_c_compile_events(notes, event_count, duration, rate, setups, setup_count, &out)
+        : afx_c_compile_events_loop(notes, event_count, duration, loop_tick, rate, setups, setup_count, &out);
+    if (result) return fprintf(stderr, "cannot compile %s (%u setups, %u events, %u ticks)\n", argv[1], setup_count, event_count, duration), 1;
     /* Header words 68/72: the authored tick rate. Not part of the control image, so the
      * control identity (and with it the AFC binding) is unchanged. */
     afx_write32(out.afx + 68, rate_num);
@@ -144,6 +153,6 @@ int main(int argc, char **argv) {
     printf("wrote %s (%u bytes) and %s (%u bytes, %u stream bytes%s)\n", argv[2], out.afb_bytes, argv[3], out.afx_bytes,
            afx_read32(out.afx + 28), loop_tick == UINT32_MAX ? "" : ", looping");
     afx_c_output_free(&out);
-    free(zones); free(events); free(job);
+    free(setups); free(notes); free(zones); free(events); free(job);
     return 0;
 }
