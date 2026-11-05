@@ -29,6 +29,9 @@
 
 #include "sm64_aicaflow.h"
 #include "sm64_sfx_reverb.h"
+
+/* stop_inst sends each STOP once, which loses stops on a firmware before ABI 12. */
+_Static_assert(AFX_ABI_VERSION >= 12, "third_party/aicaflow must have firmware ABI 12 or later");
 extern s16 gCurrLevelNum;
 #include "pc/dc_prof.h"
 
@@ -101,11 +104,6 @@ typedef struct {
 static SfxChannel sChannel[SFX_CHANNELS];
 static u8 sMuted;
 static struct { Asset asset; afx_instance_t inst; } sRetiring[RETIRING];
-/* Stops the firmware has not taken yet: a lifecycle command returns AFX_BUSY while an earlier one
- * is unacknowledged (or AFX_IPC_FULL with the queue full), and a stop lost that way leaves its
- * song playing with nothing holding it. Retried every tick until taken or the instance is gone. */
-#define STOPS_PENDING 32
-static afx_instance_t sStopPending[STOPS_PENDING];
 /* DC_AICAFLOW_DEBUG: log every music call and the music instances' status every two seconds. */
 #ifdef DC_AICAFLOW_DEBUG
 static u32 sTicks;
@@ -183,31 +181,14 @@ static int asset_load(Asset *a, const char *stem, u32 id) {
     return result;
 }
 
-static int gone(afx_instance_t inst);
-
+/* A STOP is queued behind any command the firmware has not taken yet, or held back while the queue
+ * is full, and the instance's channels come back at once (firmware ABI 12). Only an upload on
+ * another thread holding the host could refuse it, and every call here is on the game thread. */
 static void stop_inst(afx_instance_t inst) {
     if (!inst) return;
     int result = afx_instance_stop(inst);
-    if (result != -AFX_BUSY && result != -AFX_IPC_FULL) return;
-    for (int i = 0; i < STOPS_PENDING; i++) {
-        if (sStopPending[i] == inst) return;
-    }
-    for (int i = 0; i < STOPS_PENDING; i++) {
-        if (!sStopPending[i]) {
-            sStopPending[i] = inst;
-            return;
-        }
-    }
-    printf("AICAFLOW: no room to retry a stop; instance %lx may keep playing\n", (unsigned long) inst);
-}
-
-static void retry_stops(void) {
-    for (int i = 0; i < STOPS_PENDING; i++) {
-        afx_instance_t inst = sStopPending[i];
-        if (!inst) continue;
-        int result = gone(inst) ? 0 : afx_instance_stop(inst);
-        if (result != -AFX_BUSY && result != -AFX_IPC_FULL) sStopPending[i] = 0;
-    }
+    if (result && result != -AFX_STALE_GENERATION)
+        printf("AICAFLOW: stop of instance %lx refused (%d)\n", (unsigned long) inst, result);
 }
 
 /* Hand an asset (and its last instance) over to be freed once the instance is gone. */
@@ -477,7 +458,6 @@ static void song_make_room(afx_instance_t stopping) {
     }
     sfx_release_idle();
     for (int wait = 0; wait < 50; wait++) {
-        retry_stops();
         free_retired();
         int busy = !gone(stopping);
         for (int i = 0; i < RETIRING; i++) busy |= sRetiring[i].asset.id != 0;
@@ -547,7 +527,6 @@ static void core_drop(void) {
         if (sSfx[i].id && (sSfx[i].core || sSfx[i].shared == &sCoreBank)) asset_free(&sSfx[i]);
     /* The bank goes once the last flow bound to it has: that waits for the stops above. */
     for (int wait = 0; wait < 50 && sCoreBankUp; wait++) {
-        retry_stops();
         free_retired();
         if (afx_bank_release(&sCoreBank) == 0) sCoreBankUp = 0;
         else thd_sleep(1);
@@ -596,7 +575,6 @@ static void scene_end(void) {
     }
     for (int wait = 0; wait < 200; wait++) {
         int busy = 0;
-        retry_stops();
         for (int i = 0; i < count; i++) busy |= !gone(stopped[i]);
         if (!busy) break;
         thd_sleep(1);
@@ -997,7 +975,6 @@ void sm64_afx_tick(void) {
         }
     }
 #endif
-    retry_stops();
     free_retired();
 }
 
