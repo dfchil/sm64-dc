@@ -44,6 +44,9 @@ extern s16 gCurrLevelNum;
 #define SFX_CHANNELS 10   /* SOUND_BANK_COUNT, one channel each (sMaxChannelsForSoundBank) */
 #define MENU_BANK 7
 #define SEQ_CREDITS 0x1A
+/* gCurrLevelNum of LEVEL_BOWSER_3 and LEVEL_CASTLE_GROUNDS (levels/level_defines.h order). */
+#define LEVEL_BOWSER_3_NUM 34
+#define LEVEL_CASTLE_GROUNDS_NUM 16
 #define RETIRING 16
 
 extern const unsigned char gAicaflowFirmware[];
@@ -152,10 +155,70 @@ static int flow_upload(Asset *a, afx_bank_t *bank, afx_bank_t *also, const void 
     return result;
 }
 
+/* Assets a scene will load from their own files, read into main RAM ahead of time at a load point,
+ * so that when they play they go to AICA RAM from memory instead of from the disc. Today only the
+ * credits (see sm64_afx_scene_prepare): their song, in no pack, and the sounds they play once the
+ * core pack has gone for it. A copy goes once it has been uploaded. */
+#define PREFETCH_MAX 8
+static struct {
+    char stem[24];
+    void *afb, *afx;
+    u32 afb_bytes, afx_bytes;
+} sPrefetch[PREFETCH_MAX];
+
+static void prefetch_drop(int i) {
+    free(sPrefetch[i].afb);
+    free(sPrefetch[i].afx);
+    memset(&sPrefetch[i], 0, sizeof(sPrefetch[i]));
+}
+
+static int prefetch_find(const char *stem) {
+    for (int i = 0; i < PREFETCH_MAX; i++)
+        if (sPrefetch[i].stem[0] && !strcmp(sPrefetch[i].stem, stem)) return i;
+    return -1;
+}
+
+static void prefetch(const char *stem) {
+    char path[128];
+    int i = 0;
+    if (prefetch_find(stem) >= 0) return;
+    while (i < PREFETCH_MAX && sPrefetch[i].stem[0]) i++;
+    if (i == PREFETCH_MAX) return;
+#ifdef DC_PROF
+    u64 start = dc_prof_now_us();
+#endif
+    snprintf(path, sizeof(path), "%s/%s.afb", DC_AICAFLOW_ROOT, stem);
+    int ok = read_file(path, &sPrefetch[i].afb, &sPrefetch[i].afb_bytes) == 0;
+    snprintf(path, sizeof(path), "%s/%s.afx", DC_AICAFLOW_ROOT, stem);
+    ok = ok && read_file(path, &sPrefetch[i].afx, &sPrefetch[i].afx_bytes) == 0;
+#ifdef DC_PROF
+    char name[32];
+    snprintf(name, sizeof(name), "ram:%s", stem);
+    dc_prof_asset_load(name, (unsigned int) (dc_prof_now_us() - start), sPrefetch[i].afb_bytes + sPrefetch[i].afx_bytes, ok);
+#endif
+    if (ok) snprintf(sPrefetch[i].stem, sizeof(sPrefetch[i].stem), "%s", stem);
+    else prefetch_drop(i);   /* no room in main RAM: it loads from its files when it plays */
+}
+
 static int asset_load_files(Asset *a, const char *stem, u32 id, u32 *bytes) {
     char path[128];
     void *flow = NULL;
     memset(a, 0, sizeof(*a));
+    int p = prefetch_find(stem);
+    if (p >= 0) {
+        int result = afx_bank_load_memory(&a->bank, sPrefetch[p].afb, sPrefetch[p].afb_bytes);
+        *bytes = sPrefetch[p].afx_bytes;
+        if (!result && (result = flow_upload(a, &a->bank, NULL, sPrefetch[p].afx, sPrefetch[p].afx_bytes)) != 0)
+            afx_bank_release(&a->bank);
+        if (!result) {
+            prefetch_drop(p);
+            a->id = id;
+            return 0;
+        }
+        memset(a, 0, sizeof(*a));
+        if (result == -AFX_NO_AICA_RAM) return result;   /* song_fetch makes room and tries again */
+        prefetch_drop(p);
+    }
     snprintf(path, sizeof(path), "%s/%s.afb", DC_AICAFLOW_ROOT, stem);
     int result = afx_bank_load_file(&a->bank, path);
     if (result) return result;
@@ -645,6 +708,7 @@ void sm64_afx_scene_prepare(s16 level) {
     arm7_stack_report();
 #endif
     if (sSceneLevel >= 0) scene_end();
+    s16 from = sSceneLevel;
     sSceneLevel = level;
     if (!sCorePackTried) {
         sCorePackTried = 1;
@@ -654,6 +718,16 @@ void sm64_afx_scene_prepare(s16 level) {
     char stem[16];
     snprintf(stem, sizeof(stem), "scene_%02d", (int) level);
     if (!pack_load(stem, 0)) sPackAbsent[level] = 1;
+    /* Bowser 3 goes on to the castle grounds only for the ending (sCreditsSequence[0]): Peach's
+     * cutscene, then the credits' song, which is in no pack (620 KB, it takes the core pack's room),
+     * and the sounds the credits play after that from their own files (seen on hardware
+     * 2026-11-07: the waterfall, two bird chirps, the birds flying away, the closing voice). Read
+     * them into main RAM now, in this load, so that the credits make no disc read. */
+    if (from == LEVEL_BOWSER_3_NUM && level == LEVEL_CASTLE_GROUNDS_NUM) {
+        static const char *const credits[] = { "seq1A", "sfx_40010000", "sfx_80500000", "sfx_90520000",
+                                               "sfx_30690000", "sfx_701F0000" };
+        for (u32 i = 0; i < sizeof(credits) / sizeof(credits[0]); i++) prefetch(credits[i]);
+    }
 }
 
 int sm64_afx_init(void) {

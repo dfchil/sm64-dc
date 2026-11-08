@@ -70,18 +70,62 @@ def level_numbers():
     return out
 
 
+PCMS_SHIFT, PCM8, ADPCM = 7, 1, 2    # CONTROL bits 8:7, the sample format
+# Opcode -> prefix bytes before a NOTE/PATCH's values (AICAflow codec.h afx_decode_event).
+PREFIX = {0x00: 1, 0x13: 1, 0x01: 2, 0x02: 3, 0x03: 5, 0x16: 5, 0x12: 2, 0x10: 8, 0x14: 4, 0x15: 2, 0x17: 2, 0x18: 2, 0x11: 6}
+FIXED_MASK = {0x14: 1 << 6 | 1 << 10, 0x15: 1 << 10, 0x17: 1 << 4, 0x18: 1 << 4 | 1 << 10}
+
+
+def notes_set_sample(afx):
+    """Whether any NOTE in the flow's stream gives its own CONTROL or SAMPLE_LOW (then the
+    setup's sample format is not the one that plays, and re-encoding a sample needs more)."""
+    image, _, stream_off, stream_size = struct.unpack_from("<4I", afx, 16)
+    p, end = image + stream_off, image + stream_off + stream_size
+    while p < end:
+        op = afx[p]
+        prefix = PREFIX[op]
+        mask = 0
+        if op in FIXED_MASK:
+            mask = FIXED_MASK[op]
+        elif op in (0x10, 0x11):
+            mask = struct.unpack_from("<I", afx, p + prefix - 4)[0]
+        if op in (0x10, 0x14) and mask & 3:
+            return True
+        p += prefix + 2 * bin(mask).count("1")
+    return False
+
+
+def adpcm_encode(data):
+    """A PCM8 sample's bytes as Yamaha ADPCM, by the build's beam encoder (tools/aica/ya2beam_c)."""
+    import ya2beam_c
+    pcm = [((v ^ 0x80) - 0x80) << 8 for v in data]
+    adpcm, n = ya2beam_c.encode(pcm, beam=32)
+    assert n == len(pcm), (n, len(pcm))
+    return adpcm
+
+
 class Asset:
-    def __init__(self, stage, stem):
+    def __init__(self, stage, stem, adpcm=()):
         self.stem = stem
         self.afx = bytearray((stage / f"{stem}.afx").read_bytes())
         afb = (stage / f"{stem}.afb").read_bytes()
         off, size = struct.unpack_from("<II", afb, 16)
         payload = afb[off:off + size]
+        image = struct.unpack_from("<I", self.afx, 16)[0]
         ro, rc = struct.unpack_from("<II", self.afx, 48)
         self.relocs = []
         for i in range(rc):
             pair, so, sb = struct.unpack_from("<III", self.afx, ro + 12 * i)
-            self.relocs.append((pair, payload[so:so + sb]))
+            data = payload[so:so + sb]
+            if hashlib.sha1(data).hexdigest()[:12] in adpcm:
+                # Chosen to play as ADPCM: re-encode, and the setup that names it says so.
+                control = struct.unpack_from("<H", self.afx, image + pair)[0]
+                assert (control >> PCMS_SHIFT) & 3 == PCM8, (stem, hex(control))
+                assert not notes_set_sample(self.afx), f"{stem}: a NOTE sets its own sample"
+                data = adpcm_cache.get(data) or adpcm_cache.setdefault(data, adpcm_encode(data))
+                struct.pack_into("<H", self.afx, image + pair, control & ~(3 << PCMS_SHIFT) | ADPCM << PCMS_SHIFT)
+                struct.pack_into("<I", self.afx, ro + 12 * i + 8, len(data))
+            self.relocs.append((pair, data))
 
     def samples(self):
         return {hashlib.sha1(data).digest(): data for _, data in self.relocs}
@@ -161,7 +205,10 @@ def write_pack(path, bank_file, entries):
     return len(out)
 
 
-def fit(ranked, core_samples, budget, music):
+adpcm_cache = {}
+
+
+def fit(ranked, core_samples, budget, music, forced_out=()):
     """The assets of ranked (in load order) that go in a level pack, and those left out.
 
     An asset costs its flow and the samples it adds to the level bank, which are those the core
@@ -170,7 +217,9 @@ def fit(ranked, core_samples, budget, music):
     the runtime lets go for it: a sound left out loads from its own files when it plays, but a
     song left out without room is silent. Of the other songs, the set packed is the one that lets the most of them play: a song left out
     plays when the room it needs on its own (its files, which the runtime loads when it plays)
-    is free beside the pack; ties go to the larger set packed, which loads nothing mid-scene."""
+    is free beside the pack; ties go to the larger set packed, which loads nothing mid-scene.
+    forced_out (chosen to load from disk) are never packed, but their songs count among those
+    the room is kept for."""
     core = set(core_samples)
 
     def cost(a, have):
@@ -193,14 +242,15 @@ def fit(ranked, core_samples, budget, music):
 
     later = [a for a in ranked if a.stem.startswith("seq") and a.stem not in music]
     level_music = sum(len(a.afx) for a in ranked if a.stem in music)
-    reserve = max(0, max((alone(a) for a in later), default=0) - level_music)
+    forced_songs = [a for a in forced_out if a.stem.startswith("seq")]
+    reserve = max(0, max((alone(a) for a in later + forced_songs), default=0) - level_music)
     first, first_out, have, used = place([a for a in ranked if a not in later], set(), 0, budget - reserve)
     best = None
     for bits in range(1 << len(later)):
         packed, out, _, total = place([a for i, a in enumerate(later) if bits >> i & 1], have, used, budget)
         if out:
             continue
-        rest = [a for i, a in enumerate(later) if not bits >> i & 1]
+        rest = [a for i, a in enumerate(later) if not bits >> i & 1] + forced_songs
         idle = level_music + sum(len(a.afx) for a in packed)
         room = budget - total + idle >= max((alone(a) for a in rest), default=0)
         score = (len(packed) + (len(rest) if room else 0), len(packed))
@@ -211,7 +261,8 @@ def fit(ranked, core_samples, budget, music):
         print(f"  warning: {a.stem} does not fit", file=sys.stderr)
     if rest and not room:
         print(f"  note: no room beside the whole pack for {' '.join(a.stem for a in rest)} (the runtime lets idle songs go for them)", file=sys.stderr)
-    return first + packed, rest + first_out
+    rest = [a for a in rest if a not in forced_songs]
+    return first + packed, rest + first_out + list(forced_out)
 
 
 def main():
@@ -222,15 +273,26 @@ def main():
     ap.add_argument("--arena-kb", type=int, default=2023, help="AICA RAM arena (default %(default)s)")
     ap.add_argument("--reverb-kb", type=int, default=16, help="reverb ring, 0 without (default %(default)s)")
     ap.add_argument("--margin-kb", type=int, default=32, help="kept free (default %(default)s)")
+    ap.add_argument("--choices", type=Path, help="moves, additions, disk-only assets and ADPCM samples (sm64_sound_choices.json)")
     args = ap.parse_args()
     stage = args.stage / "afx"
     lists = json.loads(args.assets.read_text())
+    choices = json.loads(args.choices.read_text()) if args.choices else {}
+    adpcm = set(choices.get("adpcm", []))
+    disk = set(choices.get("disk", []))
+    for stem, levels in list(choices.get("move", {}).items()) + list(choices.get("add", {}).items()):
+        if stem in lists["global"]:
+            lists["global"].remove(stem)
+        for lvl in levels:
+            if stem not in lists["levels"].setdefault(lvl, []):
+                lists["levels"][lvl].append(stem)
+    lists["global"] = [s for s in lists["global"] if s not in disk]
 
     def load(stems):
         out = []
         for s in stems:
             if (stage / f"{s}.afx").exists() and (stage / f"{s}.afb").exists():
-                out.append(Asset(stage, s))
+                out.append(Asset(stage, s, adpcm))
         return out
 
     core = load(lists["global"])
@@ -255,7 +317,14 @@ def main():
     for number, (lvl, stems, music) in sorted(by_number.items()):
         def rank(a):
             return (0 if a.stem in music else 1 if a.stem.startswith("sfx_") else 2, len(a.afx), a.stem)
-        own, left_out = fit(sorted(load(stems), key=rank), core_samples, budget, music)
+        assets = load(stems)
+        own, left_out = fit(sorted((a for a in assets if a.stem not in disk), key=rank), core_samples, budget,
+                            music - disk, [a for a in assets if a.stem in disk])
+        if not own:
+            (stage / f"scene_{number:02d}.smp").unlink(missing_ok=True)
+            print(f"scene_{number:02d}.smp {lvl:17s} none: everything is on disk {' '.join(a.stem for a in left_out)}")
+            report.append(f"{number:02d} {lvl} 0 assets left out {' '.join(a.stem for a in left_out)}")
+            continue
         samples = {}
         for a in own:
             samples.update((k, v) for k, v in a.samples().items() if k not in core_samples)
