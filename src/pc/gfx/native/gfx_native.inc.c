@@ -83,7 +83,7 @@ typedef struct {
     uint32_t ltex_size;
     __typeof__(rdp.texture_tile) tile;
     uint16_t s_scale, t_scale;
-    Light_t lights[MAX_LIGHTS + 1];
+    Light_t lights[MAX_LIGHTS + 1] __attribute__((aligned(4)));   // copied and compared by words
     uint8_t num_lights;
     int16_t fog_mul, fog_offset;
     struct RGBA env, prim, fogcol, fill;
@@ -114,9 +114,20 @@ typedef struct {
 } NatLoad;
 
 typedef struct {
-    Light_t lights[MAX_LIGHTS + 1];
+    Light_t lights[MAX_LIGHTS + 1] __attribute__((aligned(4)));   // copied and compared by words
     uint8_t num;
 } NatLights;
+
+// Lights are copied and compared a word at a time (shz_memcpy4; libc's memcpy and memcmp are calls):
+// every Light_t array here is 4-byte aligned and a Light_t is three words.
+_Static_assert(sizeof(Light_t) == 12, "a Light_t is three words");
+#define NAT_LIGHTS_BYTES (sizeof(Light_t) * (MAX_LIGHTS + 1))
+static inline int nat_words_differ(const void *a, const void *b, size_t bytes) {
+    const uint32_t *x = (const uint32_t *) a, *y = (const uint32_t *) b;
+    uint32_t d = 0;
+    for (size_t i = 0; i < bytes / 4; i++) d |= x[i] ^ y[i];
+    return d != 0;
+}
 
 typedef struct NatVariant {
     // The caller's state this was compiled in, compared for the groups in sig_mask (render mode
@@ -361,7 +372,7 @@ static void nat_state_get(NatState *s) {
     s->tile = rdp.texture_tile;
     s->s_scale = rsp.s_scale;
     s->t_scale = rsp.t_scale;
-    memcpy(s->lights, rsp.current_lights, sizeof(s->lights));
+    shz_memcpy4(s->lights, rsp.current_lights, NAT_LIGHTS_BYTES);
     s->num_lights = rsp.current_num_lights;
     s->fog_mul = rsp.fog_mul;
     s->fog_offset = rsp.fog_offset;
@@ -401,7 +412,7 @@ static int nat_sig_match(const NatVariant *v) {
     if (m & NG_LIGHTS) {
         if ((v->sig_lights & 0x80) && rsp.current_num_lights != g->num_lights) return 0;
         for (int i = 0; i <= MAX_LIGHTS; i++) {
-            if ((v->sig_lights & (1 << i)) && memcmp(&rsp.current_lights[i], &g->lights[i], sizeof(Light_t)) != 0) {
+            if ((v->sig_lights & (1 << i)) && nat_words_differ(&rsp.current_lights[i], &g->lights[i], sizeof(Light_t))) {
                 return 0;
             }
         }
@@ -451,7 +462,7 @@ static void nat_state_exit(const NatVariant *v) {
         rsp.t_scale = e->t_scale;
     }
     if (m & NG_LIGHTS) {
-        memcpy(rsp.current_lights, e->lights, sizeof(e->lights));
+        shz_memcpy4(rsp.current_lights, e->lights, NAT_LIGHTS_BYTES);
         rsp.current_num_lights = e->num_lights;
     }
     if (m & NG_FOG) {
@@ -525,13 +536,13 @@ static void nat_rec_vtx(size_t n, size_t dest, const Vtx *v) {
         l->lights_in = need & ~sRec.light_w;
         NatLights *last = sRec.nlights ? &sRec.lights[sRec.nlights - 1] : NULL;
         if (last == NULL || last->num != rsp.current_num_lights ||
-            memcmp(last->lights, rsp.current_lights, sizeof(last->lights)) != 0) {
+            nat_words_differ(last->lights, rsp.current_lights, NAT_LIGHTS_BYTES)) {
             if (sRec.nlights >= NAT_REC_LIGHTS) {
                 sRec.fail = 1;
                 return;
             }
             last = &sRec.lights[sRec.nlights++];
-            memcpy(last->lights, rsp.current_lights, sizeof(last->lights));
+            shz_memcpy4(last->lights, rsp.current_lights, NAT_LIGHTS_BYTES);
             last->num = rsp.current_num_lights;
         }
         l->lights = (int16_t) (last - sRec.lights);
@@ -1052,8 +1063,11 @@ static NatVariant *__attribute__((noinline, cold)) nat_record(Gfx *dl) {
 // The clip planes a triangle is rejected against (trivial_reject), as gradients in model space
 // of x - w, -x - w, y - w, -y - w, z - w, -z - w, with their lengths.
 static float sNatPlane[6][4];
+static uint32_t sNatPlaneGen;   // the sMpGen they are for: draws under one matrix share them
 
 static void nat_planes(void) {
+    if (sNatPlaneGen == sMpGen) return;
+    sNatPlaneGen = sMpGen;
     const float (*m)[4] = (const float (*)[4]) rsp.MP_matrix;
     static const int8_t axis[6] = { 0, 0, 1, 1, 2, 2 };
     for (int p = 0; p < 6; p++) {
@@ -1096,7 +1110,7 @@ static int SM_HOT __attribute__((noinline)) nat_classify(const float sp[4]) {
 
 static void SM_HOT __attribute__((noinline)) nat_seg_begin(const NatSeg *s) {
     tri_state_bump();
-    sTri = s->tri;
+    shz_memcpy32(&sTri, &s->tri, sizeof(sTri));
     sTri.epoch = sTriStateEpoch;
     sTri.cull_flip = (sm_xscale * sm_yscale) < 0.0f;
     if (s->cc_live) {
@@ -1164,14 +1178,20 @@ static uint8_t nat_lit_snapshot(void) {
     if (sNatLit[sNatLitCur].gen == sLightGen) return (uint8_t) (sNatLitCur + 1);
     sNatLitCur = (sNatLitCur + 1) & (NAT_LIT_SNAPS - 1);
     const uint8_t id = (uint8_t) (sNatLitCur + 1);
-    for (int i = 0; i < MAX_VERTICES; i++) {
-        if (sVtxLit[i] == id) nat_vertex_resolve((uint8_t) i);
+    // Four slots a word: a word holds the id where (w ^ id x 4) has a zero byte.
+    const uint32_t *words = (const uint32_t *) sVtxLit, idw = id * 0x01010101u;
+    for (int k = 0; k < MAX_VERTICES / 4; k++) {
+        const uint32_t x = words[k] ^ idw;
+        if (((x - 0x01010101u) & ~x & 0x80808080u) == 0) continue;
+        for (int i = 4 * k; i < 4 * k + 4; i++) {
+            if (sVtxLit[i] == id) nat_vertex_resolve((uint8_t) i);
+        }
     }
     NatLitSnap *sn = &sNatLit[sNatLitCur];
     const int nl = rsp.current_num_lights - 1;
     sn->nl = nl < 0 ? 0 : nl > MAX_LIGHTS ? MAX_LIGHTS : nl;
-    memcpy(sn->coef, rsp.current_lights_coeffs, sizeof(sn->coef));
-    memcpy(sn->col, rsp.current_lights_colf, sizeof(sn->col));
+    shz_memcpy4(sn->coef, rsp.current_lights_coeffs, sizeof(sn->coef));
+    shz_memcpy4(sn->col, rsp.current_lights_colf, sizeof(sn->col));
     sn->gen = sLightGen;
     return id;
 }
@@ -1277,6 +1297,20 @@ static struct {
     int load, lights, lights_saved;
 } sNatCur;
 
+// A load lights with other lights than the last (once or twice a draw): out of the hot loops' way.
+static void __attribute__((noinline)) nat_load_lights(const NatVariant *v, int li) {
+    const NatLights *nl = &v->lights[li];
+    if (!sNatCur.lights_saved) {
+        shz_memcpy4(sNatLightsIn.lights, rsp.current_lights, NAT_LIGHTS_BYTES);
+        sNatLightsIn.num = rsp.current_num_lights;
+        sNatCur.lights_saved = 1;
+    }
+    shz_memcpy4(rsp.current_lights, nl->lights, NAT_LIGHTS_BYTES);
+    rsp.current_num_lights = nl->num;
+    rsp.light_cols_changed = 1;
+    sNatCur.lights = li;
+}
+
 // A load's state: its geometry mode, texture scale, fog and lights.
 static void nat_load_state(const NatVariant *v, uint32_t li) {
     if ((int) li != sNatCur.load) {
@@ -1287,18 +1321,7 @@ static void nat_load_state(const NatVariant *v, uint32_t li) {
         rsp.t_scale = l->t_scale;
         rsp.fog_mul = l->fog_mul;
         rsp.fog_offset = l->fog_offset;
-        if (l->lights >= 0 && l->lights != sNatCur.lights) {
-            const NatLights *nl = &v->lights[l->lights];
-            if (!sNatCur.lights_saved) {
-                memcpy(sNatLightsIn.lights, rsp.current_lights, sizeof(sNatLightsIn.lights));
-                sNatLightsIn.num = rsp.current_num_lights;
-                sNatCur.lights_saved = 1;
-            }
-            memcpy(rsp.current_lights, nl->lights, sizeof(nl->lights));
-            rsp.current_num_lights = nl->num;
-            rsp.light_cols_changed = 1;
-            sNatCur.lights = l->lights;
-        }
+        if (l->lights >= 0 && l->lights != sNatCur.lights) nat_load_lights(v, l->lights);
     }
     if (v->loads[li].lights >= 0) rsp.lights_changed = v->loads[li].dirs;
 }
@@ -1490,8 +1513,8 @@ static void __attribute__((noinline)) nat_draw(const NatVariant *v) {
     rdp.texture_tile.ult = ult_in;
     if (sNatCur.lights_saved) {
         const int differ = rsp.current_num_lights != sNatLightsIn.num ||
-                           memcmp(rsp.current_lights, sNatLightsIn.lights, sizeof(sNatLightsIn.lights)) != 0;
-        memcpy(rsp.current_lights, sNatLightsIn.lights, sizeof(sNatLightsIn.lights));
+                           nat_words_differ(rsp.current_lights, sNatLightsIn.lights, NAT_LIGHTS_BYTES);
+        shz_memcpy4(rsp.current_lights, sNatLightsIn.lights, NAT_LIGHTS_BYTES);
         rsp.current_num_lights = sNatLightsIn.num;
         rsp.light_cols_changed = 1;
         if (differ && !(v->exit_mask & NG_LIGHTS) && v->lc_out == 0) {

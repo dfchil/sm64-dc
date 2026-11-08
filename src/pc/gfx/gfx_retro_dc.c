@@ -131,7 +131,7 @@ static uint32_t sProjGen = 1;                                 // one per screen 
 // A lit vertex is lit when it is first baked (nat_vertex_resolve, native/gfx_native.inc.c), with the
 // lights of its load: sVtxLit is that light snapshot + 1, 0 once lit (or unlit). sLightGen counts
 // the light states gfx_vertex_lights_prep makes, so a snapshot knows when it is out of date.
-static SM_HOT_DATA uint8_t sVtxLit[MAX_VERTICES + 4];
+static SM_HOT_DATA uint8_t __attribute__((aligned(4))) sVtxLit[MAX_VERTICES + 4];   // read by words
 static uint32_t sLightGen = 1;
 static void nat_vertex_resolve(uint8_t idx);
 
@@ -899,6 +899,7 @@ static void gfx_matrix_mul(shz_mat4x4_t* res, const shz_mat4x4_t* a, const shz_m
 }
 
 static int matrix_dirty = 0;
+static uint32_t sMpGen = 1;   // one per rsp.MP_matrix (nat_planes)
 
 static void  __attribute__((noinline)) gfx_sp_matrix(uint8_t parameters, const int32_t *addr) {
     float matrix[4][4] __attribute__((aligned(16)));
@@ -959,6 +960,7 @@ static void  __attribute__((noinline)) gfx_sp_matrix(uint8_t parameters, const i
         rsp.lights_changed = 1;
     }
     matrix_dirty = 1;
+    sMpGen++;
     gfx_matrix_mul((shz_mat4x4_t *)rsp.MP_matrix, (const shz_mat4x4_t *)rsp.modelview_matrix_stack[rsp.modelview_matrix_stack_size - 1], (const shz_mat4x4_t *)rsp.P_matrix);
 }
 
@@ -970,6 +972,7 @@ static void  __attribute__((noinline)) gfx_sp_pop_matrix(uint32_t count) {
     }
     if (rsp.modelview_matrix_stack_size > 0) {
         matrix_dirty = 1;
+        sMpGen++;
         gfx_matrix_mul((shz_mat4x4_t *)rsp.MP_matrix, (const shz_mat4x4_t *)rsp.modelview_matrix_stack[rsp.modelview_matrix_stack_size - 1], (const shz_mat4x4_t *)rsp.P_matrix);
     }
 }
@@ -1700,7 +1703,8 @@ static int sm_near_clip_fan(struct LoadedVertex *v1, struct LoadedVertex *v2,
 // loads. Triangles crossing the near plane, 2D-as-triangles overlays and the peach/bowser
 // trilerp still take the per-corner path, which handles their per-triangle z and alpha.
 
-static struct {
+// 32-byte aligned and long: a native segment's start copies it whole with shz_memcpy32.
+static struct __attribute__((aligned(32))) {
     uint32_t epoch;          // sTriStateEpoch these values were computed for (0 = never)
     uint8_t fast;            // the baked-vertex path may draw this state
     uint8_t usetex, linear_filter, depth_test, zmode_decal, ortho_3d, cull_flip;
