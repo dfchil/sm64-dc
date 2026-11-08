@@ -1150,7 +1150,8 @@ static uint32_t sNatLitCur;
 
 // gfx_sp_vertex_light's arithmetic, in the same order, from the vertex's snapshot (its normal is
 // where its colour goes until then).
-static void SM_HOT __attribute__((noinline)) nat_vertex_resolve(uint8_t idx) {
+// Returns the lit colour as ARGB8888 too (tri_bake_slot's shade, without reading it back).
+static uint32_t SM_HOT __attribute__((noinline)) nat_vertex_resolve(uint8_t idx) {
     const NatLitSnap *sn = &sNatLit[VB_LIT[idx] - 1];
     struct LoadedVertex *d = &VB_LV[idx];
     const float nx = (float) (int8_t) d->color.r, ny = (float) (int8_t) d->color.g, nz = (float) (int8_t) d->color.b;
@@ -1166,10 +1167,14 @@ static void SM_HOT __attribute__((noinline)) nat_vertex_resolve(uint8_t idx) {
             b += intensity * sn->col[l][2];
         }
     }
-    d->color.r = r >= 255.0f ? 255 : (uint8_t) r;
-    d->color.g = g >= 255.0f ? 255 : (uint8_t) g;
-    d->color.b = b >= 255.0f ? 255 : (uint8_t) b;
+    const uint32_t cr = r >= 255.0f ? 255 : (uint8_t) r;
+    const uint32_t cg = g >= 255.0f ? 255 : (uint8_t) g;
+    const uint32_t cb = b >= 255.0f ? 255 : (uint8_t) b;
+    d->color.r = (uint8_t) cr;
+    d->color.g = (uint8_t) cg;
+    d->color.b = (uint8_t) cb;
     VB_LIT[idx] = 0;
+    return (uint32_t) d->color.a << 24 | cr << 16 | cg << 8 | cb;
 }
 
 // The snapshot of the current lights (after gfx_vertex_lights_prep), + 1. Before one is reused, the
@@ -1364,8 +1369,19 @@ static inline __attribute__((always_inline)) void nat_tris(const void *t, uint32
     const uint32_t epoch = sTriStateEpoch, proj_gen = sProjGen;
     const uint32_t cull = rsp.geometry_mode & G_CULL_BOTH;
     const int flip = sTri.cull_flip, op_list = pvr_cur_kind == 0, persp = !proj_is_ortho;
-#define NT_PROJ(i) (vb.proj_gen[i] != proj_gen ? tri_proj_take(i) : (void) 0, vb.proj[i])
-#define NT_BAKED(i) (vb.bake_epoch[i] != epoch ? tri_bake_slot(i) : (void) 0, &vb.baked[i])
+    // The back-face test as one comparison: culled when cross * cull_sign <= 0 (G_CULL_BACK:
+    // cross <= 0; G_CULL_FRONT: cross >= 0; a mirrored screen map turns both round). Only the
+    // sign changes, so the comparison is the same one. G_CULL_BOTH culls nothing, as before.
+    const int cull_test = cull == G_CULL_FRONT || cull == G_CULL_BACK;
+    const float cull_sign = (cull == G_CULL_FRONT) != (flip != 0) ? -1.0f : 1.0f;
+    // A corner's screen position and bake are taken where they are not current: one test for
+    // all three corners, the common case being that none needs either.
+#define NT_TAKE3(gen, cur, take) \
+    if (((gen)[i1] ^ (cur)) | ((gen)[i2] ^ (cur)) | ((gen)[i3] ^ (cur))) { \
+        if ((gen)[i3] != (cur)) take(i3); \
+        if ((gen)[i2] != (cur)) take(i2); \
+        if ((gen)[i1] != (cur)) take(i1); \
+    }
     for (; i < n; i++) {
         const uint32_t x = NT_TRI(i);
         const uint8_t i1 = x & 0xFF, i2 = (x >> 8) & 0xFF, i3 = (x >> 16) & 0xFF;
@@ -1383,13 +1399,14 @@ static inline __attribute__((always_inline)) void nat_tris(const void *t, uint32
             continue;
         }
         DC_PROF_COUNT(DCC_FAST, 1);
-        if (cull != 0) {
-            const float *q1 = NT_PROJ(i3), *q2 = NT_PROJ(i2), *q3 = NT_PROJ(i1);
-            float cross = (q1[0] - q2[0]) * (q3[1] - q2[1]) - (q1[1] - q2[1]) * (q3[0] - q2[0]);
-            if (flip) cross = -cross;
-            if (cull == G_CULL_FRONT ? cross >= 0 : cull == G_CULL_BACK ? cross <= 0 : 0) continue;
+        if (cull_test) {
+            NT_TAKE3(vb.proj_gen, proj_gen, tri_proj_take);
+            const float *q1 = vb.proj[i3], *q2 = vb.proj[i2], *q3 = vb.proj[i1];
+            const float cross = (q1[0] - q2[0]) * (q3[1] - q2[1]) - (q1[1] - q2[1]) * (q3[0] - q2[0]);
+            if (cross * cull_sign <= 0) continue;
         }
-        const dc_fast_t *b1 = NT_BAKED(i3), *b2 = NT_BAKED(i2), *b3 = NT_BAKED(i1);
+        NT_TAKE3(vb.bake_epoch, epoch, tri_bake_slot);
+        const dc_fast_t *b1 = &vb.baked[i3], *b2 = &vb.baked[i2], *b3 = &vb.baked[i1];
         if (op_list) {
             pvr_submit_op_tri(b1, b2, b3);
         } else {
@@ -1403,8 +1420,7 @@ static inline __attribute__((always_inline)) void nat_tris(const void *t, uint32
         }
         if (persp) has_done_3d = 1;
     }
-#undef NT_PROJ
-#undef NT_BAKED
+#undef NT_TAKE3
 }
 #undef NT_TRI
 

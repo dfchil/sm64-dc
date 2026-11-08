@@ -85,22 +85,21 @@ struct __attribute__((aligned(32))) LoadedVertex {
     // 0, 4 — PVR: RAW CLIP x, y (see gfx_sp_vertex; the homogeneous
     // SW clip + screen-bake in the PVR gfx_sp_tri1 path need raw clip coords, matching MK64).
     float _x, _y;
-    // raw clip z, w — homogeneous clip planes, depth (1/w), and N64 fog (z/w).
+    // 8, 12 — raw clip z, w — homogeneous clip planes, depth (1/w), and N64 fog (z/w).
     float _z, _w;
-    // 8, 12, 16: the model-space position (nothing reads it: not stored)
-    float x, y, z;
-    // 20, 24
+    // 16, 20
     float u, v;
-    // 28
+    // 24 (a word: tri_bake_slot reads it as one)
     struct RGBA color;
-    // 29
+    // 28
     // per-vertex N64 fog coefficient (0..255), computed at vertex-load from clip z/w and the RSP
     // fog mul/offset (G_FOG). Emitted into the PVR vertex's offset-colour (oargb) ALPHA, which
     // PVR hardware VERTEX fog reads as the fog density. (Ported from OoT/MK64.)
     uint8_t fog;
-    // 30
-    uint16_t pad;
+    // 29
+    uint8_t pad[3];
 };
+_Static_assert(sizeof(struct LoadedVertex) == 32, "a loaded vertex is one cache line");
 
 // clip_rej for all 32 LoadedVerts fits in a single cache line
 // bits 0 - 5 -> clip_rej
@@ -133,7 +132,7 @@ static uint32_t sProjGen = 1;                                 // one per screen 
 // the light states gfx_vertex_lights_prep makes, so a snapshot knows when it is out of date.
 static SM_HOT_DATA uint8_t __attribute__((aligned(4))) sVtxLit[MAX_VERTICES + 4];   // read by words
 static uint32_t sLightGen = 1;
-static void nat_vertex_resolve(uint8_t idx);
+static uint32_t nat_vertex_resolve(uint8_t idx);
 
 static inline void tri_state_bump(void) {
     DC_PROF_COUNT(DCC_EPOCHS, 1);
@@ -1578,7 +1577,15 @@ static void cc_compile_cached(CompiledCC *cc, uint32_t w0, uint32_t w1, int text
     shz_memcpy8(&sCcMemo[h].cc, cc, sizeof(*cc));
 }
 
-static inline void cc_eval(const CompiledCC *cc, const struct RGBA *sh, uint32_t *out_argb, uint32_t *out_oargb) {
+// The shade colour as ARGB8888 from its RGBA bytes, read as one word (little endian: a b g r).
+static inline uint32_t rgba_argb(const struct RGBA *c) {
+    const uint32_t w = *(const uint32_t *) c;
+    return (w & 0xFF00FF00u) | ((w & 0xFFu) << 16) | ((w >> 16) & 0xFFu);
+}
+
+// cc_eval with the shade colour also at hand as ARGB8888 (packed), as tri_bake_slot has it.
+static inline void cc_eval_packed(const CompiledCC *cc, const struct RGBA *sh, uint32_t packed, uint32_t *out_argb,
+                                  uint32_t *out_oargb) {
     if (cc->replace) {
         *out_argb = 0xFFFFFFFFu;
         *out_oargb = 0;
@@ -1590,7 +1597,6 @@ static inline void cc_eval(const CompiledCC *cc, const struct RGBA *sh, uint32_t
         return;
     }
     if (cc->bytes) {
-        uint32_t packed = PACK_ARGB8888(sh->r, sh->g, sh->b, sh->a);
         uint32_t v = (packed & cc->keep) | cc->konst;
         if (cc->cct) {
             *out_oargb = v & 0x00FFFFFFu;
@@ -1602,6 +1608,10 @@ static inline void cc_eval(const CompiledCC *cc, const struct RGBA *sh, uint32_t
         return;
     }
     cc_eval_float(cc, sh, out_argb, out_oargb);
+}
+
+static inline void cc_eval(const CompiledCC *cc, const struct RGBA *sh, uint32_t *out_argb, uint32_t *out_oargb) {
+    cc_eval_packed(cc, sh, PACK_ARGB8888(sh->r, sh->g, sh->b, sh->a), out_argb, out_oargb);
 }
 
 // Combiners that mix shade with a constant factor: the general linear-form evaluation. Every value
@@ -1993,9 +2003,10 @@ static inline const float *tri_proj(uint8_t idx) {
 // the list loop and the native loops too. Its position is tri_proj's, and a lit vertex is lit first.
 static void SM_HOT __attribute__((noinline)) tri_bake_slot(uint8_t idx) {
     DC_PROF_COUNT(DCC_BAKES, 1);
-    if (VB_LIT[idx]) nat_vertex_resolve(idx);
-    const float *q = tri_proj(idx);
     const struct LoadedVertex *v = &VB_LV[idx];
+    // The shade colour as ARGB, from the lighting just done (in registers) or read as one word.
+    const uint32_t shade = VB_LIT[idx] ? nat_vertex_resolve(idx) : rgba_argb(&v->color);
+    const float *q = tri_proj(idx);
     dc_fast_t *bv = &VB_BAKED[idx];
     const float invw = q[2];
     bv->vert.x = q[0];
@@ -2014,7 +2025,7 @@ static void SM_HOT __attribute__((noinline)) tri_bake_slot(uint8_t idx) {
         bv->texture.v = vv * sTri.recip_th * sTri.pvr_vs;
     }
     uint32_t argb, oargb;
-    cc_eval(&sTri.cc, &v->color, &argb, &oargb);
+    cc_eval_packed(&sTri.cc, &v->color, shade, &argb, &oargb);
     bv->color.packed = argb;
     bv->pad0.vertindex = oargb | ((uint32_t) v->fog << 24);
     VB_BAKE_EPOCH[idx] = sTriStateEpoch;

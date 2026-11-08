@@ -1260,6 +1260,38 @@ static void __attribute__((noinline, cold)) op_tri_faded(const dc_fast_t *a, con
 }
 #endif
 
+// A baked vertex into the store queue at v with its command word, and sent: as sh4zam's
+// shz_sq_memcpy32_1 (four 64-bit moves in and out instead of eight words each), the command word
+// written over the first before the queue fires. The size switch (fschg) is inside the one asm, so
+// no FPU instruction of the compiler's can land between. src is 32-byte aligned (the baked arrays).
+static inline __attribute__((always_inline)) void sq_put_vertex(pvr_vertex_t *v, const dc_fast_t *src, uint32_t flags) {
+#ifdef __sh__
+    const dc_fast_t *s = src;
+    pvr_vertex_t *d = v;
+    __asm__ __volatile__(
+        "fschg\n\t"
+        "fmov.d @%[s]+, dr0\n\t"
+        "fmov.d @%[s]+, dr2\n\t"
+        "fmov.d @%[s]+, dr4\n\t"
+        "fmov.d @%[s]+, dr6\n\t"
+        "add    #32, %[d]\n\t"
+        "fmov.d dr6, @-%[d]\n\t"
+        "fmov.d dr4, @-%[d]\n\t"
+        "fmov.d dr2, @-%[d]\n\t"
+        "fmov.d dr0, @-%[d]\n\t"
+        "fschg\n\t"
+        "mov.l  %[f], @%[d]\n\t"
+        "pref   @%[d]"
+        : [s] "+r" (s), [d] "+r" (d), "=m" (*(uint8_t (*)[32]) v)
+        : [f] "r" (flags), "m" (*(const uint8_t (*)[32]) src)
+        : "fr0", "fr1", "fr2", "fr3", "fr4", "fr5", "fr6", "fr7");
+#else
+    *v = *(const pvr_vertex_t *) src;
+    v->flags = flags;
+    sq_send(v);
+#endif
+}
+
 // One triangle from three separately stored vertices (the front-end's baked-vertex cache).
 __attribute__((section(".sub0.sm64_hot"))) void pvr_submit_op_tri(const dc_fast_t *a, const dc_fast_t *b,
                                                                    const dc_fast_t *c) {
@@ -1272,22 +1304,12 @@ __attribute__((section(".sub0.sm64_hot"))) void pvr_submit_op_tri(const dc_fast_
     }
 #endif
     uint32_t addr = pvr_dr_addr;
-    pvr_vertex_t *v;
-    v = sq_next(&addr);
-    *v = *(const pvr_vertex_t *) a;
-    v->flags = PVR_CMD_VERTEX;
     HASH_VERTEX(PVR_KIND_OP, sHashOpHdr, a, PVR_CMD_VERTEX);
-    sq_send(v);
-    v = sq_next(&addr);
-    *v = *(const pvr_vertex_t *) b;
-    v->flags = PVR_CMD_VERTEX;
+    sq_put_vertex(sq_next(&addr), a, PVR_CMD_VERTEX);
     HASH_VERTEX(PVR_KIND_OP, sHashOpHdr, b, PVR_CMD_VERTEX);
-    sq_send(v);
-    v = sq_next(&addr);
-    *v = *(const pvr_vertex_t *) c;
-    v->flags = PVR_CMD_VERTEX_EOL;
+    sq_put_vertex(sq_next(&addr), b, PVR_CMD_VERTEX);
     HASH_VERTEX(PVR_KIND_OP, sHashOpHdr, c, PVR_CMD_VERTEX_EOL);
-    sq_send(v);
+    sq_put_vertex(sq_next(&addr), c, PVR_CMD_VERTEX_EOL);
     pvr_dr_addr = addr;
     PROF_COUNT_OP((const pvr_vertex_t *) a, (const pvr_vertex_t *) b, (const pvr_vertex_t *) c);
 }
