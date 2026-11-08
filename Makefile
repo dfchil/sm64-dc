@@ -1334,11 +1334,13 @@ $(BUILD_DIR)/src/game/obj_behaviors_2.o: CFLAGS += -Os -fno-lto
 # DC_EXACT_LOGIC=1: the game logic (src/game, src/engine) without the float shortcuts the rest of
 # the build takes (-ffast-math reorders, -ffp-contract=fast fuses multiply-add into FMAC, rounding
 # once where the N64 rounds twice; -fsingle-precision-constant makes the double constants float),
-# so it computes what the N64 does and an N64 TAS stays in sync. Delete src/game and src/engine
-# objects when switching; make does not track flags.
+# so it computes what the N64 does and an N64 TAS stays in sync. -fno-math-errno keeps sqrtf the
+# FPU's fsqrt, correctly rounded as the N64's sqrt.s is: with errno kept, every call went to
+# newlib's software square root. Delete src/game and src/engine objects when switching; make does
+# not track flags.
 DC_EXACT_LOGIC ?= 0
 ifeq ($(DC_EXACT_LOGIC),1)
-$(BUILD_DIR)/src/game/%.o $(BUILD_DIR)/src/engine/%.o: CFLAGS += -fno-fast-math -ffp-contract=off -fno-single-precision-constant -DDC_EXACT_MATH=1
+$(BUILD_DIR)/src/game/%.o $(BUILD_DIR)/src/engine/%.o: CFLAGS += -fno-fast-math -fno-math-errno -ffp-contract=off -fno-single-precision-constant -DDC_EXACT_MATH=1
 endif
 # Bisection aid: these sources (e.g. DC_OS_FILES="src/goddard/objects.c") are built at -Os
 # whatever DC_OPT is. Delete their .o files when the list changes; make does not track flags.
