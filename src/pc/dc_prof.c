@@ -670,7 +670,13 @@ void dc_prof_frame_end(void) {
             sSinceScene = 0;
         }
         int is_late = r->fields > DC_VBL_WAIT;
+        int is_load = r->us[C_LOGIC] >= LOAD_LOGIC_US || r->us[C_DL] >= LOAD_DL_US ||
+                      sSinceScene < LOAD_SCENE_FRAMES || sFrameAssetUs != 0;
+#if defined(DC_PROF_SAMPLE_LATE) && DC_PROF_SAMPLE_LATE == 2
+        sample_frame_end(is_late && !is_load);   // the steady late frames, not the loads
+#else
         sample_frame_end(is_late);
+#endif
 
         SceneStats *s = scene_stats(r->scene);
 #ifdef DC_PROF_LISTS
@@ -690,8 +696,7 @@ void dc_prof_frame_end(void) {
             s->frames++;
             if (is_late) {
                 uint32_t cpu = (uint32_t) r->us[C_LOGIC] + r->us[C_GEO] + r->us[C_DL] + r->us[C_FINISH];
-                int load = r->us[C_LOGIC] >= LOAD_LOGIC_US || r->us[C_DL] >= LOAD_DL_US ||
-                           sSinceScene < LOAD_SCENE_FRAMES || sFrameAssetUs != 0;
+                int load = is_load;
                 int cpu_bound = cpu >= LATE_BUDGET_US;
                 int pvr_bound = r->us[C_WAIT] >= 500 || r->us[C_RENDER] >= LATE_BUDGET_US;
                 uint8_t cause = load ? LATE_LOAD

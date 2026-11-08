@@ -769,8 +769,13 @@ ifeq ($(DC_PROF),1)
     PLATFORM_CFLAGS += -DDC_PROF_TOUR_START=$(DC_PROF_TOUR_START)
   endif
   # DC_PROF_SAMPLE_LATE=1: sample the PC at 2 kHz but keep only the samples of late frames.
+  # DC_PROF_SAMPLE_LATE=2: the same, but not the late frames of a load (logic or translation over
+  # the load bounds, a scene's first frames, an asset read): what is left is the steady late work.
   ifeq ($(DC_PROF_SAMPLE_LATE),1)
     PLATFORM_CFLAGS += -DDC_PROF_SAMPLE -DDC_PROF_SAMPLE_LATE
+  endif
+  ifeq ($(DC_PROF_SAMPLE_LATE),2)
+    PLATFORM_CFLAGS += -DDC_PROF_SAMPLE -DDC_PROF_SAMPLE_LATE=2
   endif
   # DC_PROF_SKIP=<code>: leave one part of the frame out of the PVR lists, to price it by
   # subtraction (codes in gfx_pvr.c); 999 cycles through every code in one run (DCPROF SKIP lines).
