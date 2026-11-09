@@ -1217,8 +1217,165 @@ static inline __attribute__((always_inline)) uint8_t nat_fog(float z, float w, f
 // screen map of now) while its clip coordinates are at hand. The slots' arrays, the screen map and
 // the fog parameters are read once, into locals: GCC must assume the loop's stores may change them
 // where they live (sVB, rsp), and would read them again for every vertex.
+#ifdef __sh__
+// What the SH4 loop below reads: the slots' arrays from the first slot on, the screen map and fog
+// parameters. Handed over as one pointer, so the asm names no C symbol (LTO renames them).
+typedef struct {
+    uint32_t n;
+    const NatVtx *src;
+    struct LoadedVertex *lv;
+    uint8_t *clip;
+    uint32_t *bake, *proj;
+    float (*scr)[4];
+    uint8_t *lits;
+    uint32_t proj_gen, lit, lit_flag, fog;
+    float xscale, xbias, yscale, ybias, fog_mul, fog_offset, f255;
+} NatVtxJob;
+#endif
+
 static void SM_HOT __attribute__((noinline)) nat_vertex_run(size_t n, size_t dest, const NatVtx *src, uint8_t lit,
                                                            uint8_t lit_bit) {
+#ifdef __sh__
+    // The C loop's arithmetic, instruction for instruction (the same ftrv, fmul, fsrra and fmac on
+    // the same operands, so the same bits), scheduled by hand: GCC branched on each clip plane and
+    // spent three instructions on each float store. The clip code is built without branches, a
+    // comparison's T shifted in by rotcl (the lit bit first, so it ends at bit 7); u, v and the
+    // colour are copied and the source prefetched while ftrv runs.
+    NatVtxJob job = {
+        .n = (uint32_t) n, .src = src, .lv = &VB_LV[dest], .clip = &VB_CLIP[dest],
+        .bake = &VB_BAKE_EPOCH[dest], .proj = &VB_PROJ_GEN[dest], .scr = &VB_PROJ[dest],
+        .lits = &VB_LIT[dest], .proj_gen = sProjGen, .lit = lit, .lit_flag = lit_bit != 0,
+        .fog = (rsp.geometry_mode & G_FOG) != 0,
+        .xscale = sm_xscale, .xbias = sm_xbias, .yscale = sm_yscale, .ybias = sm_ybias,
+        .fog_mul = (float) rsp.fog_mul, .fog_offset = (float) rsp.fog_offset, .f255 = 255.0f,
+    };
+    register NatVtxJob *j asm("r4") = &job;
+    __asm__ volatile(
+        "mov.l   @(4,%[j]),r6\n\t"      // src
+        "mov.l   @(8,%[j]),r5\n\t"      // lv
+        "mov.l   @(12,%[j]),r7\n\t"     // clip
+        "mov.l   @(16,%[j]),r8\n\t"     // bake
+        "mov.l   @(20,%[j]),r9\n\t"     // proj (generation)
+        "mov.l   @(24,%[j]),r10\n\t"    // scr
+        "mov.l   @(28,%[j]),r11\n\t"    // lits
+        "mov.l   @(32,%[j]),r12\n\t"    // proj_gen
+        "mov.l   @(36,%[j]),r13\n\t"    // lit
+        "mov.l   @(40,%[j]),r14\n\t"    // lit_flag
+        "mov.l   @(44,%[j]),r3\n\t"     // fog
+        "mov     %[j],r0\n\t"
+        "add     #48,r0\n\t"
+        "fmov.s  @r0+,fr8\n\t"          // xscale
+        "fmov.s  @r0+,fr9\n\t"          // xbias
+        "fmov.s  @r0+,fr10\n\t"         // yscale
+        "fmov.s  @r0+,fr11\n\t"         // ybias
+        "fmov.s  @r0+,fr12\n\t"         // fog_mul
+        "fmov.s  @r0+,fr13\n\t"         // fog_offset
+        "fmov.s  @r0+,fr14\n\t"         // 255
+        "fldi0   fr15\n\t"
+        "mov.l   @%[j],%[j]\n\t"        // n, counted down
+        "tst     %[j],%[j]\n\t"
+        "bt      9f\n"
+        "1:\n\t"
+        "fmov.s  @r6+,fr4\n\t"          // x, y, z, 1
+        "fmov.s  @r6+,fr5\n\t"
+        "fmov.s  @r6+,fr6\n\t"
+        "fldi1   fr7\n\t"
+        "ftrv    xmtrx,fv4\n\t"
+        "mov.l   @r6+,r1\n\t"           // u
+        "mov     r6,r0\n\t"
+        "mov.l   @r6+,r2\n\t"           // v
+        "add     #56,r0\n\t"            // the vertex three on (src + 3), as before
+        "pref    @r0\n\t"
+        "mov.l   r1,@(16,r5)\n\t"
+        "mov.l   @r6+,r1\n\t"           // colour (or normal and alpha)
+        "mov.l   r2,@(20,r5)\n\t"
+        "mov.l   r1,@(24,r5)\n\t"
+        "mov     r5,r1\n\t"
+        "add     #16,r1\n\t"
+        "fmov.s  fr7,@-r1\n\t"          // _w, _z, _y, _x
+        "fmov.s  fr6,@-r1\n\t"
+        "fmov.s  fr5,@-r1\n\t"
+        "fmov.s  fr4,@-r1\n\t"
+        "mov     r14,r2\n\t"            // the clip code: lit, w < 0, z > w, z < -w, y.., x..
+        "fmov    fr7,fr3\n\t"
+        "fneg    fr3\n\t"               // -w
+        "fcmp/gt fr7,fr15\n\t"          // 0 > w
+        "rotcl   r2\n\t"
+        "fcmp/gt fr7,fr6\n\t"           // z > w
+        "rotcl   r2\n\t"
+        "fcmp/gt fr6,fr3\n\t"           // -w > z
+        "rotcl   r2\n\t"
+        "fcmp/gt fr7,fr5\n\t"           // y > w
+        "rotcl   r2\n\t"
+        "fcmp/gt fr5,fr3\n\t"           // -w > y
+        "rotcl   r2\n\t"
+        "fcmp/gt fr7,fr4\n\t"           // x > w
+        "rotcl   r2\n\t"
+        "fcmp/gt fr4,fr3\n\t"           // -w > x
+        "rotcl   r2\n\t"
+        "mov.b   r2,@r7\n\t"
+        "add     #1,r7\n\t"
+        "fmov    fr7,fr1\n\t"           // 1/w: shz_invf, fsrra(w * w) with w's sign
+        "fmul    fr7,fr1\n\t"
+        "fsrra   fr1\n\t"
+        "fcmp/gt fr7,fr15\n\t"
+        "bf      2f\n\t"
+        "fneg    fr1\n"
+        "2:\n\t"
+        "mov     #0,r0\n\t"             // fog: nat_fog's
+        "tst     r3,r3\n\t"
+        "bt      4f\n\t"
+        "fcmp/gt fr6,fr3\n\t"           // z < -w: 0
+        "bt      4f\n\t"
+        "fmov    fr6,fr2\n\t"
+        "fmul    fr1,fr2\n\t"           // z / w
+        "fmov    fr13,fr3\n\t"
+        "fmov    fr12,fr0\n\t"
+        "fmac    fr0,fr2,fr3\n\t"       // mul * z / w + offset
+        "fcmp/gt fr14,fr3\n\t"          // over 255: 255
+        "bt.s    4f\n\t"
+        "mov     #-1,r0\n\t"
+        "fcmp/gt fr3,fr15\n\t"          // under 0: 0
+        "bt.s    4f\n\t"
+        "mov     #0,r0\n\t"
+        "ftrc    fr3,fpul\n\t"
+        "sts     fpul,r0\n"
+        "4:\n\t"
+        "mov     r5,r1\n\t"
+        "add     #28,r1\n\t"
+        "mov.b   r0,@r1\n\t"
+        "fmul    fr1,fr4\n\t"           // screen x, y and 1/w
+        "fmov    fr9,fr2\n\t"
+        "fmov    fr8,fr0\n\t"
+        "fmac    fr0,fr4,fr2\n\t"
+        "fmul    fr1,fr5\n\t"
+        "fmov    fr11,fr3\n\t"
+        "fmov    fr10,fr0\n\t"
+        "fmac    fr0,fr5,fr3\n\t"
+        "mov     r10,r1\n\t"
+        "add     #12,r1\n\t"
+        "fmov.s  fr1,@-r1\n\t"
+        "fmov.s  fr3,@-r1\n\t"
+        "fmov.s  fr2,@-r1\n\t"
+        "add     #16,r10\n\t"
+        "mov     #0,r0\n\t"             // unbaked; the screen position current; the light snapshot
+        "mov.l   r0,@r8\n\t"
+        "add     #4,r8\n\t"
+        "mov.l   r12,@r9\n\t"
+        "add     #4,r9\n\t"
+        "mov.b   r13,@r11\n\t"
+        "add     #1,r11\n\t"
+        "dt      %[j]\n\t"
+        "bf.s    1b\n\t"
+        "add     #32,r5\n"
+        "9:\n"
+        : [j] "+r"(j)
+        :
+        : "r0", "r1", "r2", "r3", "r5", "r6", "r7", "r8", "r9", "r10", "r11", "r12", "r13", "r14",
+          "fr0", "fr1", "fr2", "fr3", "fr4", "fr5", "fr6", "fr7", "fr8", "fr9", "fr10", "fr11", "fr12",
+          "fr13", "fr14", "fr15", "fpul", "t", "memory");
+#else
+
     struct LoadedVertex *const lv = VB_LV;
     uint8_t *const clip = VB_CLIP, *const lits = VB_LIT;
     uint32_t *const bake = VB_BAKE_EPOCH, *const proj = VB_PROJ_GEN;
@@ -1251,6 +1408,7 @@ static void SM_HOT __attribute__((noinline)) nat_vertex_run(size_t n, size_t des
         proj[dest] = proj_gen;
         lits[dest] = lit;
     }
+#endif
 }
 
 static void nat_vertex(size_t n, size_t dest, const NatVtx *src) {
