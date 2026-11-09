@@ -10,13 +10,10 @@
 #include <assert.h>
 
 #define GFX_API_NAME "Dreamcast PVR"
-#if LOWRES
-#define SCR_WIDTH (320)
-#define SCR_HEIGHT (240)
-#else
-#define SCR_WIDTH (640)
-#define SCR_HEIGHT (480)
-#endif
+#include "pc/dc_video_options.h"
+// The framebuffer at start: 320x240 in the 240p mode (gfx_pvr.c can switch it later).
+#define SCR_WIDTH (gDcVideo240p ? 320 : 640)
+#define SCR_HEIGHT (gDcVideo240p ? 240 : 480)
 
 #undef bool
 #define bool uint8_t

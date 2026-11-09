@@ -46,18 +46,14 @@ _Static_assert(sizeof(pvr_poly_hdr_t) == 32, "pvr_poly_hdr_t must be one 32-byte
 #ifndef DC_FSAA
 #define DC_FSAA 0
 #endif
-#if LOWRES
-#define DC_RENDER_W_1X 320
-#else
-#define DC_RENDER_W_1X 640
-#endif
-// Current render width (DC_FB_W << the current FSAA mode): FSAA can be switched off per course.
-#if DC_FSAA
-static int sRenderW = DC_RENDER_W_1X << DC_FSAA;
+// The framebuffer: 640x480, or 320x240 in the 240p mode (gDcVideo240p, dc_video_options.h), which
+// the debug menu can switch. Render width = DC_FB_W << the current FSAA mode (FSAA can be switched
+// off per course).
+static int sFbW = 640, sFbH = 480;
+static int sRenderW = 640 << DC_FSAA;
+#define DC_FB_W sFbW
+#define DC_FB_H sFbH
 #define DC_RENDER_W sRenderW
-#else
-#define DC_RENDER_W DC_RENDER_W_1X
-#endif
 // DC_FSAA builds draw these scenes without FSAA in the curated mode, as FSAA_SCENE(level, area)
 // (comma-separated): their fill does not fit 60 fps with FSAA, which doubles it.
 #include "pc/dc_video_options.h"
@@ -810,14 +806,6 @@ static void pvr_pad16(const uint16_t *in, int iw, int ih, uint16_t *out, int ow,
     }
 }
 
-// Framebuffer dimensions — must match gfx_dc.c SCR_WIDTH/HEIGHT. LOWRES = native 240p (320x240).
-#if LOWRES
-#define DC_FB_W 320
-#define DC_FB_H 240
-#else
-#define DC_FB_W 640
-#define DC_FB_H 480
-#endif
 
 // Mirror of OoT's known-good params for this toolchain:
 //   {OP, OP_MOD, TR, TR_MOD, PT} bin sizes, vtxbuf, dma, fsaa, autosort_disabled, overflow
@@ -1438,6 +1426,24 @@ __attribute__((section(".text.dc_layout_pad"), noinline, used)) void dc_layout_p
 }
 #endif
 
+// The 240p mode (gDcVideo240p): the video mode it is shown in. NTSC 320x240 is progressive (240p);
+// on VGA it is line-doubled. 640x480 is interlaced on a TV. KOS's pvr_init sets the vertical
+// scaler by the mode: the flicker filter only for interlaced TV output.
+static int sVideo240p;   // the mode the PVR runs in
+int gDcVideo240p = DC_VIDEO_240P;
+
+static int pvr_video_mode(int lo) {
+    const int vga = vid_check_cable() == CT_VGA;
+    return lo ? (vga ? DM_320x240_VGA : DM_320x240_NTSC) : (vga ? DM_640x480_VGA : DM_640x480_NTSC_IL);
+}
+
+static void pvr_fb_size(int lo) {
+    sVideo240p = lo;
+    sFbW = lo ? 320 : 640;
+    sFbH = lo ? 240 : 480;
+    sRenderW = sFbW << sPvrParams.fsaa_enabled;
+}
+
 static void gfx_pvr_init(void) {
 #if DC_LAYOUT_PAD
     __asm__ volatile("" : : "r"(dc_layout_pad));   // a use of its address: the linker keeps it
@@ -1449,14 +1455,9 @@ static void gfx_pvr_init(void) {
     enj_state_t *state = enj_state_get();
     // The same specific modes as below, not a generic one (which takes PAL's 50 Hz on a PAL
     // console): enDjinn's field has the generic type, but vid_set_mode takes either.
-#if LOWRES
-    state->video.display_mode =
-        (vid_display_mode_generic_t) (vid_check_cable() != CT_VGA ? DM_320x240_NTSC : DM_320x240_VGA);
-#else
-    state->video.display_mode =
-        (vid_display_mode_generic_t) (vid_check_cable() != CT_VGA ? DM_640x480_NTSC_IL : DM_640x480_VGA);
-#endif
-    state->video.pixel_mode = PM_RGB888;
+    pvr_fb_size(gDcVideo240p);
+    state->video.display_mode = (vid_display_mode_generic_t) pvr_video_mode(gDcVideo240p);
+    state->video.pixel_mode = PM_RGB888;   // XRGB8888, 32-bit (KOS PM_RGB0888): measured 1% faster to render than packed 24-bit
     state->video.pvr_params = sPvrParams;
     state->flags.soft_reset_enabled = 0;
     state->flags.no_snd_init = 1;
@@ -1466,22 +1467,15 @@ static void gfx_pvr_init(void) {
     }
 #else
 #ifdef __DREAMCAST__
-#if LOWRES
-    // Native 240p (progressive). NTSC 320x240 is non-interlaced; VGA has a 320x240 mode too.
-    vid_set_mode(vid_check_cable() != CT_VGA ? DM_320x240_NTSC : DM_320x240_VGA, PM_RGB888);//_565);
-#else
-    if (vid_check_cable() != CT_VGA)
-        vid_set_mode(DM_640x480_NTSC_IL, PM_RGB888);//, PM_RGB565);
-    else
-        vid_set_mode(DM_640x480_VGA, PM_RGB888);//, PM_RGB565);
-#endif
+    pvr_fb_size(gDcVideo240p);
+    vid_set_mode(pvr_video_mode(gDcVideo240p), PM_RGB888);
 #endif
     pvr_init(&sPvrParams);
 #endif
     pvr_post_init();
 }
 
-// Everything set after pvr_init, again after a restart (gfx_pvr_switch_fsaa).
+// Everything set after pvr_init, again after a restart (gfx_pvr_restart).
 static void pvr_post_init(void) {
 #if DC_PT_CHUNK != 64
     // Punch-through chunk of the tile renderer: ISP_FEED_CFG (PVR register 0x098) bits 13..4, in
@@ -1491,9 +1485,6 @@ static void pvr_post_init(void) {
 #define PVR_ISP_FEED_CFG PVR_UNK_0098   /* KOS before 315741eb named it by its address */
 #endif
     PVR_SET(PVR_ISP_FEED_CFG, 0x00800008u | ((unsigned) DC_PT_CHUNK << 4));
-#endif
-#if defined(__DREAMCAST__) && LOWRES
-    PVR_SET(PVR_SCALER_CFG, 0x400);   // 240p: disable the vertical flicker/scanline filter
 #endif
 #define PM_DITHER_BIT 8
     uint32_t cfg = PVR_GET(PVR_FB_CFG_2);
@@ -1517,6 +1508,12 @@ static void pvr_post_init(void) {
 
 #if DC_FSAA
 static int sFsaaWant = DC_FSAA;
+#define FSAA_WANT sFsaaWant
+#else
+#define FSAA_WANT 0
+#endif
+
+#if DC_FSAA
 
 // The player's choice (dc_video_options.h): off, on, or on except the scenes whose fill does not
 // fit 60 fps with it. gfx_pvr_start_frame switches before the next scene begins.
@@ -1552,19 +1549,28 @@ void gfx_pvr_fsaa_toggle(void) {
     printf("FSAA: %s by the toggle button\n", sFsaaWant ? "on" : "off");
 }
 
-extern void reset_texcache(void);
-extern void gfx_dc_set_fsaa_x(int fsaa);
+#endif
 
-// Restart the PVR in the wanted FSAA mode (the DKR/enDjinn recipe). pvr_shutdown resets the VRAM
-// allocator, so every texture pointer is forgotten, never freed, and the front-end cache is wiped:
-// the course's textures upload again on first use, in the new mode.
-static void gfx_pvr_switch_fsaa(void) {
+extern void reset_texcache(void);
+extern void gfx_dc_set_screen(int width, int height, int fsaa);
+
+// Restart the PVR in the wanted FSAA and video modes (the DKR/enDjinn recipe). pvr_shutdown resets
+// the VRAM allocator, so every texture pointer is forgotten, never freed, and the front-end cache
+// is wiped: the course's textures upload again on first use, in the new mode.
+static void gfx_pvr_restart(void) {
     pvr_wait_ready();
     pvr_shutdown();
-    sPvrParams.fsaa_enabled = sFsaaWant;
+    sPvrParams.fsaa_enabled = FSAA_WANT;
+    if (gDcVideo240p != sVideo240p) {
+        vid_set_mode(pvr_video_mode(gDcVideo240p), PM_RGB888);
+#if DC_ENJ_LOOP
+        enj_state_get()->video.display_mode = (vid_display_mode_generic_t) pvr_video_mode(gDcVideo240p);
+#endif
+    }
+    pvr_fb_size(gDcVideo240p);
     pvr_init(&sPvrParams);
 #if DC_ENJ_LOOP
-    enj_state_get()->video.pvr_params.fsaa_enabled = sFsaaWant;   // enDjinn's copy of the parameters
+    enj_state_get()->video.pvr_params.fsaa_enabled = FSAA_WANT;   // enDjinn's copy of the parameters
 #endif
     pvr_post_init();
 #if DC_OVERLAY_CODE
@@ -1578,11 +1584,15 @@ static void gfx_pvr_switch_fsaa(void) {
     sBoundTex = 0;
     sCurBound = 0;
     reset_texcache();
-    sRenderW = DC_RENDER_W_1X << sFsaaWant;
-    gfx_dc_set_fsaa_x(sFsaaWant);
+    gfx_dc_set_screen(sFbW, sFbH, sPvrParams.fsaa_enabled);
     pvr_mark_dirty();
+    printf("gfx_pvr: video %dx%d%s\n", sFbW, sFbH, sPvrParams.fsaa_enabled ? ", FSAA" : "");
 }
-#endif
+
+// The FSAA or 240p option changed since the PVR started: restart it before the frame.
+static inline int pvr_mode_stale(void) {
+    return FSAA_WANT != sPvrParams.fsaa_enabled || gDcVideo240p != sVideo240p;
+}
 
 static void gfx_pvr_on_resize(void) { }
 
@@ -1602,11 +1612,9 @@ static inline void sm_rgba5551_to_rgbf(uint16_t c, float *r, float *g, float *b)
 static void gfx_pvr_start_frame(void) {
     float cr, cg, cb;
 #if !DC_ENJ_RENDER
-#if DC_FSAA
-    if (sFsaaWant != sPvrParams.fsaa_enabled) {
-        gfx_pvr_switch_fsaa();
+    if (pvr_mode_stale()) {
+        gfx_pvr_restart();
     }
-#endif
     DC_PROF_MARK(DCP_WAIT_BEGIN);
     pvr_wait_ready();
     DC_PROF_MARK(DCP_WAIT_END);
@@ -1707,11 +1715,9 @@ static void pvr_render_op(void *data) {
 }
 
 void gfx_pvr_render_frame(void (*op_renderer)(void *data), void *data) {
-#if DC_FSAA
-    if (sFsaaWant != sPvrParams.fsaa_enabled) {
-        gfx_pvr_switch_fsaa();
+    if (pvr_mode_stale()) {
+        gfx_pvr_restart();
     }
-#endif
     sOpRenderer = op_renderer;
     enj_render_list_add(PVR_LIST_OP_POLY, pvr_render_op, data);
     DC_PROF_MARK(DCP_WAIT_BEGIN);

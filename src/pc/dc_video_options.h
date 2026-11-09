@@ -16,6 +16,18 @@
 #endif
 extern int gDcFsaaMode;
 
+/* Resolution (gDcVideo240p, gfx_pvr.c): 0 = 640x480 (interlaced on a TV, 480p on VGA), 1 = 320x240,
+ * progressive 240p on a TV (line-doubled on VGA). The debug menu switches it (a PVR restart).
+ * make LOWRES=1 starts in 240p. */
+#ifndef DC_VIDEO_240P
+#ifdef LOWRES
+#define DC_VIDEO_240P 1
+#else
+#define DC_VIDEO_240P 0
+#endif
+#endif
+extern int gDcVideo240p;
+
 /* Frame rate (DC_60FPS builds; gDcFrameMode, pc_main.c). Each 30 Hz logic step is shown as an
  * interpolated frame and then the exact one. */
 #define DC_FRAME_MODE_30      0   /* the exact frame only, for two vblanks */

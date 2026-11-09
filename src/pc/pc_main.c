@@ -333,6 +333,15 @@ static void dbg_fsaa_changed(UNUSED enj_menu_row_t *row, UNUSED void *data) {
 }
 #endif
 static const char *const sDbgOffOn[] = { "Off", "On" };
+#include "pc/dc_video_options.h"
+static const char *const sDbgResolutions[] = { "640x480", "320x240 (240p)" };
+static int sDbgVideo240p = DC_VIDEO_240P;
+
+// The PVR restarts in the other video mode before the game's next frame (gfx_pvr.c), after the
+// menu closes: the restart frees the VRAM the menu draws from.
+static void dbg_resolution_changed(UNUSED enj_menu_row_t *row, UNUSED void *data) {
+    gDcVideo240p = sDbgVideo240p;
+}
 #if defined(DC_AICAFLOW) && DC_AICAFLOW_REVERB
 #include "audio/sm64_aicaflow.h"
 
@@ -390,6 +399,13 @@ static enj_menu_row_t sDbgRows[] = {
       .on_change = dbg_fsaa_changed,
       .apply_on_close = 1 },
 #endif
+    { .name = "Resolution",
+      .help = "320x240 is the N64's own: progressive 240p on a TV, line-doubled on VGA. "
+              "640x480 is interlaced on a TV. Each switch loads the textures again.",
+      .type = ENJ_MENU_CHOICE,
+      .choice = { .value = &sDbgVideo240p, .labels = sDbgResolutions, .count = 2 },
+      .on_change = dbg_resolution_changed,
+      .apply_on_close = 1 },
 #if defined(DC_AICAFLOW) && DC_AICAFLOW_REVERB
     { .name = "Reverb",
       .help = "The N64's echo, as the AICA DSP's program. Off silences its output; the program "

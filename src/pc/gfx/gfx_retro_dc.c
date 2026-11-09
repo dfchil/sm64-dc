@@ -377,7 +377,7 @@ extern float gfx_pvr_get_v_scale(void);
 #define DC_FSAA 0
 #endif
 // The x scale follows the PVR's current FSAA mode, which can change per scene (gfx_pvr.c
-// DC_FSAA_OFF_SCENES); gfx_dc_set_fsaa_x sets it while no frame is in flight.
+// DC_FSAA_OFF_SCENES); gfx_dc_set_screen sets it while no frame is in flight.
 static float sDcFsaaX = (float) (1 << DC_FSAA);
 #define DC_FSAA_X sDcFsaaX
 static float vpf_x = 0.0f, vpf_y = 0.0f, vpf_w = 640.0f, vpf_h = 480.0f;
@@ -388,9 +388,24 @@ static float sm_yscale = -240.0f, sm_ybias = 240.0f;
 // of a hardwired 640x480. The 3D bake already scales via RATIO/sm_*.
 static float fb_half_w = 320.0f * (float) (1 << DC_FSAA), fb_half_h = 240.0f;
 static void gfx_recompute_screen_map(void);
-void gfx_dc_set_fsaa_x(int fsaa) {
+// The PVR restarted (gfx_pvr.c gfx_pvr_restart): its framebuffer size (640x480, or 320x240 in the
+// 240p mode) and FSAA mode. Viewports and scissors follow at the game's next G_SETVIEWPORT/SCISSOR,
+// which every frame's display list has.
+void gfx_dc_set_screen(int width, int height, int fsaa) {
+    if (gfx_current_dimensions.width != (uint32_t) width || gfx_current_dimensions.height != (uint32_t) height) {
+        const float sx = (float) width / (float) gfx_current_dimensions.width;
+        const float sy = (float) height / (float) gfx_current_dimensions.height;
+        gfx_current_dimensions.width = width;
+        gfx_current_dimensions.height = height;
+        gfx_current_dimensions.aspect_ratio = (float) width / (float) height;
+        vpf_x *= sx; vpf_w *= sx;   // until the next viewport command
+        vpf_y *= sy; vpf_h *= sy;
+        rendering_state.viewport = (struct XYWidthHeight) { 0, 0, 0, 0 };   // taken again
+        rendering_state.scissor = (struct XYWidthHeight) { 0, 0, 0, 0 };
+    }
     sDcFsaaX = (float) (1 << fsaa);
     fb_half_w = (float) gfx_current_dimensions.width * 0.5f * sDcFsaaX;
+    fb_half_h = (float) gfx_current_dimensions.height * 0.5f;
     gfx_recompute_screen_map();
 }
 static void gfx_recompute_screen_map(void) {
