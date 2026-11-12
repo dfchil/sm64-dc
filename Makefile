@@ -692,6 +692,8 @@ DC_PT_CHUNK ?= 64
 PLATFORM_CFLAGS += -DDC_PT_CHUNK=$(DC_PT_CHUNK)
 # Above -Os GCC flags stock SM64 code (mario_actions_moving.c) as maybe-uninitialized.
 PLATFORM_CFLAGS += -Wno-error=maybe-uninitialized
+# GCC 16 also flags stock SM64 code (camera.c posReturn) as unused-but-set.
+PLATFORM_CFLAGS += -Wno-error=unused-but-set-variable
 # DC_TAS_MENU=1 (with the debug menu): the movie in two debug menu rows (src/game/tas_slice.c).
 # TAS replay plays the whole run or one section (a star or two, a Bowser) over the player's game
 # from the next level change; Level select puts the pad in a star's level, with the movie's save
