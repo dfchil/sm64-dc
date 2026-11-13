@@ -65,12 +65,14 @@ static int sRenderW = 640 << DC_FSAA;
 // 1-2, JRB 1, THI 1, LLL 2, DDD 1-2, COTMC 1. And the scenes under 98% on time with FSAA forced on in
 // the TAS (build/hw/sndt5-20261031-212517; VCUTM with DC_GRATE_TR: g1-20261105-164223): VCUTM 97.1%,
 // SL 93.5%, BITDW 97.9%; Bowser 1, which no TAS run visits, from the camera-orbit benchmark
-// (2026-10-26, 94%). TTC holds 99.2% with DC_GRATE_TR.
+// (2026-10-26, 94%). TTC holds 99.2% with DC_GRATE_TR. THI 3, the Wiggler's room: 88.6% with FSAA
+// in the whole movie (build/hw/fsaa_all-20261113-083022), every late frame the PVR's.
 #define DC_FSAA_OFF_SCENES                                                                         \
     FSAA_SCENE(LEVEL_WDW, 1), FSAA_SCENE(LEVEL_WDW, 2), FSAA_SCENE(LEVEL_JRB, 1),                  \
-    FSAA_SCENE(LEVEL_THI, 1), FSAA_SCENE(LEVEL_LLL, 2), FSAA_SCENE(LEVEL_DDD, 1),                  \
-    FSAA_SCENE(LEVEL_DDD, 2), FSAA_SCENE(LEVEL_COTMC, 1), FSAA_SCENE(LEVEL_VCUTM, 1),              \
-    FSAA_SCENE(LEVEL_SL, 1), FSAA_SCENE(LEVEL_BITDW, 1), FSAA_SCENE(LEVEL_BOWSER_1, 1)
+    FSAA_SCENE(LEVEL_THI, 1), FSAA_SCENE(LEVEL_THI, 3), FSAA_SCENE(LEVEL_LLL, 2),                  \
+    FSAA_SCENE(LEVEL_DDD, 1), FSAA_SCENE(LEVEL_DDD, 2), FSAA_SCENE(LEVEL_COTMC, 1),                \
+    FSAA_SCENE(LEVEL_VCUTM, 1), FSAA_SCENE(LEVEL_SL, 1), FSAA_SCENE(LEVEL_BITDW, 1),               \
+    FSAA_SCENE(LEVEL_BOWSER_1, 1)
 #endif
 static void pvr_post_init(void);
 #if DC_FSAA
