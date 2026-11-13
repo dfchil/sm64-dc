@@ -1,7 +1,8 @@
 // make DC_TAS=1: TAS slices. A slice is the movie from the moment a level is entered, with the
 // game state carried over from before: the save data, the random seed, the timers, Mario's lives
 // and health, the act and the few globals that cross a level change. The pc-endjinn host captures
-// one per level change (the courses and the castle's grounds, inside and courtyard) while it plays
+// one at the game's start (the castle grounds after the file select, with the intro) and one per
+// level change (the courses and the castle's grounds, inside and courtyard) while it plays
 // the whole movie (SM64_SLICE_CAPTURE=file); a replay starts the game, sends its first level change
 // to a slice's level instead, restores that state there and plays the movie on from the slice's
 // sample, and when the level is left goes on to the next slice in the playlist. Every level of a
@@ -33,7 +34,9 @@
 #include "pc/dc_prof.h"
 #endif
 
-#define WARP_TYPE_CHANGE_LEVEL 1   // level_update.c
+#define WARP_TYPE_NOT_WARPING 0    // level_update.c
+#define WARP_TYPE_CHANGE_LEVEL 1
+#define WARP_NODE_CREDITS_MIN 0xF8
 
 extern s8 D_8032C9E0;
 extern s8 sYoshiDead;
@@ -385,8 +388,23 @@ static void slice_check_end(void) {
 
 // init_level, before the level's warp is carried out.
 void tas_slice_init_level(void) {
-    if (sCapture != NULL && sWarpDest.type == WARP_TYPE_CHANGE_LEVEL) {
+    // The game's first start from the file select (lvl_init_from_save_file) is a slice too, the
+    // first: it has no warp, so its init_level spawns Mario as a new game does, with the intro
+    // (Lakitu, the letter, the pipe) when its save is empty. The movie's later starts (a Save &
+    // Quit to come out in front of the castle) stay inside the slice they happen in, and the
+    // credits after the movie's end are no slices.
+    static s32 sCapturedAny;
+    s32 start = !sCapturedAny && sWarpDest.type == WARP_TYPE_NOT_WARPING && gCurrDemoInput == NULL
+                && gCurrCreditsEntry == NULL;
+    if (sCapture != NULL && ((sWarpDest.type == WARP_TYPE_CHANGE_LEVEL && sWarpDest.nodeId < WARP_NODE_CREDITS_MIN) || start)) {
+        sCapturedAny = 1;
         struct SliceHeader h = { dc_tas_frame(), sWarpDest, tas_random_seed16(), (u16) item_bytes() };
+        if (start) {
+            memset(&h.warp, 0, sizeof(h.warp));
+            h.warp.type = WARP_TYPE_NOT_WARPING;
+            h.warp.levelNum = (u8) gCurrLevelNum;
+            h.warp.areaIdx = (u8) gPlayerSpawnInfos[0].areaIndex;
+        }
         fwrite(&h, sizeof(h), 1, sCapture);
         for (u32 i = 0; i < ARRAY_COUNT(sItems); i++) {
             fwrite(sItems[i].addr, sItems[i].size, 1, sCapture);
@@ -414,7 +432,7 @@ void tas_slice_init_level(void) {
             memcpy(sItems[i].addr, p, sItems[i].size);
             p += sItems[i].size;
         }
-        sWarpDest = sPending->warp;
+        sWarpDest = sPending->warp;   // the start slice's: no warp, so the level starts as a new game
         tas_random_seed16_set(sPending->seed);
 #ifdef DC_TAS_MENU
         if (!sMovie) {
