@@ -70,12 +70,48 @@ void set_vblank_handler(UNUSED s32 index, UNUSED struct VblankHandler *handler, 
 static uint8_t inited = 0;
 
 #include "game/game_init.h" // for gGlobalTimer
+#include "pc/dc_overlay.h"
+
+#include "pc/dc_video_options.h"
+#include <dc/pvr.h>
+int gDcFrameMode = DC_FRAME_MODE;
+extern unsigned int gfx_dc_vbl_late;
+
+// DC_FRAME_MODE_60_DROP: after the step's first (interpolated) frame was handed over and paced to
+// its vblank, is it late? Late if it was handed over after that vblank (CPU), or if the PVR's last
+// render took longer than a frame: render times hold from frame to frame, so this one will too.
+// (Counting KOS's flips instead does not work: two frames are normally in flight at this point.)
+#ifndef DC_LATEDROP_RENDER_US
+#define DC_LATEDROP_RENDER_US 16700
+#endif
+static int first_frame_late(unsigned int late_before) {
+    pvr_stats_t st;
+    pvr_get_stats(&st);
+    return gfx_dc_vbl_late != late_before || st.rnd_last_time > DC_LATEDROP_RENDER_US * 1000ull;
+}
+
+static int sFrameQueued;   // send_display_list ran in this frame (the enDjinn loop below)
 
 void send_display_list(struct SPTask *spTask) {
+    extern s32 tas_show_fast(void);
+    extern s32 mtx_patch_interpolated(void);
+    if (tas_show_fast()) {   // Show star's way back: the steps run, nothing is drawn
+        mtx_patch_interpolated();   // empties its table, which points into this display list
+        return;
+    }
+    sFrameQueued = 1;
+    if (gDcFrameMode == DC_FRAME_MODE_30) {   // the exact matrices now; the second draw then finds
+        extern s32 mtx_patch_interpolated(void);   // nothing to change and holds this frame
+        mtx_patch_interpolated();
+    }
     gfx_run((Gfx *)spTask->task.t.data_ptr);
 }
 
 #include <kos.h>
+#include <enDjinn/enj_mode.h>
+#include <enDjinn/enj_render.h>
+#include <enDjinn/enj_state.h>
+#include <enDjinn/enj_debug_menu.h>
 #undef bool
 #undef true
 #undef false
@@ -98,12 +134,17 @@ void vblfunc(uint32_t c, void *d) {
 //432
 s16 audio_buffer[2][SAMPLES_HIGH * 2 * 2 * 3] __attribute__((aligned(64)));
 
+
 void *AudioSynthesisThread(UNUSED void *arg) {
     uint64_t last_vbltick = vblticker;
 
     while (1) {
         while (vblticker <= last_vbltick)
+#ifdef KOS_GENWAIT_3ARG
+            genwait_wait((void*)&vblticker, NULL, 0);
+#else
             genwait_wait((void*)&vblticker, NULL, 0/* 3 */, NULL);
+#endif
         last_vbltick = vblticker;
 // if you notice the sound starts skipping, re-enable the irq_disable/enable around synthesis
 //        irq_disable();
@@ -135,6 +176,8 @@ void *main_pc_pool_gd = NULL;
 
 static u8 pool[0x165000+0x70800] __attribute__((aligned(16384)));
 
+#include "pc/loop/enj_loop.inc.c"
+
 void main_func(void) {
     main_pc_pool = &pool;
     main_pc_pool_gd = &pool[0x165000];
@@ -153,10 +196,6 @@ void main_func(void) {
     
     wm_api->set_fullscreen_changed_callback(on_fullscreen_changed);
     
-    if (audio_api == NULL && audio_dc.init()) {
-        audio_api = &audio_dc;
-    }
-
     if (audio_api == NULL) {
         audio_api = &audio_null;
     }
@@ -165,25 +204,17 @@ void main_func(void) {
     sound_init();
 
     vblank_handler_add(&vblfunc, NULL);
-    kthread_attr_t audio_attr;
-    audio_attr.create_detached = 1;
-	audio_attr.stack_size = 32768;
-	audio_attr.stack_ptr = NULL;
-	audio_attr.prio = PRIO_DEFAULT - 1;
-	audio_attr.label = "AudioSynthesis";
-    thd_create_ex(&audio_attr, &AudioSynthesisThread, NULL);
+    // No sequencer on the SH4: the music and sounds are AICAflow flows (src/pc/audio/sm64_aicaflow.c).
+    {
+        extern int sm64_afx_init(void);
+        sm64_afx_init();
+    }
 //    (void)audio_attr;
     thread5_game_loop(NULL);
 
     inited = 1;
 
-    while (1) {
-        gfx_start_frame();
-        game_loop_one_iteration();
-        gfx_end_frame();
-        gSysFrameCount++;
-        thd_pass();
-    }
+    enj_loop_run();
 }
 
 
